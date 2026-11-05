@@ -30,21 +30,22 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ## 日常同步与回滚
 
-开始修改前先同步远端，再创建分支：
+开始修改前先同步远端：
 
 ```powershell
 git switch main
 git pull --ff-only
-git switch -c fix/short-description
 ```
 
-完成修改并验证后，提交并推送分支：
+本项目约定：8766 机器人代码修改通过项目验证后，提交并推送到 `main`，作为跨电脑同步点和回滚点。只读分析不产生提交；不改写历史或强推。
+
+完成修改并验证后，提交并推送：
 
 ```powershell
 git status --short
 git add <本次修改的文件>
 git commit -m "fix: 简要说明"
-git push -u origin fix/short-description
+git push origin main
 ```
 
-合并前检查变更，合并后再从 `main` 同步。若某次修改需要撤销，先用 `git log --oneline` 找到对应提交，再用 `git revert <提交号>` 创建反向提交并推送；这样会保留同步历史，也可在之后恢复被撤销的提交。
+若某次修改需要撤销，先用 `git log --oneline` 找到对应提交，再用 `git revert <提交号>` 创建反向提交并推送；这样会保留同步历史，也可在之后恢复被撤销的提交。
