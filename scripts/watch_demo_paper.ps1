@@ -75,7 +75,7 @@ function Get-DemoRunnerRoots {
 function Get-DemoLedgerHealth {
     $reasons = [System.Collections.Generic.List[string]]::new()
     try {
-        $state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+        $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
         $snapshot = $state.exchange_snapshot
         if ($state.execution_mode -ne 'demo_usdm') { $reasons.Add('execution_mode') }
         if ($state.strategy_variant -ne 'ema50_deviation_candidate') { $reasons.Add('strategy_variant') }
