@@ -1,0 +1,272 @@
+exchange: binanceusdm
+market_type: swap
+settle: USDT
+timezone: Asia/Shanghai
+
+timeframes:
+  regime: 4h
+  exec: 1h
+
+lookback:
+  range_bars_4h: 48
+  atr_len: 14
+  adx_len: 14
+  min_regime_bars_4h: 80
+  afternoon_extreme_lookback_1h: 24
+
+regime:
+  low_pct: 0.30
+  high_pct: 0.70
+  adx_sideways: 20
+  atrpct_percentile: 30
+  atrpct_lookback: 30
+  slow_lookback_4h: 6
+  slow_move_atr_mult: 1.0
+
+signals:
+  impulse_atr_mult: 1.5
+  stop_atr_mult: 2.0
+  allow_short: true
+  allow_long: true
+  reverse_same_bar: false
+  reverse_size_mult: 0.5
+  cooldown_hours: 18 # Fallback for old exit records without a recoverable reason.
+
+long_entry:
+  require_reversal_sign: true
+  reversal_lookback_1h: 3
+  block_if_4h_lower_lows: true
+  lower_lows_lookback_4h: 4
+  reject_if_below_range: true
+  max_below_range_atr: 0.5
+
+short_entry:
+  block_if_4h_higher_highs: true
+  higher_highs_lookback_4h: 4
+  reject_if_above_range: true
+  max_above_range_atr: 0.5
+
+execution:
+  confirm_on_1h_close: true
+  confirm_delay_sec_max: 60
+  entry_quote_max_age_sec: 15
+  entry_adverse_atr_observe: [0.05, 0.10, 0.15]
+  wait_pullback: false
+  wait_bars_15m: 1
+  pullback_atr: 0.4
+  timeout_action: cancel
+  pullback_timeframe: 15m
+
+cooldowns:
+  # Experimental paper settings; ADA one-year results worsened with shorter waits.
+  stop_loss_hours: 6
+  profit_exit_hours: 2
+  strategy_exit_hours: 0
+  strategy_switch_hours: 1
+  strategy_switch_bars: 1
+  liquidation_hours: 18
+
+exit_management:
+  enabled: true
+  breakeven_trigger_r: 1.5
+  trailing_trigger_r: 2.5
+  trailing_atr_mult: 2.0
+  # Legacy 12h/24h observation and exit path; automatic time exits remain disabled.
+  time_exit_enabled: false
+  time_check_hours: 12
+  time_exit_hours: 24
+  time_min_progress_r: 0.5
+
+mr_candidate_exit:
+  # First lock activates at stops.move_to_breakeven_atr (currently 1.0 ATR).
+  first_lock_r: 0.2
+  second_lock_trigger_r: 1.5
+  second_lock_r: 0.5
+  trailing_trigger_r: 2.0
+
+exit_proposal_v1:
+  enabled: true
+  tp1_atr: 1.0
+  tp1_frac: 0.40
+  tp2_atr: 1.8
+  tp2_frac: 0.40
+  trail_atr: 0.8
+  trail_tight_atr: 0.5
+  structure_enabled: true
+
+# Active no-progress and maximum-hold settings are defined here.
+exits:
+  structure_invalid_enabled: true
+  structure_invalid_buffer_atr: 0.25
+  regime_fade_enabled: true
+  regime_fade_min_atr: 0.5
+  no_progress_bars: 6
+  no_progress_min_atr: 0.4
+  no_progress_action: close
+  max_hold_bars: 24
+  exempt_max_hold_after_tp1: true
+  require_breakeven_for_exempt: true
+  runner_max_hold_bars: 0
+  startup_stale_exit: true
+
+stops:
+  use_structure_stop: true
+  swing_lookback_1h: 6
+  structure_buffer_atr: 0.4
+  min_stop_atr: 0.3
+  min_stop_action: reject # reject | expand
+  max_stop_atr: 2.5
+  wide_stop_action: reject # reject | shrink
+  hard_cap_atr: 2.0
+  move_to_breakeven_atr: 1.0
+
+session:
+  morning_start: "08:00"
+  morning_end: "12:00"
+  afternoon_start: "12:00"
+  afternoon_end: "20:00"
+  night_new_entries: true
+  afternoon_extreme_pct: 0.10
+
+sizing:
+  leverage: 3
+  margin_per_symbol_usdt: 1000
+  max_symbols: 5
+  max_gross_notional_pct: 1.8
+  max_directional_notional_pct: 0.9
+  splits: 2
+
+pyramiding:
+  enabled: false
+  max_adds: 1
+
+risk:
+  daily_drawdown_halt_pct: 0.04
+  max_slippage_pct: 0.0015
+  funding_abs_block: 0.001
+  max_single_trade_risk_pct: 0.02
+
+market_risk:
+  enabled: true
+  # Thresholds reuse existing signals/regime settings; elevated size scales new entries and budgets.
+  symbol: "BTC/USDT:USDT"
+  elevated_size_multiplier: 1.0  # no volatility size-halving: direction-neutral scaler cut trend winners (DIAGNOSIS s10)
+
+symbol_regime:
+  enabled: true
+  min_closed_bars: 80
+  adx_period: 14
+  trend_adx_min: 25
+  range_adx_max: 18
+  ema_fast_bars: 20
+  ema_slow_bars: 50
+  slope_lookback_bars: 3
+  trend_slope_min_pct: 0.001
+  range_slope_max_pct: 0.0005
+  range_max_distance_pct: 0.015
+  structure_lookback_bars: 4
+  confirm_bars: 3
+  range_confirm_bars: 2
+
+mean_reversion_match:
+  weights:
+    route: 25
+    adx: 20
+    ema50_slope: 15
+    ema50_distance: 15
+    structure: 10
+    legacy_regime: 15
+  penalties:
+    trend_tendency: 15
+    impulse: 30
+    structure_conflict: 15
+    low_high_edge: 8
+  ema50_distance_zero_multiple: 2.0
+
+trend_match:
+  weights:
+    range_position: 40
+    ema50_distance: 15
+    recent_return: 15
+    adx_rising: 15
+    ema50_slope: 10
+    structure: 5
+  score_aggregation: max
+  direction_bias_min_score: 55
+  direction_bias_min_delta: 5
+  common_deductions:
+    lower_extreme_position_pct: 10
+    upper_extreme_position_pct: 90
+    one_sided_move_min_pct: 30
+    one_sided_move: 15
+    abnormal_return_min_pct: 40
+    abnormal_return: 10
+    structure_conflict: 10
+  range_lookback_bars: 48
+  preferred_position_min_pct: 20
+  preferred_position_max_pct: 60
+  upper_position_penalty_start_pct: 75
+  upper_position_zero_score_pct: 90
+  below_min_position_score: 60
+  upper_position_score_at_penalty_start: 70
+  ema50_distance_full_score_pct: 2
+  ema50_distance_zero_score_pct: 8
+  recent_return_lookback_bars: 12
+  recent_return_no_penalty_pct: 8
+  recent_return_zero_score_pct: 30
+  adx_rising_lookback_bars: 3
+  adx_min_rise: 1
+  adx_preferred_max: 35
+  adx_extreme_max: 50
+  ema50_slope_full_score_min_pct: 0.05
+  ema50_slope_full_score_max_pct: 0.5
+  ema50_slope_zero_score_pct: 2.0
+
+trend_strategy:
+  risk_per_trade_pct: 0.005
+  entry_ema_bars: 20
+  pullback_ttl_minutes: 45
+  pullback_atr: 0.4
+  stop_mode: structure
+  stop_swing_lookback_1h: 6
+  structure_buffer_atr: 0.4
+  min_stop_atr: 0.3
+  max_stop_atr: 2.5
+  atr_stop_multiple: 2.0
+  exit_ema_bars: 50
+  breakeven_trigger_r: 1.5
+  trailing_trigger_r: 2.5
+  trailing_atr_multiple: 2.0
+
+low_position_watch:
+  enabled: true
+  range_position_min_pct: 0
+  range_position_max_pct: 45
+  ema50_distance_min_pct: -10
+  ema50_distance_max_pct: 8
+  recent_return_min_pct: -15
+  recent_return_max_pct: 15
+  ema50_slope_min_pct: -0.5
+
+# Independent, log-only comparison of the legacy directional observer and Bollinger rules.
+bollinger_observation:
+  enabled: true
+  period: 20
+  standard_deviations: 2
+  width_lookback_bars: 50
+  width_low_quantile: 0.30
+  middle_slope_lookback_bars: 5
+  middle_flat_tolerance_pct: 0.1
+  expansion_lookback_bars: 3
+  volume_filter_enabled: false
+
+universe:
+  min_quote_volume_24h: 20000000
+  min_list_days: 14
+  exclude_symbols:
+    - BTCUSDT
+    - ETHUSDT
+
+fees:
+  taker_bps: 5
+  slippage_bps: 3

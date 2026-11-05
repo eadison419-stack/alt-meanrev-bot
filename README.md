@@ -1,0 +1,99 @@
+# Alt Mean Reversion Bot
+
+这是 2026-10-23 的 Windows 源码安装包。项目面向 Binance USDⓈ-M USDT 永续合约，提供本地 Paper 模拟、USDⓈ-M Demo 试运行、策略回测和诊断工具。
+
+安装包不是独立 EXE，也不是离线依赖包。需要 Windows x64、Python 3.11 或 3.12，以及安装时访问 Python 包索引的网络。首次策略运行还需要访问 Binance 公共行情 API。
+
+默认运行方式是本地 Paper：只读取公开行情，在本地模拟成交，不创建私有交易所客户端，也不发送订单。安装脚本只准备项目虚拟环境和依赖，不启动服务、不连接账户、不注册 watchdog 或计划任务。
+
+独立的旧版 LOW/HIGH 均值回归 Paper Runner 可用以下命令启动：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_legacy_mr_paper.py
+```
+
+它使用热度 Top 20、4H LOW/HIGH 与已收盘 1H 方向信号、BTC 大盘风险拦截、当前共享风控参数及 EMA20 中轨回撤退出。账本单独保存在 `data/paper/legacy_low_high_portfolio.json`，默认虚拟资金为 5,000 USDT；日志保存在 `logs/legacy_low_high_paper.log`。它仅连接公开行情，不读取 Demo 账户或发送交易委托。加 `--once` 可运行一个行情周期后退出。
+
+需要单独查看这份旧版 Paper 账本时，在另一个 PowerShell 窗口运行。旧账本预览使用 8768 端口，8767 留给新的独立策略：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_dashboard.py --state .\data\paper\legacy_low_high_portfolio.json --port 8768
+```
+
+## 快速安装
+
+1. 将 ZIP 解压到一台干净的 Windows 电脑上的新目录。
+2. 在解压后的项目根目录打开 PowerShell。
+3. 运行：powershell -ExecutionPolicy Bypass -File .\install.ps1
+4. 安装成功后，如要开始本地 Paper：.\run-local-paper.ps1
+5. 用 Ctrl+C 停止本地 Paper。
+
+USDⓈ-M Demo 需要单独录入 Demo 专用凭据并手动启动，入口为 `.\run-demo-paper.ps1`，详见 INSTALL_WINDOWS.md。
+
+更完整的安装、Demo 前置核对和故障说明见 INSTALL_WINDOWS.md。完整策略说明见 STRATEGY_REVIEW_2026-10-23.md 和 STRATEGY_BOUNDARIES.md。
+
+8766 源码仓库初始化、跨电脑恢复、GitHub 同步与回滚步骤见 [GITHUB_WORKFLOW.md](GITHUB_WORKFLOW.md)。仓库只保存源码和可复现配置，不同步 Demo 密钥、账本或交易状态。
+
+## 包含内容
+
+- src/：策略、行情、路由、风控、Paper、Demo、回测和 Dashboard 实现。
+- configs/default.yaml：唯一正式策略参数源。
+- scripts/：CLI、Demo 凭据、安全运行脚本与可选 watchdog 源文件。
+- tests/：离线测试源码，供后续维护者使用。
+- pyproject.toml、uv.lock：依赖声明和锁定版本。
+- AGENTS.md、STRATEGY_BOUNDARIES.md 和本包的安装／策略文档。
+- MANIFEST.sha256：包内文件校验值。
+
+## 有意排除
+
+真实环境文件、API 密钥、账本、订单／仓位状态、市场缓存、研究缓存、运行日志、虚拟环境、Python 缓存和当前电脑上的计划任务或快捷方式均未打包。该 ZIP 是干净源码快照，不能恢复另一台电脑的余额、模拟状态、Demo 订单或历史表现。
+
+实盘入口当前拒绝执行。任何 Demo 模式都必须由操作者主动配置 USDⓈ-M Demo 凭据并手动启动；不得把正式账户凭据放入机器人。
+
+## 8766 USDⓈ-M Demo 开仓门槛
+
+8766 的 Demo Runner 使用热度 Top 20 选币，并在现有已收盘 1H 均值回归触发前增加日线方向门槛：只读取最近一根已收盘的 UTC 日线，用 `symbol_regime.ema_slow_bars`（当前为 50）计算日线 EMA50。日线收盘高于 EMA50 时只允许做多，低于时只允许做空；相等、有效完整日线不足 51 根、行情不可用或数据无效时，该币本轮不新开仓。未收盘的当日日线不会参与计算。
+
+方向门槛通过后，原入场条件保持不变：只用已收盘 4H K 线计算 4H EMA50；已收盘 1H 收盘价不高于 4H EMA50 × 0.99 且该 K 线收阳时做多，收盘价不低于 4H EMA50 × 1.01 且该 K 线收阴时做空。资金费率、BTC 风险、仓位和初始保护止损保持原样。浮盈达到 1 ATR 时保护止损锁定扣费和滑点后的 +0.2R，达到 1.5R 后提高至 +0.5R，达到 2R 后启动原有追踪算法。Demo 持仓以 5 秒为轮询间隔检查新鲜合约报价；轮询在 Runner 闲置时运行，也会插入行情扫描各请求之间。单个正在进行的网络请求返回前无法并行执行监控。报价超过 15 秒或不可用时跳过实时结构失效、分段保护／追踪止损更新，并在账本记录行情状态，交易所已有保护止损继续有效。现有结构失效线（摆动结构位外 0.25 ATR）会在报价新鲜、且失效线比交易所保护止损更靠近当前价格时触发 Demo 市价平仓；1H 收盘检查继续保留。达到分段锁盈或追踪触发条件后，止损会在下一次有效监控中即时上移；首次分段保护不受 15 秒止损更新间隔限制，后续追踪更新至少间隔 15 秒。24 小时持仓上限也由快监控处理。布林中轨拒绝、行情状态衰退和无进展退出仍按已收盘 K 线确认。8767 使用相同的方向门槛和收盘 1H 入场条件，仍是独立的本地 Paper 账本。
+
+8766 的结构失效平仓若净盈亏非正或无法计算，按亏损止损应用 6 小时冷却。同一币种、同一方向连续两次结构失效亏损后，必须再等一根已收盘 1H K 线收在前一根 K 线高点之外（多头）或低点之外（空头），才解除该方向的再次入场限制；随后仍须满足原有入场条件。连续失败次数和确认事件从 Demo 账本事件恢复，Runner 重启后继续生效。其他方向及 8767 独立 Paper 不受此门槛影响。
+
+无法计算的盈亏包括缺失值、无法转换的值、布尔值、`NaN`、正负无穷及计算溢出。Demo 平仓会校验盈亏计算分量与最终结果；无法确认净盈亏时，新平仓事件记录 `net_pnl: null`、`pnl_recorded: false`，结构失效风险控制仍将其计入连续失败。旧账本中的异常盈亏采用相同判定，冷却从原平仓时间起算；突破确认不会提前结束 6 小时冷却。
+
+8766 的下一轮扫描等待会在下一个 UTC 1H 收盘处提前结束，避免扫描耗时与固定等待时间不断叠加。已收盘 4H 行情和日线方向结果在各自 UTC 周期内复用，新周期必须重新获取；日线缓存还会在没有新入场评估的轮次预热。热度选币继续使用本轮行情计算，缓存不改变同批行情的信号或排名。同步网络请求返回前仍无法抢占执行。
+
+8766 在账户模式、持仓和合约设置检查完成后，发单前再次获取 Demo 五档盘口，做多使用最佳卖价、做空使用最佳买价。信号从 1H 收盘至最终发单检查不得超过 `execution.confirm_delay_sec_max`（当前 60 秒）；盘口时间戳必须有效且不晚于本地观察时间，盘口年龄不得超过 `execution.entry_quote_max_age_sec`（当前 15 秒）。缺失、异常或过期报价禁止该次开仓。复核使用原信号的已收盘 4H EMA、1H 开盘价、ATR 和结构位，检查偏离及方向条件、结构失效和原计划止损，并按最新报价重算止损距离、数量和风控。首个候选被拒后，仍可在有效期内按原排名评估下一候选。
+
+`execution.entry_adverse_atr_observe` 当前为 `[0.05, 0.10, 0.15]`，只记录各档不利报价偏移是否超限，不据此拦截。`entry_preflight_decision` 记录实际评估、报价和最终检查时间；`entry_execution_quality` 记录发单前本地时间、成交时间、公共／Demo 报价、档位数量与 ATR 偏移分解；公共报价不可用时保留缺失原因，不作为 Demo 报价的替代。两个报价并非同时采集，事件保留时间差，最佳一档数量也不保证整笔市价单能按该价格成交。`entry_cycle_timing` 记录行情准备和入场评估完成时间。60 秒约束的是发单前信号有效性，市价单最终成交价及完成时间仍取决于交易所。
+
+8766 的退出处理进度与入场扫描进度独立记录。入场扫描在账本的 `mr_entry_scan` 保存本根 1H K 线、候选名单、方向、尝试次数与处理结果。已完成的候选不会因轮询、重启或同根 K 线内开平仓而重复入场；尚未完成的候选只能在原收盘时刻起算的 60 秒内继续。候选评估和发单前准备中的单币 `BadSymbol` 等确定性错误会记录后跳过；暂时性读取失败先让其他候选完成，再最多补一次。认证、限流、账户异常或程序错误暂停本轮新开仓，正常候选仍遵循原有排名、入场条件与风控。
+
+Demo 开仓会先在 `mr_entry_attempts` 持久化稳定的 `clientOrderId`，最终发送前再保存实际数量和止损位。保存失败时不发单；保存后也重新检查信号和盘口有效期。发单后响应丢失或保护止损结果不明时，暂停新开仓并按保存的订单标识查询订单、成交、持仓和保护止损，不自动补发市价单。重启后先进行同样的对账。仅当成交、持仓和保护止损一致时恢复本地持仓；查询不到订单、成交后已经平仓但平仓账目未核实、或保护止损无法确认时，继续暂停新开仓并记录原因，需后续核对处理。已确认的其他持仓继续使用现有退出管理，未知订单的保护单不做孤儿清理。
+
+`entry_scan_outcome` 和 `entry_scan_finished` 记录单币结果及本轮状态；异常记录包含币种、阶段、公共／Demo 接口类别、异常类型和是否可能已发单，不记录原始异常响应。扫描之外的接口错误记录 `entry_cycle_failed`，无法确认接口来源时标为 `unidentified`。以上调整不改变策略入场阈值、分段锁盈参数或其他退出规则。
+
+## 8767 独立本地均值回归 Paper
+
+8767 独立运行于本地 Paper，不读取 Demo 账户、不发送交易所委托，默认使用 5,000 USDT 虚拟资金。它每 5 分钟刷新热度 Top 20；仅在新 1H K 线收盘后评估入场，使用最近收盘 UTC 日线方向门槛、已收盘 4H EMA50 和已收盘 1H 反转条件。通过资金费率、BTC 风险和仓位风控后按 1H 收盘价模拟成交。保护止损在浮盈达到 1 ATR 后锁定扣除费用和滑点后的 +0.2R，达到 1.5R 后提高至 +0.5R，达到 2R 后启动原有追踪算法；其他结构失效、布林中轨、行情状态、无进展及持仓时限退出保持原样。本地保护止损仍每轮使用实时价格监控。看护器每 15 秒运行一轮。
+
+在项目根目录运行以下命令启动看护器。看护器会拉起 Paper Runner，并在 Runner 进程退出或账本心跳超时后重启：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\watch_mr_intrabar_paper.ps1
+```
+
+Dashboard 使用独立账本和 8767 端口：
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_dashboard.py --state .\data\paper\ema50_intrabar_portfolio.json --port 8767 --no-open
+```
+
+本地访问地址为 `http://127.0.0.1:8767/`。策略日志保存在 `logs/mr_intrabar_paper.log`，看护日志保存在 `logs/mr-intrabar-watchdog-YYYYMMDD.log`。
+
+## 时间过滤的 fail-closed 与审计
+
+8766／8767 的均值回归开仓均要求最新 1H K 线已收盘，时间戳按 K 线开盘时间加 1 小时计算。时间过滤只使用截至该收盘时刻的数据；至少要有 25 根连续完整 1H K 线，覆盖 ATR 和此前 24 根区间。收盘时间不匹配、历史不足、K 线断档、ATR 无效或 OHLCV 无效时，数据状态会标为不可用并禁止新开仓。8767 另会拒绝收盘超过 10 分钟的迟到信号；8766 在候选评估和最终发单前均用真实当前时间检查 `execution.confirm_delay_sec_max`，不再以循环开始时间和固定 10 分钟上限替代。
+
+若均值回归条件本身形成候选，账本会写入 `entry_time_filter_decision`，记录候选方向、允许／拦截结果、原因、K 线 UTC／上海时间、脉冲 ATR 倍数、区间标记和 Runner／过滤器源码指纹。8767 对未收盘或迟到的 K 线记录 `entry_bar_rejected`。可在 Dashboard 对应账本状态中的事件记录和 Runner 日志中核对。
+
+8766 的 LOW/HIGH 衰退退出现在会在每次持仓 1H 退出评估时写入 `regime_fade_evaluated`，包含持仓／当前 4H regime、1H 收盘进展 ATR 倍数、0.5 ATR 阈值及是否在热点榜。数据缺失或更高优先级退出先发生时写入 `regime_fade_check_skipped`；条件触发时先写 `regime_fade_exit_attempted`，交易所确认平仓后仍以 `paper_fill` 和 `long_regime_faded`／`short_regime_faded` 记录成交。以上事件仅用于审计，不改变退出条件。
