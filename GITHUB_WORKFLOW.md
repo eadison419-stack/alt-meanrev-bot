@@ -9,7 +9,7 @@
 安装 Git，并安装 Python 3.11 或 3.12。然后克隆仓库并安装锁定依赖：
 
 ```powershell
-git clone https://github.com/<OWNER>/alt-meanrev-bot.git
+git clone https://github.com/eadison419-stack/alt-meanrev-bot.git
 Set-Location .\alt-meanrev-bot
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
