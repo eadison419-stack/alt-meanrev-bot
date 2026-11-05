@@ -195,6 +195,32 @@ class DemoExecutionService:
         except Exception:
             return None
 
+    def funding_history(self, started_at: datetime, ended_at: datetime) -> list[dict] | None:
+        """Read a bounded USDT funding interval for delayed settlement reconciliation."""
+        if (started_at.tzinfo is None or ended_at.tzinfo is None
+                or ended_at < started_at):
+            return None
+        try:
+            verify_demo_urls(self.exchange)
+            start_ms, end_ms = int(started_at.timestamp() * 1000), int(ended_at.timestamp() * 1000)
+            rows = self.exchange.fapiPrivateGetIncome({
+                "incomeType": "FUNDING_FEE", "startTime": start_ms, "endTime": end_ms,
+                "limit": 1000,
+            }) or []
+            if len(rows) >= 1000:
+                return None
+            result = []
+            for row in rows:
+                amount, at = float(row["income"]), int(row["time"])
+                if (row.get("asset") != "USDT" or row.get("incomeType") != "FUNDING_FEE"
+                        or not row.get("symbol") or not math.isfinite(amount)
+                        or not start_ms <= at <= end_ms):
+                    return None
+                result.append({"symbol": row["symbol"], "time": at, "income": amount})
+            return result
+        except Exception:
+            return None
+
     def resolve_entry_fee(self, symbol: str, side: Side, quantity: float,
                           entry_price: float, opened_at: datetime) -> float | None:
         """Recover an older Demo entry fee only when one matching order is unambiguous."""

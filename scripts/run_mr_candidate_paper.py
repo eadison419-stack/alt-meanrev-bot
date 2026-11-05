@@ -69,6 +69,7 @@ from bot.risk import (OrderIntent, assess_entry, calculate_adaptive_stop,
 from bot.signals import Action, Side
 from bot.strategy_router import MEAN_REVERSION
 from bot.time_filter import TimeFilterFlags, evaluate_time_filter
+from bot.utils.logging import redact_log_record, redacted_excepthook
 
 HOUR_MS = 3600 * 1000
 FOUR_H_MS = 4 * HOUR_MS
@@ -127,6 +128,81 @@ def _next_poll_delay(now, poll, *, align_hourly=False, cycle_started_at=None):
     return min(float(poll), (next_hour - now).total_seconds())
 
 
+class _RunnerCheckpoint:
+    """Keep monitoring in memory during storage outages; entries require a save."""
+
+    def __init__(self, state, path):
+        self.state, self.path = state, path
+        self.failed = False
+
+    def __call__(self):
+        recovery = None
+        if self.failed:
+            recovery = {"event": "state_persistence_recovered", "at": _utc_now().isoformat()}
+            self.state.events.append(recovery)
+        try:
+            self.state.save(self.path)
+        except OSError as exc:
+            if recovery is not None:
+                self.state.events.pop()
+            if not self.failed:
+                self.state.events.append({
+                    "event": "state_persistence_unavailable", "at": _utc_now().isoformat(),
+                    "error": type(exc).__name__, "new_entries_paused": True,
+                })
+                logger.error("MR state persistence unavailable; entries paused: {}", type(exc).__name__)
+            self.failed = True
+            raise
+        if self.failed:
+            logger.info("MR state persistence recovered")
+        self.failed = False
+
+    def try_save(self):
+        try:
+            self()
+        except OSError:
+            return False
+        return True
+
+
+def _wait_with_monitor(seconds, monitor=None):
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(DEMO_POSITION_MONITOR_POLL_SECONDS, remaining) if monitor else remaining)
+        if monitor is not None:
+            monitor()
+
+
+def _initialize_demo(execution):
+    for attempt in range(3):
+        try:
+            return execution.initialize()
+        except ccxt.BaseError as exc:
+            if attempt == 2 or not mr_scan.retryable_read(exc):
+                raise
+            logger.warning("Demo startup read failed; retry {}/3: {}", attempt + 1, type(exc).__name__)
+            time.sleep(attempt + 1)
+
+
+def _read_entry_data(read, *, phase, retry=False, deadline=None, monitor=None, symbol=None):
+    for attempt in range(2 if retry else 1):
+        try:
+            return read()
+        except ccxt.BaseError as exc:
+            exc.mr_phase, exc.mr_endpoint, exc.mr_symbol = phase, "public", symbol
+            if attempt or not retry or not mr_scan.retryable_read(exc):
+                raise
+            if monitor is not None:
+                monitor()
+            if deadline is not None and _utc_now() >= deadline:
+                raise
+            logger.warning("MR public read retry phase={} symbol={} error={}",
+                           phase, symbol, type(exc).__name__)
+
+
 def _source_fingerprint(path):
     try:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]
@@ -159,12 +235,17 @@ def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, le
             })
             if attempt["status"] != "prepared":
                 raise RuntimeError("entry attempt already submitted; reconciliation required")
+            if entry_audit is not None:
+                entry_audit["clientOrderId"] = client_id
             mr_scan.checkpoint(checkpoint)
 
             def on_submit(amount, actual_stop, submitted_at):
                 attempt.update(status="submitting", quantity=amount, stop_price=actual_stop,
-                               submitted_at=submitted_at.isoformat())
+                               submitted_at=submitted_at.isoformat(),
+                               audit=dict(entry_audit or {}))
                 scan_row.update(phase="submit_or_protect", order_may_have_been_sent=True)
+                mr_scan.attempt_outcome(state, attempt, "submitting", submitted_at,
+                                        phase=scan_row["phase"], order_may_have_been_sent=True)
                 mr_scan.checkpoint(checkpoint)
                 quote_deadline = (entry_audit or {}).get("quote_valid_until")
                 if quote_deadline and _utc_now() > datetime.fromisoformat(quote_deadline):
@@ -181,14 +262,30 @@ def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, le
             if attempt is not None:
                 attempt["status"] = "not_submitted"
                 scan_row["order_may_have_been_sent"] = False
-                mr_scan.checkpoint(checkpoint)
             if entry_audit is not None and entry_audit.get("decision") != "BLOCK":
                 _record_preflight_decision(state, entry_audit, str(exc), _utc_now())
+            if attempt is not None:
+                mr_scan.attempt_outcome(state, attempt, "not_submitted", _utc_now(),
+                                        phase=scan_row.get("phase"), reason=str(exc),
+                                        order_may_have_been_sent=False)
+                mr_scan.checkpoint(checkpoint)
             return None
-        except Exception:
-            if attempt is not None and attempt["status"] == "submitting":
-                attempt["status"] = "uncertain"
-                state.execution_status = "entry_reconciliation_required"
+        except Exception as exc:
+            if attempt is not None:
+                # A failed pre-submit checkpoint prevents execution.open from sending.
+                uncertain = (attempt["status"] == "submitting"
+                             and not isinstance(exc, mr_scan.ScanCheckpointError))
+                if uncertain:
+                    attempt["status"] = "uncertain"
+                    state.execution_status = "entry_reconciliation_required"
+                else:
+                    attempt["status"] = "prepared"
+                    scan_row["order_may_have_been_sent"] = False
+                mr_scan.attempt_outcome(
+                    state, attempt, "uncertain" if uncertain else "not_submitted", _utc_now(),
+                    phase=scan_row.get("phase"), error=type(exc).__name__,
+                    order_may_have_been_sent=uncertain,
+                )
                 mr_scan.checkpoint(checkpoint)
             raise
         if attempt is not None:
@@ -215,7 +312,8 @@ def _record_demo_open(state, symbol, side, reason, regime_value, result, entry_a
                          "side": side.value, "at": opened_at.isoformat(), "quantity": position.quantity,
                          "price": position.entry_price, "reason": reason, "source": MEAN_REVERSION,
                          "fee": fill.get("fee_cost"), "orderId": fill.get("id"),
-                         "clientOrderId": fill.get("clientOrderId"),
+                         "clientOrderId": (fill.get("clientOrderId")
+                                           or (entry_audit or {}).get("clientOrderId")),
                          "execution_source": "binance_usdm_demo"})
     if entry_audit is not None:
         _record_entry_execution_fill(state, position, result, entry_audit)
@@ -391,7 +489,7 @@ def _record_entry_execution_fill(state, position, result, audit):
         "fill_at": position.opened_at.isoformat(), "fill_price": position.entry_price,
         "fill_time_verified": _verified_fill_timestamp(result["fill"]) is not None,
         "orderId": result["fill"].get("id"),
-        "clientOrderId": result["fill"].get("clientOrderId"),
+        "clientOrderId": result["fill"].get("clientOrderId") or audit.get("clientOrderId"),
         "quantity": position.quantity,
         "order_submitted_at": result.get("order_submitted_at"),
         "signal_to_fill_atr": direction * (position.entry_price - audit["signal_close"]) / atr_value,
@@ -781,6 +879,96 @@ def _demo_close_values(execution, state, position, fill, closed_at):
     net = (_finite_pnl_value(gross - fees + funding)
            if gross is not None and fees is not None and funding is not None else None)
     return gross, fees, funding, net
+
+
+def _reconcile_demo_funding(execution, state, now, *, position_monitor=None):
+    """Recheck late-posted funding without changing fills or account balances."""
+    fetch = getattr(execution, "funding_history", None)
+    if not callable(fetch):
+        return False
+    previous = next((e for e in reversed(state.events)
+                     if e.get("event") == "funding_reconciliation_checked"), {})
+    checked_at = _aware_datetime(previous.get("at"))
+    if checked_at is not None and (now - checked_at).total_seconds() < 300:
+        return False
+    active, trades = {}, []
+    for event in state.events:
+        if (event.get("event") != "paper_fill"
+                or event.get("execution_source") != "binance_usdm_demo"):
+            continue
+        symbol = event["symbol"]
+        if event.get("action") == "OPEN":
+            active[symbol] = event
+            continue
+        if event.get("action") != "CLOSE":
+            continue
+        opened = active.pop(symbol, {})
+        start = _aware_datetime(event.get("opened_at") or opened.get("at"))
+        end = _aware_datetime(event.get("closed_at") or event.get("at"))
+        gross, fees = _finite_pnl_value(event.get("gross_pnl")), _finite_pnl_value(event.get("fees"))
+        if start is None or end is None or end < start or gross is None or fees is None:
+            continue
+        age = (now - end).total_seconds()
+        if age < 300 or (age > 86400 and event.get("funding_rechecked_at")):
+            continue
+        try:
+            market_id = execution.exchange.market(symbol)["id"]
+        except (ccxt.BaseError, KeyError):
+            continue
+        trades.append({"event": event, "symbol": market_id, "start": start, "end": end,
+                       "gross": gross, "fees": fees, "income": []})
+    if not trades:
+        return False
+    cursor, through = min(t["start"] for t in trades), max(t["end"] for t in trades)
+    rows = []
+    while cursor <= through:
+        if position_monitor is not None:
+            position_monitor()
+        until = min(through, cursor + timedelta(days=5) - timedelta(milliseconds=1))
+        batch = fetch(cursor, until)
+        if batch is None:
+            state.events.append({"event": "funding_reconciliation_checked",
+                                 "at": now.isoformat(), "status": "unavailable"})
+            return True
+        rows.extend(batch)
+        cursor = until + timedelta(milliseconds=1)
+    ambiguous = set()
+    for row in rows:
+        owners = [i for i, trade in enumerate(trades) if row["symbol"] == trade["symbol"]
+                  and int(trade["start"].timestamp() * 1000) <= row["time"]
+                  <= int(trade["end"].timestamp() * 1000)]
+        if len(owners) > 1:
+            ambiguous.update(owners)
+        elif owners:
+            trades[owners[0]]["income"].append(row["income"])
+    adjusted = 0
+    for i, trade in enumerate(trades):
+        if i in ambiguous:
+            continue
+        event = trade["event"]
+        income = math.fsum(trade["income"])
+        net = _finite_pnl_value(trade["gross"] - trade["fees"] + income)
+        if net is None:
+            continue
+        old_funding, old_net = event.get("funding_paid"), event.get("net_pnl")
+        event["funding_rechecked_at"] = now.isoformat()
+        funding_value, net_value = _finite_pnl_value(old_funding), _finite_pnl_value(old_net)
+        if (funding_value is not None and net_value is not None
+                and abs(funding_value - income) <= 1e-8 and abs(net_value - net) <= 1e-8):
+            continue
+        event.update(funding_paid=income, net_pnl=net, pnl_recorded=True,
+                     funding_source="binance_income_recheck")
+        state.events.append({
+            "event": "funding_reconciliation_adjusted", "at": now.isoformat(),
+            "symbol": event["symbol"], "opened_at": trade["start"].isoformat(),
+            "closed_at": trade["end"].isoformat(), "previous_funding": funding_value,
+            "funding_income": income, "previous_net_pnl": net_value, "net_pnl": net,
+        })
+        adjusted += 1
+    state.events.append({"event": "funding_reconciliation_checked", "at": now.isoformat(),
+                         "status": "ambiguous" if ambiguous else "completed",
+                         "checked_trades": len(trades) - len(ambiguous), "adjusted_trades": adjusted})
+    return True
 
 
 def _close_position(is_demo, execution, state, symbol, price, reason, at, fee_rate, slip_rate):
@@ -1571,9 +1759,12 @@ def _ticker_observed_at(tickers, symbol):
 
 
 def _build_universe(exchange, settings, now, now_ms, *, fail_on_market_error=False,
-                    on_progress=None):
-    markets = exchange.load_markets()
-    tickers = exchange.fetch_tickers()
+                    on_progress=None, retry_reads=False):
+    deadline = now.replace(minute=0, second=0, microsecond=0) + timedelta(
+        seconds=settings.execution.confirm_delay_sec_max)
+    read_kwargs = {"retry": retry_reads, "deadline": deadline, "monitor": on_progress}
+    markets = _read_entry_data(exchange.load_markets, phase="universe_markets", **read_kwargs)
+    tickers = _read_entry_data(exchange.fetch_tickers, phase="universe_tickers", **read_kwargs)
     candidates = filter_tradable_crypto_universe(markets, tickers, settings, now=now)
     one_hour: dict[str, pd.DataFrame] = {}
     current_hour: dict[str, dict] = {}
@@ -1582,7 +1773,10 @@ def _build_universe(exchange, settings, now, now_ms, *, fail_on_market_error=Fal
         if on_progress is not None:
             on_progress()
         try:
-            rows = exchange.fetch_ohlcv(symbol, "1h", limit=60)
+            rows = _read_entry_data(
+                lambda: exchange.fetch_ohlcv(symbol, "1h", limit=60),
+                phase="universe_hourly", symbol=symbol, **read_kwargs,
+            )
         except ccxt.BaseError as exc:
             _raise_market_error_if_needed(exc, fail_on_market_error)
             continue
@@ -1866,7 +2060,8 @@ def _reconcile_pending_entries(execution, state, checkpoint):
             else:
                 if local is None:
                     local = _record_demo_open(state, symbol, Side(attempt["side"]),
-                                              attempt["reason"], attempt["regime"], result)
+                                              attempt["reason"], attempt["regime"], result,
+                                              attempt.get("audit"))
                 if symbol not in state.exit_management_by_symbol:
                     meta = attempt["meta"]
                     _initialize_entry_metadata(
@@ -1883,6 +2078,9 @@ def _reconcile_pending_entries(execution, state, checkpoint):
             state.events.append({"event": "entry_order_reconciliation", "at": _utc_now().isoformat(),
                                  "symbol": symbol, "clientOrderId": attempt["clientOrderId"],
                                  **attempt["reconciliation"]})
+            mr_scan.attempt_outcome(state, attempt, attempt["status"], _utc_now(),
+                                    phase="reconciliation", reconciled=True, error=report.get("error"),
+                                    order_may_have_been_sent=True)
             logger.warning("MR entry reconciliation symbol={} status={} error={}",
                            symbol, status, report.get("error"))
         scan = state.mr_entry_scan
@@ -1983,7 +2181,7 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
     else:
         markets, hotlist, one_hour, current_hour, tickers = _build_universe(
             exchange, settings, now, now_ms, fail_on_market_error=intrabar_entries,
-            on_progress=position_monitor,
+            on_progress=position_monitor, retry_reads=is_demo,
         )
         top_symbols = [row["symbol"] for row in hotlist]
         track = sorted(set(top_symbols) | set(state.portfolio.positions) | set(resume_symbols))
@@ -2815,6 +3013,10 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                     if opened is not None:
                         client_id = mr_scan.client_order_id(symbol, candidate[2].value, scan["bar"])
                         state.mr_entry_attempts[client_id]["status"] = "completed"
+                        mr_scan.attempt_outcome(
+                            state, state.mr_entry_attempts[client_id], "completed", _utc_now(),
+                            phase="fill_confirmed", order_may_have_been_sent=True,
+                        )
                     finish(symbol, "opened" if opened is not None else "rejected")
                 except mr_scan.ScanCheckpointError:
                     raise
@@ -2881,6 +3083,7 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
 
 
 def main() -> int:
+    sys.excepthook = redacted_excepthook
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--poll", type=int, default=300, help="poll interval in seconds")
     parser.add_argument("--max-positions", type=int, default=5)
@@ -2909,7 +3112,8 @@ def main() -> int:
     logger.remove()
     log_name = "mr_intrabar_paper.log" if args.intrabar_entries else "mr_candidate_paper.log"
     logger.add(log_dir / log_name, rotation="10 MB", retention=7,
-               enqueue=True, level="INFO")
+               enqueue=True, level="INFO", backtrace=False, diagnose=False,
+               filter=redact_log_record)
     pid_name = "ema50_intrabar_paper.pid" if args.intrabar_entries else "mr_candidate_paper.pid"
     pid_path = PROJECT_ROOT / "data" / "paper" / pid_name
     pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2926,14 +3130,26 @@ def main() -> int:
     try:
         state = MultiPaperState.load(state_path, initial_equity=args.equity)
         state.execution_mode = mode.name
-        checkpoint = lambda: state.save(state_path)
+        checkpoint = _RunnerCheckpoint(state, state_path)
         if is_demo:
             demo_exchange = create_demo_usdm(settings.runtime)
             execution = DemoExecutionService(demo_exchange, settings)
-            state.exchange_snapshot = execution.initialize()
-            entries_reconciled = _reconcile_pending_entries(execution, state, checkpoint)
+            try:
+                state.exchange_snapshot = _initialize_demo(execution)
+            except ccxt.BaseError as exc:
+                state.events.append({"event": "demo_startup_failed", "at": _utc_now().isoformat(),
+                                     "phase": "account_initialization", "endpoint": "demo",
+                                     "error": type(exc).__name__, "order_may_have_been_sent": False})
+                if state_path_existed:
+                    checkpoint.try_save()
+                logger.error("Demo startup failed before entry processing: {}", type(exc).__name__)
+                return 1
+            try:
+                entries_reconciled = _reconcile_pending_entries(execution, state, checkpoint)
+            except mr_scan.ScanCheckpointError:
+                entries_reconciled = False
             if entries_reconciled and not _demo_sync_stopped(execution, state, datetime.now(timezone.utc)):
-                state.save(state_path)
+                checkpoint.try_save()
                 raise RuntimeError("Demo positions do not match the local ledger; refusing to start")
             if not state_path_existed:
                 state.initial_equity = float(state.exchange_snapshot["equity"])
@@ -2947,7 +3163,7 @@ def main() -> int:
                                  "previous": state.strategy_variant,
                                  "current": candidate_variant})
             state.strategy_variant = candidate_variant
-        state.save(state_path)
+        checkpoint.try_save()
 
         logger.info("Starting MR candidate paper: mode={} strategy={} max_positions={} risk_per_trade_pct={} poll={} intrabar_entries={} runner_build_id={} time_filter_build_id={} state={}",
                     mode.name, candidate_variant, args.max_positions,
@@ -3002,19 +3218,31 @@ def main() -> int:
                 dirty = True
             if dirty:
                 state.record_equity(datetime.now(timezone.utc))
-                state.save(state_path)
+                checkpoint.try_save()
             return dirty
 
         while True:
             now = datetime.now(timezone.utc)
+            if checkpoint.failed:
+                monitor_demo_positions(force=True)
+                if not checkpoint.try_save():
+                    logger.info("MR state save pending; new entries remain paused")
+                    if args.once:
+                        return 1
+                    _wait_with_monitor(min(float(args.poll), 30.0),
+                                       monitor_demo_positions if is_demo else None)
+                    continue
             if args.intrabar_entries and retry_after is not None and now < retry_after:
                 state.record_equity(now)
-                state.save(state_path)
+                checkpoint.try_save()
                 remaining = max(1.0, (retry_after - now).total_seconds())
                 time.sleep(min(float(args.poll), remaining))
                 continue
+            cycle_completed = False
             try:
                 monitor_demo_positions(force=True)
+                if checkpoint.failed:
+                    raise mr_scan.ScanCheckpointError("MR state storage unavailable")
                 _cycle(exchange, execution, state, settings, now, is_demo, args.max_positions,
                        intrabar_entries=args.intrabar_entries, market_cache=market_cache,
                        position_monitor=monitor_demo_positions if is_demo else None,
@@ -3022,11 +3250,14 @@ def main() -> int:
                 monitor_demo_positions()
                 market_failure_attempt = 0
                 retry_after = None
+                cycle_completed = True
             except ccxt.BaseError as exc:
                 if is_demo:
                     state.events.append({"event": "entry_cycle_failed", "at": _utc_now().isoformat(),
                                          "cycle_started_at": now.isoformat(), "status": "partial",
-                                         "phase": "outside_candidate_scan", "endpoint": "unidentified",
+                                         "phase": getattr(exc, "mr_phase", "outside_candidate_scan"),
+                                         "endpoint": getattr(exc, "mr_endpoint", "unidentified"),
+                                         "symbol": getattr(exc, "mr_symbol", None),
                                          "error": type(exc).__name__,
                                          "order_may_have_been_sent": bool(mr_scan.unresolved_attempts(state))})
                 if args.intrabar_entries:
@@ -3044,26 +3275,24 @@ def main() -> int:
                         retry_after.isoformat(), int(retry_delay), type(exc).__name__,
                     )
                 else:
-                    logger.warning("MR cycle failed outside candidate scan; endpoint not identified: {}", type(exc).__name__)
+                    logger.warning("MR cycle failed phase={} endpoint={} error={}",
+                                   getattr(exc, "mr_phase", "outside_candidate_scan"),
+                                   getattr(exc, "mr_endpoint", "unidentified"), type(exc).__name__)
+            except mr_scan.ScanCheckpointError:
+                logger.error("MR entry checkpoint failed; entries paused until storage recovers")
+            if is_demo and not checkpoint.failed:
+                _reconcile_demo_funding(execution, state, _utc_now(),
+                                       position_monitor=monitor_demo_positions)
             state.record_equity(now)
-            state.save(state_path)
+            saved = checkpoint.try_save()
             logger.info("MR candidate paper equity={} open_positions={}",
                         round(state.current_equity, 4), len(state.portfolio.positions))
             if args.once:
-                break
+                return 0 if saved and cycle_completed else 1
             if retry_after is None:
                 poll_delay = _next_poll_delay(_utc_now(), args.poll, align_hourly=is_demo,
                                               cycle_started_at=now)
-                if is_demo and state.portfolio.positions:
-                    deadline = time.monotonic() + poll_delay
-                    while True:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            break
-                        time.sleep(min(DEMO_POSITION_MONITOR_POLL_SECONDS, remaining))
-                        monitor_demo_positions()
-                else:
-                    time.sleep(poll_delay)
+                _wait_with_monitor(poll_delay, monitor_demo_positions if is_demo else None)
             else:
                 remaining = max(1.0, (retry_after - datetime.now(timezone.utc)).total_seconds())
                 time.sleep(min(float(args.poll), remaining))

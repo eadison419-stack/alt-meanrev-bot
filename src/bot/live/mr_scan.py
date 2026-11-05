@@ -88,5 +88,13 @@ def outcome(state, scan, symbol, status, at, save=None, **details):
     return row
 
 
+def attempt_outcome(state, attempt, status, at, **details):
+    state.events.append({
+        "event": "entry_attempt_outcome", "at": at.isoformat(),
+        **{key: attempt[key] for key in ("symbol", "side", "bar", "clientOrderId")},
+        "status": status, "endpoint": "demo", **details,
+    })
+
+
 def expired(scan, at):
     return at > datetime.fromisoformat(scan["deadline"])

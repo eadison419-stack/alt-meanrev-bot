@@ -71,6 +71,7 @@ class MultiPaperState:
     inconsistencies: list[str] = field(default_factory=list)
     foreign_order_ids: list[str] = field(default_factory=list)
     equity_history: list[dict[str, Any]] = field(default_factory=list)
+    _pending_save: tuple[Path, Path] | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if not math.isfinite(self.initial_equity) or self.initial_equity <= 0:
@@ -234,15 +235,22 @@ class MultiPaperState:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2, allow_nan=False)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
-        )
-        temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+        if self._pending_save and self._pending_save[0] == target and self._pending_save[1].exists():
+            temporary = self._pending_save[1]
+            handle = temporary.open("w", encoding="utf-8", newline="\n")
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=target.parent,
+            )
+            temporary = Path(temporary_name)
+            handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+        self._pending_save = target, temporary
+        with handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         _replace_state_file(temporary, target)
+        self._pending_save = None
 
 
 class SymbolAccountView:

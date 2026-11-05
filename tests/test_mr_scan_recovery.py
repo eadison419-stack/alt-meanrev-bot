@@ -63,6 +63,8 @@ def scan_env(monkeypatch, tmp_path):
             refreshed, stop = before_submit(intent, stop_price)
             on_submit(refreshed.quantity, stop, clock[0])
             if faults.get("after_submit"):
+                if isinstance(faults["after_submit"], Exception):
+                    raise faults["after_submit"]
                 raise ccxt.RequestTimeout("response lost")
             return {"fill": {"id": client_order_id, "clientOrderId": client_order_id},
                     "position": {"quantity": refreshed.quantity, "entry_price": refreshed.price},
@@ -136,6 +138,32 @@ def test_lost_submit_response_survives_restart_and_never_resends(scan_env):
     assert attempt["clientOrderId"].startswith("mrb_")
     env.run(restored)
     assert env.calls == [FIRST]
+
+
+def test_preflight_bad_request_has_linked_uncertain_outcome_without_raw_response(scan_env):
+    env = scan_env
+    env.faults["after_submit"] = ccxt.BadRequest("GET ?signature=example-signature")
+    env.run()
+    audit = next(e for e in env.state.events if e.get("event") == "entry_preflight_decision")
+    outcome = next(e for e in env.state.events if e.get("event") == "entry_attempt_outcome"
+                   and e["status"] == "uncertain")
+    assert audit["clientOrderId"] == outcome["clientOrderId"]
+    assert outcome["error"] == "BadRequest" and outcome["order_may_have_been_sent"]
+    assert env.calls == [FIRST]
+    assert "example-signature" not in env.path.read_text(encoding="utf-8")
+
+
+def test_successful_attempt_links_preflight_fill_and_completed_outcome(scan_env):
+    env = scan_env
+    env.run()
+    for symbol in (FIRST, SECOND):
+        events = [e for e in env.state.events if e.get("symbol") == symbol]
+        audit = next(e for e in events if e.get("event") == "entry_preflight_decision")
+        fill = next(e for e in events if e.get("event") == "entry_execution_quality")
+        outcome = next(e for e in events if e.get("event") == "entry_attempt_outcome"
+                       and e["status"] == "completed")
+        assert audit["clientOrderId"] == fill["clientOrderId"] == outcome["clientOrderId"]
+    assert len(env.state.portfolio.positions) == 2
 
 
 def test_interrupted_scan_resumes_unfinished_symbols_without_repeating_exits(scan_env, monkeypatch):
@@ -276,6 +304,20 @@ def test_confirmed_entry_and_active_stop_are_adopted_once(recovery_env, tmp_path
     assert runner._reconcile_pending_entries(service, state, save)
     assert len([e for e in state.events if e.get("action") == "OPEN"]) == 1
     assert not state.exit_management_by_symbol[FIRST]["telemetry_history_complete"]
+
+
+def test_recovery_preserves_saved_preflight_quality_and_order_identity(recovery_env, tmp_path):
+    state, client, service = recovery_env
+    state.mr_entry_attempts["mrb_fixed"]["audit"] = {
+        "signal_atr": 1., "signal_close": 98., "clientOrderId": "mrb_fixed",
+        "demo_quote": {"price": 98., "quoted_at": NOW.isoformat()}, "public_quote": None,
+    }
+    assert runner._reconcile_pending_entries(service, state, lambda: state.save(tmp_path / "state.json"))
+    quality = next(e for e in state.events if e.get("event") == "entry_execution_quality")
+    assert quality["clientOrderId"] == "mrb_fixed"
+    assert quality["fill_price"] == 98 and quality["demo_quote_to_fill_atr"] == 0
+    outcome = next(e for e in state.events if e.get("event") == "entry_attempt_outcome")
+    assert outcome["status"] == "completed" and outcome["reconciled"]
 
 
 @pytest.mark.parametrize("case,reason", [("flat", "filled_then_flat"), ("no_stop", "protection_unconfirmed"),

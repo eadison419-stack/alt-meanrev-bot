@@ -88,6 +88,34 @@ def test_multi_paper_save_preserves_previous_state_after_replace_retries_exhaust
     assert all(source != state_path.with_name("portfolio.json.tmp") for source, _ in calls)
 
 
+def test_repeated_save_lock_reuses_temporary_and_recovers_latest_payload(tmp_path, monkeypatch):
+    state_path = tmp_path / "portfolio.json"
+    state_path.write_text('{"previous": true}', encoding="utf-8")
+    state = MultiPaperState()
+    replace = multi_paper_module.os.replace
+    sources = []
+    locked = [True]
+
+    def replace_after_unlock(source, target):
+        sources.append(Path(source))
+        if locked[0]:
+            raise PermissionError("locked")
+        replace(source, target)
+
+    monkeypatch.setattr(multi_paper_module.os, "replace", replace_after_unlock)
+    monkeypatch.setattr(multi_paper_module.time, "sleep", lambda _: None)
+    for _ in range(2):
+        with pytest.raises(PermissionError):
+            state.save(state_path)
+    assert len(set(sources)) == 1
+    assert json.loads(state_path.read_text()) == {"previous": True}
+    state.cash = 4999
+    locked[0] = False
+    state.save(state_path)
+    assert json.loads(state_path.read_text())["cash"] == 4999
+    assert state._pending_save is None
+
+
 def test_multiple_symbol_orders_share_portfolio_limits_and_survive_restart(tmp_path):
     settings = load_settings(env_file=None)
     settings.sizing.max_symbols = 2
