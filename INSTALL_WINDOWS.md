@@ -64,11 +64,17 @@ Demo 使用测试环境私有 API，并会真实发送测试委托、创建保�
 
 Demo 状态默认写入 `data/paper/demo_portfolio.json`；当前启动脚本使用已收盘日线 EMA50 方向门槛、4H EMA50 偏离和已收盘 1H 反转确认，并使用同一止损、退出及账户权益比例仓位规则。此操作会向 Binance USDⓈ-M Demo 发送测试委托，不会启动正式盘交易。候选策略仍属前瞻验证，不代表已证明有稳定收益。
 
+Demo Dashboard 使用 8766 端口并读取 Demo 账本。请从项目根目录运行：
+
+~~~powershell
+.\.venv\Scripts\python.exe .\scripts\run_dashboard.py --state .\data\paper\demo_portfolio.json --port 8766 --no-open
+~~~
+
 Demo watchdog 文件随项目源码提供。本机 Startup 快捷方式已配置为启动该 watchdog；它会重启 EMA50 偏离候选 Runner，并检查 Demo 账本与最近交易所快照的同步状态。其他电脑不会因安装项目自动注册该启动项。
 
 ## Binance Futures Lead Portfolio 实盘（真实委托）
 
-该入口运行 8766 的 `ema50_daily_gate_closed_h1_mean_reversion`：在相同的 4H EMA50 偏离与已收盘 1H 反转条件上应用已收盘日线 EMA50 方向门槛。目标保证金按当前 Lead 账户权益的 13.42% 计算，默认每 60 秒轮询。它使用生产 USDⓈ-M API；每次启动都要求在控制台输入 `LEAD`。不要在确认前运行。账户连接及只读初始化已核验，尚未验证真实委托及跟单成交同步。
+Lead 实盘入口运行 `ema50_daily_gate_closed_h1_mean_reversion`：在相同的 4H EMA50 偏离与已收盘 1H 反转条件上应用已收盘日线 EMA50 方向门槛。目标保证金按当前 Lead 账户权益的 13.42% 计算，默认每 60 秒轮询。它使用生产 USDⓈ-M API；每次启动都要求在控制台输入 `LEAD`。不要在确认前运行。账户连接及只读初始化已核验，尚未验证真实委托及跟单成交同步。
 
 启用前应先完成以下准备：
 
@@ -86,7 +92,7 @@ Demo watchdog 文件随项目源码提供。本机 Startup 快捷方式已配置
 
 从前台运行切换到后台前，先在原 PowerShell 窗口按 `Ctrl+C` 并等进程退出，再运行后台脚本。后台脚本检测到已有 Lead 实盘进程时会拒绝重复启动。后台模式不会在 Windows 重启后自动启动，也不负责崩溃重启；需要停止后台实例时，先核对当前运行 PID 与账户状态，再从 Windows 进程管理中结束对应 Runner。
 
-需要查看账本及最近账户快照时，可另开窗口启动只读 Dashboard：
+Lead Dashboard 使用 8769 端口并读取实盘账本；它与 8766 Demo Dashboard 分开运行。需要查看账本及最近账户快照时，可另开窗口启动 Dashboard：
 
 ~~~powershell
 .\.venv\Scripts\python.exe .\scripts\run_dashboard.py --state .\data\live\lead_portfolio.json --port 8769 --no-open
@@ -94,11 +100,31 @@ Demo watchdog 文件随项目源码提供。本机 Startup 快捷方式已配置
 
 Lead 实盘状态独立保存在 `data/live/lead_portfolio.json`，日志为 `logs/mr_lead_live.log`。不要把 Demo 或本地 Paper 账本指定为实盘账本。每币目标保证金按当前 Lead 权益的 13.42% 缩放；实际仓位仍受 2% 单笔风险预算、止损距离、总敞口、方向敞口和可用保证金限制。已有仓位不会因权益变化自动改仓。
 
+## Dashboard 登录后自动启动
+
+本机当前 Windows 用户的启动文件夹已安装 `AltMeanrevDashboards.lnk`，登录后通过 Windows PowerShell 隐藏运行 `scripts/start_dashboards.ps1`：
+
+- 8766 固定读取 Demo 账本 `data/paper/demo_portfolio.json`。
+- 8769 固定读取 Lead 实盘账本 `data/live/lead_portfolio.json`。
+- 已有正确实例时直接检查，不重复启动；端口由其他程序或错误账本占用时拒绝接管并记录错误。
+- 启动器退出后 Dashboard 独立运行，可关闭启动它的 PowerShell；它不会读取交易凭据或启动 Runner。
+
+登录启动仅适用于当前用户；电脑重启后须登录该用户才会执行。项目目录、虚拟环境和两个账本需保留在当前路径。复制源码或执行 `install.ps1` 不会在其他电脑自动安装此启动项。此入口负责登录启动，不提供运行中崩溃重启。
+
+从项目根目录手动补启动或检查：
+
+~~~powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboards.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboards.ps1 -CheckOnly
+~~~
+
+启动日志在 `logs/dashboard-startup-YYYYMMDD.log`，每次新进程的标准输出和错误日志在 `logs/dashboard-<port>-<timestamp>.*.log`。可通过任务管理器的“启动应用”禁用 `AltMeanrevDashboards`；启动文件夹可用 Windows 的 `shell:startup` 打开。
+
 ## 配置与状态
 
 - configs/default.yaml 是策略参数唯一来源。编辑配置属于策略变更，需要单独设计和离线验证。
 - 不要将 .env、API Key、Secret、账本、日志或账户导出放入 ZIP、代码仓库或共享目录。
-- 8766 实盘入口只接受 `run-lead-live.ps1` 或 `run-lead-live-background.ps1`；仍受独立凭据、BOT_MODE、生产 API 主机锁、独立账本和逐次 `LEAD` 控制台确认限制。不要用通用 `scripts/run_live.py` 或直接向机器人传入普通账户凭据。
+- Lead 实盘入口只接受 `run-lead-live.ps1` 或 `run-lead-live-background.ps1`；仍受独立凭据、BOT_MODE、生产 API 主机锁、独立账本和逐次 `LEAD` 控制台确认限制。不要用通用 `scripts/run_live.py` 或直接向机器人传入普通账户凭据。
 - 包含测试源码但本次打包没有运行测试套件；最近项目记录中的测试状态见策略复盘。
 - 下载 ZIP 后，在 ZIP 所在目录运行 Get-FileHash .\alt-meanrev-bot-windows-20261023.zip -Algorithm SHA256，并与同目录的 .sha256 文件核对。
 
