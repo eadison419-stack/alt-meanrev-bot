@@ -10,6 +10,16 @@ foreach ($required in @($python, $runner, $credentialStore)) {
     }
 }
 
+function Assert-LeadWatchdogInactive {
+    $watchdogPath = Join-Path $root 'scripts\watch_lead_live.ps1'
+    $active = @(Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -match '^(?:powershell|pwsh)\.exe$' -and $_.CommandLine -and
+        $_.CommandLine.IndexOf($watchdogPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $_.CommandLine -match '(?<!\S)-Armed(?!\S)'
+    })
+    if ($active.Count -gt 0) { throw 'Lead watchdog is active; use its -Status or -Stop command before starting another Runner.' }
+}
+Assert-LeadWatchdogInactive
 . $credentialStore
 $credential = $null
 $oldKey = $env:BINANCE_API_KEY

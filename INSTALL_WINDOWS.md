@@ -74,7 +74,7 @@ Demo watchdog 文件随项目源码提供。本机 Startup 快捷方式已配置
 
 ## Binance Futures Lead Portfolio 实盘（真实委托）
 
-Lead 实盘入口运行 `ema50_daily_gate_closed_h1_mean_reversion`：在相同的 4H EMA50 偏离与已收盘 1H 反转条件上应用已收盘日线 EMA50 方向门槛。目标保证金按当前 Lead 账户权益的 13.42% 计算，默认每 60 秒轮询。它使用生产 USDⓈ-M API；每次启动都要求在控制台输入 `LEAD`。不要在确认前运行。账户连接及只读初始化已核验，尚未验证真实委托及跟单成交同步。
+Lead 实盘入口运行 `ema50_daily_gate_closed_h1_mean_reversion`：在相同的 4H EMA50 偏离与已收盘 1H 反转条件上应用已收盘日线 EMA50 方向门槛。目标保证金按当前 Lead 账户权益的 13.42% 计算，默认每 60 秒轮询。它使用生产 USDⓈ-M API；手动启动 Runner 或启用看护器都要求在控制台输入 `LEAD`。不要在确认前运行。账户连接及只读初始化已核验，尚未验证真实委托及跟单成交同步。
 
 启用前应先完成以下准备：
 
@@ -100,6 +100,22 @@ Lead Dashboard 使用 8769 端口并读取实盘账本；它与 8766 Demo Dashbo
 
 Lead 实盘状态独立保存在 `data/live/lead_portfolio.json`，日志为 `logs/mr_lead_live.log`。不要把 Demo 或本地 Paper 账本指定为实盘账本。每币目标保证金按当前 Lead 权益的 13.42% 缩放；实际仓位仍受 2% 单笔风险预算、止损距离、总敞口、方向敞口和可用保证金限制。已有仓位不会因权益变化自动改仓。
 
+## Lead Runner 看护器
+
+从项目根目录启动看护器并输入 `LEAD`，授权该看护器存活期间自动恢复 Lead 实盘 Runner。它会隐藏运行，启用成功后可关闭 PowerShell。
+
+~~~powershell
+.\run-lead-watchdog.ps1          # 输入 LEAD；接管已有正确实例或在没有实例时启动实盘 Runner
+.\run-lead-watchdog.ps1 -Status  # 只读查看看护器、Runner 和本地账户快照健康
+.\run-lead-watchdog.ps1 -Stop    # 仅停止看护器，Runner 保持运行
+~~~
+
+看护器每 30 秒检查进程和账本，5 分钟内的账本写入、账户快照及持仓保护单审计才视为新鲜。进程退出后等待 60 秒再尝试恢复，连续失败逐次退避，最长等待 30 分钟；识别到本次启动认证、权限或限流错误时，至少等待 5 分钟。每次恢复从 Windows Credential Manager 读取 Lead 专用凭据，使用生产 API 和独立实盘账本，保留 Runner 原有的启动对账、未决委托恢复及新开仓门禁。
+
+活进程即使心跳超时、账户不同步或认证异常，也只向 `logs/lead-runner-watchdog-YYYYMMDD.log` 写告警，不强杀或重复启动；当前没有外部通知。发现多个实盘进程根或其他账本的实盘实例时同样拒绝新增实例。普通实盘启动入口在看护器运行时拒绝另起 Runner。
+
+主动停止实盘交易前，先用 `-Stop` 解除看护，再按原方式停止已核对的 Runner，否则看护器会自动拉起退出的进程。该看护器没有 Windows 登录启动项；看护器退出或 Windows 重启后，本次自动恢复授权结束，需再次运行入口并输入 `LEAD`。交易凭据和无人值守启动授权均不写入代码或配置。
+
 ## Dashboard 登录后自动启动
 
 本机当前 Windows 用户的启动文件夹已安装 `AltMeanrevDashboards.lnk`，登录后通过 Windows PowerShell 隐藏运行 `scripts/start_dashboards.ps1`：
@@ -124,7 +140,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboards.p
 
 - configs/default.yaml 是策略参数唯一来源。编辑配置属于策略变更，需要单独设计和离线验证。
 - 不要将 .env、API Key、Secret、账本、日志或账户导出放入 ZIP、代码仓库或共享目录。
-- Lead 实盘入口只接受 `run-lead-live.ps1` 或 `run-lead-live-background.ps1`；仍受独立凭据、BOT_MODE、生产 API 主机锁、独立账本和逐次 `LEAD` 控制台确认限制。不要用通用 `scripts/run_live.py` 或直接向机器人传入普通账户凭据。
+- Lead 实盘入口只接受 `run-lead-live.ps1`、`run-lead-live-background.ps1` 或 `run-lead-watchdog.ps1`；仍受独立凭据、BOT_MODE、生产 API 主机锁、独立账本，以及手动启动或启用看护时的 `LEAD` 确认限制。不要用通用 `scripts/run_live.py` 或直接向机器人传入普通账户凭据。
 - 包含测试源码但本次打包没有运行测试套件；最近项目记录中的测试状态见策略复盘。
 - 下载 ZIP 后，在 ZIP 所在目录运行 Get-FileHash .\alt-meanrev-bot-windows-20261023.zip -Algorithm SHA256，并与同目录的 .sha256 文件核对。
 

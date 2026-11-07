@@ -48,7 +48,9 @@ USDⓈ-M Demo 需要单独录入 Demo 专用凭据并手动启动，入口为 `.
 
 真实环境文件、API 密钥、账本、订单／仓位状态、市场缓存、研究缓存、运行日志、虚拟环境、Python 缓存和当前电脑上的计划任务或快捷方式均未打包。该 ZIP 是干净源码快照，不能恢复另一台电脑的余额、模拟状态、Demo 订单或历史表现。
 
-现行策略已提供独立 Binance Futures Lead Portfolio 实盘入口。该入口必须使用 Lead Portfolio 专用 API Key 和独立账本；前台启动或后台启动时都要在终端输入 `LEAD` 确认。账户连接及只读初始化已核验，真实委托和跟单成交同步尚未验收。前台启动方式会随启动它的 PowerShell 终止；如需关闭 PowerShell 后继续运行，先按 `Ctrl+C` 停止前台实例，再使用 `run-lead-live-background.ps1`。不得使用普通 Futures API Key 或把密钥写入项目文件。
+现行策略已提供独立 Binance Futures Lead Portfolio 实盘入口。该入口必须使用 Lead Portfolio 专用 API Key 和独立账本；手动启动 Runner 或启用看护器时都要在终端输入 `LEAD` 确认。账户连接及只读初始化已核验，真实委托和跟单成交同步尚未验收。前台启动方式会随启动它的 PowerShell 终止；如需关闭 PowerShell 后继续运行，先按 `Ctrl+C` 停止前台实例，再使用 `run-lead-live-background.ps1`。不得使用普通 Futures API Key 或把密钥写入项目文件。
+
+`run-lead-watchdog.ps1` 可在一次 `LEAD` 确认后隐藏看护实盘 Runner：已有正确实例时直接接管，进程退出后按退避规则恢复。活进程的账户或心跳异常只写本地日志，不强杀。`-Status` 查看进程与账本健康，`-Stop` 只停止看护并保留 Runner；主动停止 Runner 前先停止看护。看护授权仅持续到该看护器退出或 Windows 重启，届时需重新启用。详见 [实盘看护说明](INSTALL_WINDOWS.md#lead-runner-看护器)。
 
 ## Dashboard 与登录启动
 
