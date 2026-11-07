@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import json
+import os
 
 import pandas as pd
 import pytest
@@ -49,6 +50,29 @@ def _daily_rows(closes, *, start=datetime(2026, 9, 5, tzinfo=timezone.utc)):
 
 def _market_risk(state: MarketRiskState, now: datetime) -> MarketRiskAssessment:
     return MarketRiskAssessment(state, state.value.lower(), now, "BTC/USDT:USDT", "4h", {})
+
+
+def test_background_live_confirmation_requires_launcher_token(monkeypatch):
+    args = SimpleNamespace(live=True, background_confirmed=True)
+    monkeypatch.setenv("BOT_LEAD_BACKGROUND_CONFIRMATION", "LEAD")
+
+    assert runner._confirm_live(args, runner.argparse.ArgumentParser()) is True
+    assert "BOT_LEAD_BACKGROUND_CONFIRMATION" not in os.environ
+
+
+def test_background_live_confirmation_rejects_missing_token(monkeypatch):
+    args = SimpleNamespace(live=True, background_confirmed=True)
+    monkeypatch.delenv("BOT_LEAD_BACKGROUND_CONFIRMATION", raising=False)
+
+    with pytest.raises(SystemExit):
+        runner._confirm_live(args, runner.argparse.ArgumentParser())
+
+
+def test_background_confirmation_cannot_enable_nonlive_mode():
+    args = SimpleNamespace(live=False, background_confirmed=True)
+
+    with pytest.raises(SystemExit):
+        runner._confirm_live(args, runner.argparse.ArgumentParser())
 
 
 def test_lead_target_margin_tracks_live_equity_and_keeps_paper_target_fixed():

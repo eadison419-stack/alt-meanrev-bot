@@ -132,6 +132,27 @@ def _next_poll_delay(now, poll, *, align_hourly=False, cycle_started_at=None):
     return min(float(poll), (next_hour - now).total_seconds())
 
 
+def _confirm_live(args, parser):
+    if not args.live:
+        if args.background_confirmed:
+            parser.error("--background-confirmed requires --live")
+        return False
+
+    if args.background_confirmed:
+        confirmation = os.environ.pop("BOT_LEAD_BACKGROUND_CONFIRMATION", None)
+        if confirmation != "LEAD":
+            parser.error("background live mode requires a confirmed Lead launcher")
+        return True
+
+    if not sys.stdin.isatty():
+        parser.error("--live requires an interactive console confirmation")
+    print("实盘将通过 Binance Lead Portfolio API 发送真实委托。输入 LEAD 才继续：", flush=True)
+    try:
+        return input().strip() == "LEAD"
+    except EOFError:
+        return False
+
+
 class _RunnerCheckpoint:
     """Keep monitoring in memory during storage outages; entries require a save."""
 
@@ -3139,6 +3160,7 @@ def main() -> int:
                         help="run on Binance USDT-M testnet demo (default: local paper, no key)")
     parser.add_argument("--live", action="store_true",
                         help="run the 8766 strategy on a Binance Lead Portfolio account")
+    parser.add_argument("--background-confirmed", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--intrabar-entries", action="store_true",
                         help="local paper only: closed-1H entries with live-price stop monitoring")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
@@ -3150,18 +3172,10 @@ def main() -> int:
     if args.intrabar_entries and (args.demo or args.live):
         parser.error("--intrabar-entries is local-paper only")
 
-    live_confirmed = False
-    if args.live:
-        if not sys.stdin.isatty():
-            parser.error("--live requires an interactive console confirmation")
-        print("实盘将通过 Binance Lead Portfolio API 发送真实委托。输入 LEAD 才继续：", flush=True)
-        try:
-            live_confirmed = input().strip() == "LEAD"
-        except EOFError:
-            live_confirmed = False
-        if not live_confirmed:
-            print("未确认，已退出；未连接账户。")
-            return 2
+    live_confirmed = _confirm_live(args, parser)
+    if args.live and not live_confirmed:
+        print("未确认，已退出；未连接账户。")
+        return 2
 
     settings = load_settings()
     mode = resolve_execution_mode(bot_mode=settings.runtime.bot_mode,
