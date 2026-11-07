@@ -1,4 +1,4 @@
-"""USDⓈ-M Demo Trading client with an explicit host lock."""
+"""USDⓈ-M exchange clients with explicit Demo and production host locks."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ from bot.exchange.network import configure_system_proxy
 
 DEMO_REST_ROOT = "https://demo-fapi.binance.com"
 DEMO_WS_ROOT = "wss://demo-fstream.binance.com"
-FAPI_URLS = {
+LIVE_REST_ROOT = "https://fapi.binance.com"
+LIVE_SAPI_URL = "https://api.binance.com/sapi/v1"
+DEMO_FAPI_URLS = {
     "fapiPublic": f"{DEMO_REST_ROOT}/fapi/v1",
     "fapiPublicV2": f"{DEMO_REST_ROOT}/fapi/v2",
     "fapiPublicV3": f"{DEMO_REST_ROOT}/fapi/v3",
@@ -22,6 +24,10 @@ FAPI_URLS = {
     "fapiPrivateV3": f"{DEMO_REST_ROOT}/fapi/v3",
     "fapiData": f"{DEMO_REST_ROOT}/futures/data",
 }
+LIVE_FAPI_URLS = {key: value.replace(DEMO_REST_ROOT, LIVE_REST_ROOT)
+                  for key, value in DEMO_FAPI_URLS.items()}
+# Kept as a compatibility alias for existing Demo tests and scripts.
+FAPI_URLS = DEMO_FAPI_URLS
 
 
 @dataclass(frozen=True)
@@ -31,11 +37,20 @@ class ExecutionMode:
     bot_mode: str
 
 
-def resolve_execution_mode(*, bot_mode: str, testnet: bool, live_flag: bool = False) -> ExecutionMode:
-    """Enforce the allowed local-Paper and USDⓈ-M Demo mode matrix."""
+def resolve_execution_mode(*, bot_mode: str, testnet: bool, live_flag: bool = False,
+                           live_confirmed: bool = False) -> ExecutionMode:
+    """Enforce local Paper, USDⓈ-M Demo, and explicitly confirmed Lead modes."""
     normalized = str(bot_mode).strip().lower()
     if live_flag or normalized == "live":
-        raise RuntimeError("live mode and --live are disabled; no production trading is available")
+        if not live_flag:
+            raise RuntimeError("live mode requires --live")
+        if not live_confirmed:
+            raise RuntimeError("live mode requires interactive human confirmation")
+        if normalized != "live":
+            raise RuntimeError("--live requires BOT_MODE=live")
+        if testnet:
+            raise RuntimeError("Lead Portfolio mode requires BINANCE_TESTNET=false")
+        return ExecutionMode("lead_usdm", False, normalized)
     if normalized != "paper":
         raise RuntimeError("BOT_MODE must be paper")
     if not isinstance(testnet, bool):
@@ -68,6 +83,20 @@ def verify_demo_urls(exchange) -> None:
         raise RuntimeError("refusing private request to production Binance Futures host")
 
 
+def verify_live_urls(exchange) -> None:
+    """Refuse signed USDⓈ-M requests unless every Futures URL is production-pinned."""
+    api = exchange.urls.get("api", {})
+    for key, expected in LIVE_FAPI_URLS.items():
+        value = api.get(key)
+        if value != expected or "fapi.binance.com" not in str(value).lower():
+            raise RuntimeError(f"refusing private request: {key} is not locked to fapi.binance.com")
+    if api.get("sapi") != LIVE_SAPI_URL:
+        raise RuntimeError("refusing Lead status request: sapi is not locked to api.binance.com")
+    if any("demo-fapi.binance.com" in str(api.get(key, "")).lower()
+           for key in LIVE_FAPI_URLS):
+        raise RuntimeError("refusing private request to Binance Demo Futures host")
+
+
 def create_demo_usdm(runtime, *, exchange_factory=None):
     """Build a private USDⓈ-M Demo client without exposing credentials in logs."""
     key = runtime.binance_api_key.get_secret_value().strip()
@@ -85,6 +114,35 @@ def create_demo_usdm(runtime, *, exchange_factory=None):
     })
     try:
         lock_demo_urls(exchange)
+        configure_system_proxy(exchange)
+        return exchange
+    except Exception:
+        exchange.close()
+        raise
+
+
+def create_lead_usdm(runtime, *, exchange_factory=None):
+    """Build a production USDⓈ-M client for a dedicated Lead Portfolio API key."""
+    key = runtime.binance_api_key.get_secret_value().strip()
+    secret = runtime.binance_api_secret.get_secret_value().strip()
+    if runtime.binance_testnet or runtime.bot_mode != "live":
+        raise RuntimeError("Lead client requires BINANCE_TESTNET=false and BOT_MODE=live")
+    if not key or not secret:
+        raise RuntimeError("Lead Portfolio API credentials are required for live execution")
+    factory = exchange_factory or ccxt.binanceusdm
+    exchange = factory({
+        "apiKey": key,
+        "secret": secret,
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap", "defaultSubType": "linear"},
+    })
+    try:
+        api = exchange.urls.get("api")
+        if not isinstance(api, dict):
+            raise RuntimeError("CCXT Binance USDⓈ-M API URL map is unavailable")
+        api.update(LIVE_FAPI_URLS)
+        api["sapi"] = LIVE_SAPI_URL
+        verify_live_urls(exchange)
         configure_system_proxy(exchange)
         return exchange
     except Exception:

@@ -131,6 +131,7 @@ def calculate_order_quantity(
     size_multiplier: float = 1.0,
     gross_notional_cap_pct: float | None = None,
     stop_price: float | None = None,
+    target_margin_usdt: float | None = None,
 ) -> float:
     """Size to target margin, then cap quantity by stop risk when a stop is supplied."""
     values = (equity, mark_price, step_size, minimum_quantity, size_multiplier)
@@ -139,7 +140,11 @@ def calculate_order_quantity(
             or equity <= 0 or mark_price <= 0 or step_size <= 0
             or minimum_quantity < 0 or size_multiplier <= 0):
         raise ValueError("equity, mark price, step size, and minimum quantity are invalid")
-    target_notional = (Decimal(str(settings.sizing.margin_per_symbol_usdt))
+    target_margin = (settings.sizing.margin_per_symbol_usdt
+                     if target_margin_usdt is None else target_margin_usdt)
+    if not math.isfinite(target_margin) or target_margin <= 0:
+        raise ValueError("target margin must be finite and positive")
+    target_notional = (Decimal(str(target_margin))
                        * Decimal(str(settings.sizing.leverage)) * Decimal(str(size_multiplier)))
     cap_pct = settings.sizing.max_gross_notional_pct
     if gross_notional_cap_pct is not None:
@@ -188,6 +193,7 @@ def assess_entry(
     reserved_long_notional: float = 0.0,
     reserved_short_notional: float = 0.0,
     reserved_symbols: int = 0,
+    per_symbol_margin_usdt: float | None = None,
 ) -> RiskDecision:
     """Approve or reject an opening intent; all missing risk inputs fail closed."""
     if intent.action is not Action.OPEN:
@@ -262,7 +268,11 @@ def assess_entry(
         return RiskDecision(False, "reserved_exposure_invalid")
     if len(portfolio.positions) + reserved_symbols >= settings.sizing.max_symbols:
         return RiskDecision(False, "max_symbols_reached")
-    symbol_cap = (settings.sizing.margin_per_symbol_usdt * settings.sizing.leverage
+    symbol_margin = (settings.sizing.margin_per_symbol_usdt
+                     if per_symbol_margin_usdt is None else per_symbol_margin_usdt)
+    if not math.isfinite(symbol_margin) or symbol_margin <= 0:
+        return RiskDecision(False, "per_symbol_margin_invalid")
+    symbol_cap = (symbol_margin * settings.sizing.leverage
                   * risk_multiplier)
     if intent.notional > symbol_cap:
         return RiskDecision(False, "per_symbol_notional_cap", details={

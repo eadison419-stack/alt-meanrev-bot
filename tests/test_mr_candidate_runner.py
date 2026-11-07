@@ -51,6 +51,31 @@ def _market_risk(state: MarketRiskState, now: datetime) -> MarketRiskAssessment:
     return MarketRiskAssessment(state, state.value.lower(), now, "BTC/USDT:USDT", "4h", {})
 
 
+def test_lead_target_margin_tracks_live_equity_and_keeps_paper_target_fixed():
+    settings = load_settings(env_file=None)
+    lead = MultiPaperState(initial_equity=1_000, cash=1_000, execution_mode="lead_usdm",
+                           exchange_snapshot={"equity": 1_000})
+    paper = MultiPaperState(initial_equity=1_000, cash=1_000)
+
+    assert runner._target_margin_per_symbol(lead, settings) == pytest.approx(134.2)
+    lead.exchange_snapshot["equity"] = 1_250
+    assert runner._target_margin_per_symbol(lead, settings) == pytest.approx(167.75)
+    assert runner._target_margin_per_symbol(paper, settings) == 1_000
+
+
+def test_lead_candidate_filter_keeps_only_portfolio_whitelisted_usdt_symbols():
+    execution = SimpleNamespace(lead_market_ids={"BTCUSDT"})
+    hotlist = [{"symbol": "BTC/USDT:USDT"}, {"symbol": "ETH/USDT:USDT"}]
+    markets = {
+        "BTC/USDT:USDT": {"id": "BTCUSDT"},
+        "ETH/USDT:USDT": {"id": "ETHUSDT"},
+    }
+
+    assert runner._filter_lead_candidates(hotlist, markets, execution) == [hotlist[0]]
+    with pytest.raises(RuntimeError, match="whitelist"):
+        runner._filter_lead_candidates(hotlist, markets, SimpleNamespace(lead_market_ids=set()))
+
+
 def _cached_intrabar_fixture(now, symbol="BEAT/USDT:USDT"):
     state = MultiPaperState(initial_equity=5_000, cash=4_000)
     position = Position(symbol, Side.SHORT, 1.0, 100.0, 102.0,

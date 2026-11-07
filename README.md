@@ -48,7 +48,7 @@ USDⓈ-M Demo 需要单独录入 Demo 专用凭据并手动启动，入口为 `.
 
 真实环境文件、API 密钥、账本、订单／仓位状态、市场缓存、研究缓存、运行日志、虚拟环境、Python 缓存和当前电脑上的计划任务或快捷方式均未打包。该 ZIP 是干净源码快照，不能恢复另一台电脑的余额、模拟状态、Demo 订单或历史表现。
 
-实盘入口当前拒绝执行。任何 Demo 模式都必须由操作者主动配置 USDⓈ-M Demo 凭据并手动启动；不得把正式账户凭据放入机器人。
+8766 现行策略已提供独立 Binance Futures Lead Portfolio 实盘入口。该入口必须使用 Lead Portfolio 专用 API Key 和独立账本；启动时还要在终端输入 `LEAD` 确认。接入代码尚未连接账户或做真实委托验收，首次启用前应先按 [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md) 完成人工核对。不得使用普通 Futures API Key 或把密钥写入项目文件。
 
 ## 8766 USDⓈ-M Demo 开仓门槛
 

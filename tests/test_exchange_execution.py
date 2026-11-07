@@ -1,8 +1,12 @@
 import pytest
+from types import SimpleNamespace
 
 from bot.config import RuntimeSettings
-from bot.exchange.binance_usdm import FAPI_URLS, lock_demo_urls, resolve_execution_mode, verify_demo_urls
-from bot.execution import DemoExecutionService
+from bot.exchange.binance_usdm import (FAPI_URLS, LIVE_FAPI_URLS, LIVE_SAPI_URL,
+                                       create_lead_usdm,
+                                       lock_demo_urls, resolve_execution_mode,
+                                       verify_demo_urls, verify_live_urls)
+from bot.execution import DemoExecutionService, LeadPortfolioExecutionService
 from bot.live.paper import PaperAccount, PaperTrader
 from bot.regime import Regime
 from bot.risk import OrderIntent
@@ -18,15 +22,26 @@ def test_execution_mode_matrix_refuses_live_and_routes_only_testnet_true_to_demo
         resolve_execution_mode(bot_mode="live", testnet=True)
     with pytest.raises(RuntimeError, match="BOT_MODE"):
         resolve_execution_mode(bot_mode="invalid", testnet=False)
+    assert resolve_execution_mode(bot_mode="live", testnet=False,
+                                  live_flag=True, live_confirmed=True).name == "lead_usdm"
+    with pytest.raises(RuntimeError, match="human confirmation"):
+        resolve_execution_mode(bot_mode="live", testnet=False, live_flag=True)
+    with pytest.raises(RuntimeError, match="BINANCE_TESTNET"):
+        resolve_execution_mode(bot_mode="live", testnet=True,
+                               live_flag=True, live_confirmed=True)
 
 
 class FakeClient:
     def __init__(self):
         self.urls = {"api": {key: "https://fapi.binance.com/fapi/v1" for key in FAPI_URLS}}
         self.enabled = False
+        self.session = SimpleNamespace(proxies={})
 
     def enable_demo_trading(self, enabled):
         self.enabled = enabled
+
+    def close(self):
+        self.closed = True
 
 
 def test_demo_client_urls_are_pinned_after_ccxt_demo_mode_and_verified():
@@ -51,6 +66,68 @@ def test_demo_factory_refuses_missing_testnet_keys_without_network():
     runtime = RuntimeSettings(_env_file=None, binance_testnet=True, bot_mode="paper")
     with pytest.raises(RuntimeError, match="API_KEY"):
         create_demo_usdm(runtime)
+
+
+def test_lead_factory_pins_production_urls_without_enabling_demo_mode():
+    client = FakeClient()
+    captured = {}
+    runtime = RuntimeSettings(_env_file=None, binance_testnet=False, bot_mode="live",
+                              binance_api_key="lead-key", binance_api_secret="lead-secret")
+
+    def factory(config):
+        captured.update(config)
+        return client
+
+    assert create_lead_usdm(runtime, exchange_factory=factory) is client
+    assert {key: client.urls["api"][key] for key in LIVE_FAPI_URLS} == LIVE_FAPI_URLS
+    assert client.urls["api"]["sapi"] == LIVE_SAPI_URL
+    assert client.enabled is False
+    assert captured["apiKey"] == "lead-key"
+    assert captured["secret"] == "lead-secret"
+    verify_live_urls(client)
+
+
+def test_live_execution_verifier_rejects_demo_host_and_never_changes_position_mode():
+    class LiveClient:
+        urls = {"api": {**LIVE_FAPI_URLS, "sapi": LIVE_SAPI_URL}}
+
+        def __init__(self):
+            self.set_position_mode_calls = 0
+
+        def fetch_position_mode(self):
+            return {"hedged": True}
+
+        def set_position_mode(self, _hedged):
+            self.set_position_mode_calls += 1
+
+    client = LiveClient()
+    service = LeadPortfolioExecutionService(client, object())
+    with pytest.raises(RuntimeError, match="one-way"):
+        service._ensure_one_way()
+    assert client.set_position_mode_calls == 0
+    client.urls["api"]["fapiPrivate"] = FAPI_URLS["fapiPrivate"]
+    with pytest.raises(RuntimeError, match="fapi.binance.com"):
+        verify_live_urls(client)
+
+
+def test_lead_execution_requires_active_lead_identity_and_uses_verified_usdt_whitelist():
+    class LeadClient:
+        urls = {"api": {**LIVE_FAPI_URLS, "sapi": LIVE_SAPI_URL}}
+
+        def sapiGetCopyTradingFuturesUserStatus(self, _params):
+            return {"code": "000000", "success": True,
+                    "data": {"isLeadTrader": True}}
+
+        def sapiGetCopyTradingFuturesLeadSymbol(self, _params):
+            return {"code": "000000", "success": True, "data": [
+                {"symbol": "BTCUSDT", "quoteAsset": "USDT"},
+                {"symbol": "ETHUSDT", "quoteAsset": "USDT"},
+                {"symbol": "BTCUSDC", "quoteAsset": "USDC"},
+            ]}
+
+    service = LeadPortfolioExecutionService(LeadClient(), object())
+    service._verify_lead_api_access()
+    assert service.lead_market_ids == {"BTCUSDT", "ETHUSDT"}
 
 
 def test_live_credentials_and_flags_are_not_accepted_by_runtime_matrix():

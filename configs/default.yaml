@@ -131,6 +131,7 @@ session:
 sizing:
   leverage: 3
   margin_per_symbol_usdt: 1000
+  live_margin_equity_pct: 0.1342 # Lead Portfolio only; 1000 USDT / 7451.18 USDT Demo equity reference
   max_symbols: 5
   max_gross_notional_pct: 1.8
   max_directional_notional_pct: 0.9

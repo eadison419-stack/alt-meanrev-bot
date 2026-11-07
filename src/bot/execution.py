@@ -10,7 +10,8 @@ from uuid import uuid4
 
 from loguru import logger
 
-from bot.exchange.binance_usdm import DEMO_REST_ROOT, parse_live_position, verify_demo_urls
+from bot.exchange.binance_usdm import (DEMO_REST_ROOT, LIVE_REST_ROOT, parse_live_position,
+                                       verify_demo_urls, verify_live_urls)
 from bot.signals import Action, Side
 
 
@@ -34,35 +35,71 @@ def _number(value, default=0.0) -> float:
 
 
 class DemoExecutionService:
-    """Signed USDⓈ-M Demo orders and account snapshots; never selects production URLs."""
+    """Signed USDⓈ-M orders and account snapshots behind a pinned host verifier."""
 
-    def __init__(self, exchange, settings):
-        verify_demo_urls(exchange)
+    def __init__(self, exchange, settings, *, mode="demo", auto_one_way=True):
+        self.mode = mode
+        self.label = "Lead Portfolio" if mode == "lead" else "Demo"
+        self._url_verifier = verify_live_urls if mode == "lead" else verify_demo_urls
+        self._url_verifier(exchange)
         self.exchange = exchange
         self.settings = settings
-        self.host = DEMO_REST_ROOT
+        self.host = LIVE_REST_ROOT if mode == "lead" else DEMO_REST_ROOT
+        self.source = "binance_usdm_lead" if mode == "lead" else "binance_usdm_demo"
+        self.lead_market_ids: set[str] = set()
+        self.auto_one_way = auto_one_way
         self._last_fill_audit_at = 0.0
 
+    def _verify_urls(self):
+        self._url_verifier(self.exchange)
+
     def initialize(self) -> dict[str, Any]:
+        if self.mode == "lead":
+            self._verify_lead_api_access()
         self._ensure_one_way()
         snapshot = self.sync_snapshot()
-        logger.info("Binance USDⓈ-M Demo account check: TESTNET=true BOT_MODE=paper host={} USDT={} position_mode=one-way",
+        logger.info("Binance USDⓈ-M {} account check: host={} USDT={} position_mode=one-way",
+                    self.label,
                     self.host, snapshot["usdt_balance"])
         if not math.isfinite(float(snapshot["usdt_balance"])) or float(snapshot["usdt_balance"]) <= 0:
-            raise RuntimeError("USDⓈ-M Demo account has no positive USDT wallet balance; refusing execution")
+            raise RuntimeError("USDⓈ-M account has no positive USDT wallet balance; refusing execution")
         return snapshot
 
+    def _verify_lead_api_access(self) -> None:
+        self._verify_urls()
+        status = self.exchange.sapiGetCopyTradingFuturesUserStatus({})
+        data = status.get("data") if isinstance(status, dict) else None
+        if (not isinstance(data, dict) or status.get("success") is not True
+                or status.get("code") != "000000" or data.get("isLeadTrader") is not True):
+            raise RuntimeError("Binance API key is not verified as an active Futures Lead Portfolio key")
+        whitelist = self.exchange.sapiGetCopyTradingFuturesLeadSymbol({})
+        rows = whitelist.get("data") if isinstance(whitelist, dict) else None
+        if (not isinstance(rows, list) or whitelist.get("success") is not True
+                or whitelist.get("code") != "000000"):
+            raise RuntimeError("Binance Lead Portfolio symbol whitelist could not be verified")
+        symbols = {
+            str(row.get("symbol", "")).strip().upper()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("quoteAsset", "")).upper() == "USDT"
+        }
+        if not symbols or any(not symbol.endswith("USDT") for symbol in symbols):
+            raise RuntimeError("Binance Lead Portfolio has no valid USDT futures symbols in its whitelist")
+        self.lead_market_ids = symbols
+        logger.info("Binance Lead Portfolio verified; USDT contract whitelist size={}", len(symbols))
+
     def _ensure_one_way(self) -> None:
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         mode = self.exchange.fetch_position_mode()
         if bool(mode.get("hedged")):
+            if not self.auto_one_way:
+                raise RuntimeError("Binance Lead account must already be in one-way position mode")
             self.exchange.set_position_mode(False)
             mode = self.exchange.fetch_position_mode()
         if bool(mode.get("hedged")):
             raise RuntimeError("Binance account is not in one-way position mode")
 
     def sync_snapshot(self) -> dict[str, Any]:
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         balance = self.exchange.fetch_balance()
         positions = {}
         for row in self.exchange.fetch_positions():
@@ -105,7 +142,7 @@ class DemoExecutionService:
         return market_step or step, minimum, min_cost
 
     def _prepare_symbol(self, symbol: str) -> None:
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         try:
             self.exchange.set_margin_mode("isolated", symbol)
         except Exception as exc:
@@ -119,7 +156,7 @@ class DemoExecutionService:
 
     def _market_fill(self, symbol: str, side: str, quantity: float, *, reduce_only: bool,
                      client_order_id: str | None = None) -> dict[str, Any]:
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         if quantity <= 0 or not math.isfinite(quantity):
             raise ValueError("exchange order quantity must be finite and positive")
         client_id = client_order_id or f"{BOT_ORDER_PREFIX}_{uuid4().hex[:28]}"
@@ -129,7 +166,7 @@ class DemoExecutionService:
         order = self.exchange.create_order(symbol, "market", side, quantity, None, params)
         order_id = order.get("id") or (order.get("info") or {}).get("orderId")
         if not order_id:
-            raise RuntimeError("Demo exchange returned no orderId; reconciliation required")
+            raise RuntimeError("USDⓈ-M exchange returned no orderId; reconciliation required")
         filled = _number(order.get("filled"), _number((order.get("info") or {}).get("executedQty")))
         average = _number(order.get("average"), _number((order.get("info") or {}).get("avgPrice")))
         if not filled or not average:
@@ -140,7 +177,7 @@ class DemoExecutionService:
         status = status.lower() if isinstance(status, str) else status
         terminal_statuses = {None, "closed", "canceled", "cancelled", "expired"}
         if filled <= 0 or average <= 0 or status not in terminal_statuses:
-            raise RuntimeError(f"Demo market order {order_id} was not confirmed filled")
+            raise RuntimeError(f"USDⓈ-M market order {order_id} was not confirmed filled")
         fill_data = {}
         try:
             market_id = self.exchange.market(symbol)["id"]
@@ -173,7 +210,7 @@ class DemoExecutionService:
         if opened_at.tzinfo is None or closed_at.tzinfo is None or closed_at < opened_at:
             return None
         try:
-            verify_demo_urls(self.exchange)
+            self._verify_urls()
             market_id = self.exchange.market(symbol)["id"]
             start_ms = int(opened_at.timestamp() * 1000)
             end_ms = int(closed_at.timestamp() * 1000)
@@ -201,7 +238,7 @@ class DemoExecutionService:
                 or ended_at < started_at):
             return None
         try:
-            verify_demo_urls(self.exchange)
+            self._verify_urls()
             start_ms, end_ms = int(started_at.timestamp() * 1000), int(ended_at.timestamp() * 1000)
             rows = self.exchange.fapiPrivateGetIncome({
                 "incomeType": "FUNDING_FEE", "startTime": start_ms, "endTime": end_ms,
@@ -227,7 +264,7 @@ class DemoExecutionService:
         if opened_at.tzinfo is None:
             return None
         try:
-            verify_demo_urls(self.exchange)
+            self._verify_urls()
             market_id = self.exchange.market(symbol)["id"]
             start_ms = int((opened_at.timestamp() - 10) * 1000)
             end_ms = int((opened_at.timestamp() + 180) * 1000)
@@ -261,14 +298,14 @@ class DemoExecutionService:
             return None
 
     def _position(self, symbol: str) -> dict[str, Any] | None:
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         rows = self.exchange.fetch_positions([symbol])
         return next((parsed for row in rows if (parsed := parse_live_position(row)) is not None), None)
 
     def _place_stop(self, symbol: str, side: str, amount: float, stop_price: float) -> dict[str, Any]:
         if not math.isfinite(stop_price) or stop_price <= 0:
             raise ValueError("a valid protective stop is required before order submission")
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         close_side = "sell" if side == "long" else "buy"
         amount = float(self.exchange.amount_to_precision(symbol, amount))
         stop_price = float(self.exchange.price_to_precision(symbol, stop_price))
@@ -280,14 +317,14 @@ class DemoExecutionService:
         )
         order_id = order.get("id") or (order.get("info") or {}).get("algoId")
         if not order_id:
-            raise RuntimeError("Demo protective stop returned no orderId")
+            raise RuntimeError("USDⓈ-M protective stop returned no orderId")
         return {"id": str(order_id), "clientOrderId": client_id, "stop_price": stop_price,
                 "amount": amount, "info": order.get("info", {})}
 
     def _cancel_stop(self, symbol: str, stop: dict[str, Any] | None) -> None:
         if not stop or not stop.get("id"):
             return
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         self.exchange.fapiPrivateDeleteAlgoOrder({"algoId": stop["id"]})
 
     @staticmethod
@@ -299,7 +336,7 @@ class DemoExecutionService:
     def _retire_superseded_stops(self, symbol: str, side: str, active_stop: dict[str, Any] | None,
                                  expected_quantity: float) -> list[dict[str, Any]]:
         """Keep the verified remaining-position stop and remove older bot stops."""
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         if active_stop is None:
             return []
         market_id = self.exchange.market(symbol)["id"]
@@ -346,7 +383,7 @@ class DemoExecutionService:
     def audit_active_protective_stops(self, positions: dict[str, Any],
                                       tracked_orders: dict[str, dict[str, Any]]) -> list[str]:
         """Read-only verify each saved Demo position has exactly one matching bot stop."""
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         mismatches = []
         for symbol, position in positions.items():
             order_data = tracked_orders.get(symbol, {})
@@ -384,7 +421,7 @@ class DemoExecutionService:
 
     def _cancel_untracked_bot_stops(self, symbol: str) -> None:
         """Cancel only this adapter's conditional orders when recovering an unknown position."""
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         market_id = self.exchange.market(symbol)["id"]
         rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
         for row in rows:
@@ -397,7 +434,7 @@ class DemoExecutionService:
         """Cancel and verify one saved bot stop after its exchange position is flat."""
         if not stop or not stop.get("id"):
             return
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         market_id = self.exchange.market(symbol)["id"]
         algo_id = str(stop["id"])
         rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
@@ -414,7 +451,7 @@ class DemoExecutionService:
 
     def cancel_orphaned_bot_stops(self, live_symbols: set[str]) -> list[dict[str, str]]:
         """Cancel bot-owned reduceOnly stops only when the exchange confirms the symbol is flat."""
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         market_symbols = {
             str(market.get("id")): market.get("symbol")
             for market in (getattr(self.exchange, "markets", {}) or {}).values()
@@ -430,7 +467,7 @@ class DemoExecutionService:
                     continue
                 symbol = market_symbols.get(str(row.get("symbol") or ""))
                 if symbol is None:
-                    raise RuntimeError("cannot map an open bot stop to a known Demo market")
+                    raise RuntimeError("cannot map an open bot stop to a known USDⓈ-M market")
                 if symbol not in live_symbols:
                     result.append((symbol, row))
             return result
@@ -455,7 +492,7 @@ class DemoExecutionService:
         """Return a fully verified fill for this bot's triggered reduceOnly stop."""
         if not stop or not stop.get("id"):
             return None
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         market_id = self.exchange.market(symbol)["id"]
         algo = self.exchange.fapiPrivateGetAlgoOrder({"algoId": str(stop["id"])})
         reduce_only = str(algo.get("reduceOnly")).strip().lower() in {"true", "1"}
@@ -498,7 +535,7 @@ class DemoExecutionService:
         """Resolve the triggered exchange order id for a tracked bot stop, then verify its fills."""
         if not stop or not stop.get("id"):
             return None
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         algo = self.exchange.fapiPrivateGetAlgoOrder({"algoId": str(stop["id"])})
         order_id = algo.get("actualOrderId")
         if not order_id:
@@ -509,7 +546,7 @@ class DemoExecutionService:
 
     def inspect_entry_attempt(self, attempt: dict[str, Any]) -> dict[str, Any]:
         """Read-only recovery by the exact saved order identity; never resend."""
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         symbol = attempt["symbol"]
         market_id = self.exchange.market(symbol)["id"]
         order = self.exchange.fapiPrivateGetOrder({
@@ -579,7 +616,7 @@ class DemoExecutionService:
             raise ValueError("opening intent has no valid protective stop")
         if submission_deadline is not None and _utc_now() > submission_deadline:
             raise EntryPreflightRejected("entry_signal_expired")
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         self._ensure_one_way()
         if self._position(intent.symbol) is not None:
             raise RuntimeError("exchange position already exists for symbol")
@@ -624,8 +661,8 @@ class DemoExecutionService:
             raise RuntimeError("market fill did not produce the expected exchange position")
         if step > 0 and abs(live_position["quantity"] - fill["filled"]) > step + 1e-12:
             raise RuntimeError("exchange position quantity differs from the confirmed fill")
-        logger.info("Demo OPEN_FILL symbol={} side={} amount={} orderId={} host={} source={} reason={} average={} stop_status=pending",
-                    intent.symbol, intent.side.value, live_position["quantity"], fill["id"],
+        logger.info("{} OPEN_FILL symbol={} side={} amount={} orderId={} host={} source={} reason={} average={} stop_status=pending",
+                    self.label, intent.symbol, intent.side.value, live_position["quantity"], fill["id"],
                     self.host, intent.source, intent.reason, live_position["entry_price"])
         if ((intent.side is Side.LONG and stop_price >= live_position["entry_price"])
                 or (intent.side is Side.SHORT and stop_price <= live_position["entry_price"])):
@@ -634,7 +671,7 @@ class DemoExecutionService:
                                   live_position["quantity"], reduce_only=True)
             except Exception as exc:
                 raise RuntimeError("fill moved beyond planned stop and emergency close failed; account is inconsistent") from exc
-            raise RuntimeError("fill moved beyond planned stop; Demo position was emergency-closed")
+            raise RuntimeError("fill moved beyond planned stop; position was emergency-closed")
         try:
             stop = self._place_stop(intent.symbol, intent.side.value, live_position["quantity"], stop_price)
         except Exception as stop_error:
@@ -643,7 +680,7 @@ class DemoExecutionService:
                                   live_position["quantity"], reduce_only=True)
             except Exception as close_error:
                 raise RuntimeError("protective stop placement failed and emergency reduceOnly close failed; account is inconsistent") from close_error
-            raise RuntimeError("protective stop placement failed; Demo position was emergency-closed") from stop_error
+            raise RuntimeError("protective stop placement failed; position was emergency-closed") from stop_error
         return {"fill": fill, "position": live_position, "stop": stop,
                 "order_submitted_at": submitted_at.isoformat(),
                 "host": self.host, "reason": intent.reason, "regime": intent.regime.value}
@@ -671,8 +708,8 @@ class DemoExecutionService:
         remaining = self._position(symbol)
         if remaining is not None:
             raise RuntimeError("reduceOnly close was sent but exchange position is still open")
-        logger.info("Demo CLOSE symbol={} side={} amount={} orderId={} host={} source={} reason={} average={}",
-                    symbol, position.side.value, fill["filled"], fill["id"], self.host, position.source,
+        logger.info("{} CLOSE symbol={} side={} amount={} orderId={} host={} source={} reason={} average={}",
+                    self.label, symbol, position.side.value, fill["filled"], fill["id"], self.host, position.source,
                     reason or "strategy_close", fill["average"])
         return {"fill": fill, "position": None, "host": self.host}
 
@@ -680,7 +717,7 @@ class DemoExecutionService:
                reason: str | None = None) -> dict[str, Any]:
         """Reduce a Demo position while keeping its remaining quantity protected."""
         symbol = position.symbol
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         live = self._position(symbol)
         if live is None or live["side"] != position.side.value:
             raise RuntimeError("cannot partially reduce while exchange/local positions disagree")
@@ -703,9 +740,9 @@ class DemoExecutionService:
                                      quantity, reduce_only=True)
             updated = self._position(symbol)
             if updated is None or updated["side"] != position.side.value:
-                raise RuntimeError("Demo partial reduction unexpectedly closed or reversed the position")
+                raise RuntimeError("USDⓈ-M partial reduction unexpectedly closed or reversed the position")
             if abs(float(updated["quantity"]) - remaining) > max(step, 1e-10):
-                raise RuntimeError("Demo remaining position quantity differs from expected partial reduction")
+                raise RuntimeError("USDⓈ-M remaining position quantity differs from expected partial reduction")
         except Exception:
             if replacement:
                 try:
@@ -732,7 +769,7 @@ class DemoExecutionService:
 
     def replace_stop(self, position, *, stop: dict[str, Any] | None,
                      stop_price: float) -> dict[str, Any]:
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         live_position = self._position(position.symbol)
         if live_position is None or live_position["side"] != position.side.value:
             raise RuntimeError("cannot update stop while exchange/local positions disagree")
@@ -810,12 +847,12 @@ class DemoExecutionService:
         if time.monotonic() - self._last_fill_audit_at < 300:
             return warnings
         self._last_fill_audit_at = time.monotonic()
-        verify_demo_urls(self.exchange)
+        self._verify_urls()
         for symbol in sorted(symbols):
             try:
                 trades = self.exchange.fetch_my_trades(symbol, since=None, limit=1000)
             except Exception as exc:
-                logger.warning("Demo fill audit unavailable for {}: {}", symbol, type(exc).__name__)
+                logger.warning("{} fill audit unavailable for {}: {}", self.label, symbol, type(exc).__name__)
                 continue
             for trade in trades:
                 info = trade.get("info") or {}
@@ -823,3 +860,10 @@ class DemoExecutionService:
                 if order_id and order_id not in known_order_ids and order_id not in seen_foreign_order_ids:
                     warnings.append({"symbol": symbol, "orderId": order_id})
         return warnings
+
+
+class LeadPortfolioExecutionService(DemoExecutionService):
+    """Production execution for a dedicated Binance Lead Portfolio account."""
+
+    def __init__(self, exchange, settings):
+        super().__init__(exchange, settings, mode="lead", auto_one_way=False)

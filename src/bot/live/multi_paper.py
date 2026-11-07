@@ -81,7 +81,7 @@ class MultiPaperState:
 
     @property
     def current_equity(self) -> float:
-        if self.execution_mode == "demo_usdm" and self.exchange_snapshot.get("equity") is not None:
+        if self.execution_mode in {"demo_usdm", "lead_usdm"} and self.exchange_snapshot.get("equity") is not None:
             return float(self.exchange_snapshot["equity"])
         unrealized = 0.0
         for symbol, position in self.portfolio.positions.items():

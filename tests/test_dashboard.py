@@ -302,6 +302,43 @@ def test_demo_dashboard_positions_and_unrealized_pnl_come_from_exchange_snapshot
     assert data["positions"][0]["margin_mode"] == "isolated"
 
 
+def test_lead_dashboard_uses_live_snapshot_and_disables_paper_manual_close(tmp_path):
+    symbol = "AAA/USDT:USDT"
+    state = {
+        "version": 2, "account_type": "multi_symbol_paper", "execution_mode": "lead_usdm",
+        "execution_status": "synchronized", "initial_equity": 1000.0, "cash": 900.0,
+        "positions": {}, "exchange_snapshot": {
+            "at": "2026-09-29T12:00:00+00:00", "host": "https://fapi.binance.com",
+            "equity": 995.0, "available_usdt": 800.0, "positions": {symbol: {
+                "side": "long", "quantity": 2.5, "entry_price": 10.25,
+                "unrealized_pnl": 4.75, "initial_margin": 8.54,
+                "margin_mode": "isolated", "leverage": 3,
+            }},
+        },
+        "watchlist": [], "events": [], "inconsistencies": [],
+    }
+    snapshot = build_multi_snapshot(
+        state, tickers={symbol: {"last": 12.0}}, settings=load_settings(env_file=None),
+        now=datetime(2026, 9, 29, 12, 5, tzinfo=timezone.utc),
+    )
+    assert snapshot["equity"] == 995.0
+    assert snapshot["execution_host"] == "https://fapi.binance.com"
+    assert snapshot["positions"][0]["pnl_source"] == "Lead Portfolio 账户快照"
+
+    state_path = tmp_path / "lead.json"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    class PublicExchange:
+        @staticmethod
+        def fetch_tickers():
+            return {}
+
+    service = DashboardService(state_path, None, PublicExchange(), settings=load_settings(env_file=None))
+    assert service.snapshot()["manual_close_enabled"] is False
+    with pytest.raises(ValueError, match="unavailable for Lead Portfolio"):
+        service.request_manual_close(symbol)
+
+
 def test_dashboard_service_records_one_equity_point_per_new_account_snapshot(tmp_path):
     state_path = tmp_path / "portfolio.json"
     state = {

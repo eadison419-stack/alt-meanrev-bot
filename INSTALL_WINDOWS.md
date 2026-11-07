@@ -66,11 +66,37 @@ Demo 状态默认写入 `data/paper/demo_portfolio.json`；当前启动脚本使
 
 Demo watchdog 文件随项目源码提供。本机 Startup 快捷方式已配置为启动该 watchdog；它会重启 EMA50 偏离候选 Runner，并检查 Demo 账本与最近交易所快照的同步状态。其他电脑不会因安装项目自动注册该启动项。
 
+## Binance Futures Lead Portfolio 实盘（真实委托）
+
+该入口运行 8766 的 `ema50_deviation_candidate`，沿用同一入场、止损、退出和风控逻辑。它使用生产 USDⓈ-M API；每次启动都要求在控制台输入 `LEAD`。不要在确认前运行。代码接入和离线检查不等于真实账户验收，本项目尚未用账户密钥连接或发单。
+
+启用前应先完成以下准备：
+
+1. 在 Binance 的 Futures Copy Trading 中建立 Lead Portfolio，并将资金转入该 Portfolio。Binance 当前说明创建 Lead Portfolio 时投入金额至少为 1,000 USDT；账户余额要求与跟单产品资格以 Binance 页面显示为准（[Lead Portfolio 创建说明](https://www.binance.com/en/support/faq/detail/bbd4c3725f3a474f8976b6ed70ea2c95)）。
+2. 在该 Lead Portfolio 的 API 页面创建专用 Copy Trading API Key，仅开启 Futures 权限并限制可信 IP。不要启用提现权限；该 API Key 仅支持 USDT Futures，且不支持 Multi-Assets Mode（[Lead Trading API Key 说明](https://www.binance.com/en/support/faq/detail/2bec848b904b422197ce121d0925f20b)）。
+3. 确认该 Lead 账户使用单向持仓模式，且账户内没有机器人账本以外的仓位。机器人会在启动时对账；发现持仓不匹配便拒绝继续。该账户应由这一个 Runner 管理。
+4. 用下列命令将 Lead 专用凭据存入当前 Windows 用户的 Credential Manager；Demo Key 与 Lead Key 使用不同目标。
+5. 运行实盘前核对当前账本、Runner 和 API Key，再手动启动。终端必须输入 `LEAD` 才会继续；启动时程序会核对 Lead 身份和 Binance 返回的 USDT 合约白名单，并只评估白名单币种（[Binance Copy Trading API](https://developers.binance.com/en/docs/catalog/advanced-trading-copy-trading/api/rest-api/future-copy-trading)）。运行后会管理真实持仓，并可能自动发送市价开平仓及保护止损委托。
+
+~~~powershell
+.\scripts\setup_lead_credentials.ps1
+.\run-lead-live.ps1 --once  # 先启动一次，仍须输入 LEAD
+.\run-lead-live.ps1         # 持续运行，Ctrl+C 停止
+~~~
+
+需要查看账本及最近账户快照时，可另开窗口启动只读 Dashboard：
+
+~~~powershell
+.\.venv\Scripts\python.exe .\scripts\run_dashboard.py --state .\data\live\lead_portfolio.json --port 8769 --no-open
+~~~
+
+Lead 实盘状态独立保存在 `data/live/lead_portfolio.json`，日志为 `logs/mr_lead_live.log`。不要把 Demo 或本地 Paper 账本指定为实盘账本。每币目标保证金按当前 Lead 权益的 13.42% 缩放；实际仓位仍受 2% 单笔风险预算、止损距离、总敞口、方向敞口和可用保证金限制。已有仓位不会因权益变化自动改仓。
+
 ## 配置与状态
 
 - configs/default.yaml 是策略参数唯一来源。编辑配置属于策略变更，需要单独设计和离线验证。
 - 不要将 .env、API Key、Secret、账本、日志或账户导出放入 ZIP、代码仓库或共享目录。
-- BOT_MODE=live 或 --live 当前被程序拒绝。不要据此尝试正式盘交易。
+- 8766 实盘入口只接受 `run-lead-live.ps1`；仍受独立凭据、BOT_MODE、生产 API 主机锁、独立账本和逐次控制台确认限制。不要用通用 `scripts/run_live.py` 或直接向机器人传入普通账户凭据。
 - 包含测试源码但本次打包没有运行测试套件；最近项目记录中的测试状态见策略复盘。
 - 下载 ZIP 后，在 ZIP 所在目录运行 Get-FileHash .\alt-meanrev-bot-windows-20261023.zip -Algorithm SHA256，并与同目录的 .sha256 文件核对。
 

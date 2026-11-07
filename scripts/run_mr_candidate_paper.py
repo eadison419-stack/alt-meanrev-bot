@@ -1,4 +1,4 @@
-"""Run the ``mr_candidate`` mean-reversion strategy on paper/demo.
+"""Run the ``mr_candidate`` mean-reversion strategy on paper, Demo, or Lead Portfolio.
 
 Independent entry point mirroring ``scripts/run_cta_paper.py``, but for the
 standalone mean-reversion candidate (``run_portfolio_backtest(mr_candidate=True)``):
@@ -6,19 +6,21 @@ hotness top-N universe, EMA50-deviation entries (long below / short above), and 
 EMA20 Bollinger mid-band protection plus the standard structure-stop / staged
 profit-lock / trailing / invalidation exits.
 
-Two modes (same as run_cta_paper.py):
+Execution modes (same strategy loop):
   BINANCE_TESTNET=false -> local_paper  (local virtual fills, no orders, no key)
   BINANCE_TESTNET=true  -> demo_usdm   (Binance USD-M testnet, needs API key)
+  --live + BOT_MODE=live -> lead_usdm  (production Lead Portfolio, interactive confirmation)
 
 Run (Windows, from project root):
   python scripts/run_mr_candidate_paper.py --once   # local paper, one cycle
   python scripts/run_mr_candidate_paper.py          # local paper, continuous
   python scripts/run_mr_candidate_paper.py --demo   # Binance testnet demo
+  python scripts/run_mr_candidate_paper.py --live   # production Lead Portfolio; type LEAD to confirm
   python scripts/run_mr_candidate_paper.py --intrabar-entries  # closed-1H entries, live-stop local Paper
 
 The isolated local Paper mode uses the daily EMA50 direction gate and closed-1H
 reversal entries. It keeps live-price stop monitoring and must not be combined
-with --demo.
+with --demo or --live.
 """
 
 from __future__ import annotations
@@ -47,10 +49,12 @@ from loguru import logger
 from bot.config import PROJECT_ROOT, load_settings
 from bot.data.klines import (filter_tradable_crypto_universe, hot_activity_metrics,
                              ohlcv_frame, score_hot_candidates)
-from bot.exchange.binance_usdm import create_demo_usdm, resolve_execution_mode
+from bot.exchange.binance_usdm import (create_demo_usdm, create_lead_usdm,
+                                       resolve_execution_mode)
 from bot.exchange.network import configure_system_proxy
 from bot.entry_quality import EntrySignalContext, execution_quote
-from bot.execution import DemoExecutionService, EntryPreflightRejected
+from bot.execution import (DemoExecutionService, EntryPreflightRejected,
+                           LeadPortfolioExecutionService)
 from bot.indicators import atr, validate_ohlcv
 from bot.live.multi_paper import MultiPaperState
 from bot.live import mr_scan
@@ -214,6 +218,28 @@ RUNNER_BUILD_ID = _source_fingerprint(__file__)
 TIME_FILTER_BUILD_ID = _source_fingerprint(evaluate_time_filter.__code__.co_filename)
 
 
+def _execution_source(state):
+    return ("binance_usdm_lead" if state.execution_mode == "lead_usdm"
+            else "binance_usdm_demo")
+
+
+def _target_margin_per_symbol(state, settings):
+    if state.execution_mode == "lead_usdm":
+        return state.current_equity * settings.sizing.live_margin_equity_pct
+    return settings.sizing.margin_per_symbol_usdt
+
+
+def _filter_lead_candidates(hotlist, markets, execution):
+    allowed_market_ids = getattr(execution, "lead_market_ids", set())
+    if not allowed_market_ids:
+        raise RuntimeError("Lead Portfolio contract whitelist is unavailable; refusing entries")
+    return [
+        row for row in hotlist
+        if str((markets.get(row["symbol"]) or {}).get("id", "")).upper()
+        in allowed_market_ids
+    ]
+
+
 # --- open / close helpers (demo + local, both sides) ---------------------------------
 
 def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, leverage,
@@ -314,7 +340,7 @@ def _record_demo_open(state, symbol, side, reason, regime_value, result, entry_a
                          "fee": fill.get("fee_cost"), "orderId": fill.get("id"),
                          "clientOrderId": (fill.get("clientOrderId")
                                            or (entry_audit or {}).get("clientOrderId")),
-                         "execution_source": "binance_usdm_demo"})
+                         "execution_source": _execution_source(state)})
     if entry_audit is not None:
         _record_entry_execution_fill(state, position, result, entry_audit)
     return position
@@ -456,17 +482,28 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
                 or (context.side is Side.SHORT and stop <= price)):
             reject("entry_stop_invalid")
         step, minimum = _entry_order_limits(market, price)
+        target_margin = _target_margin_per_symbol(state, settings)
         qty = calculate_order_quantity(
             state.current_equity, price, state.portfolio, settings,
             step_size=step, minimum_quantity=minimum, size_multiplier=multiplier,
             stop_price=stop, gross_notional_cap_pct=gross_cap,
+            target_margin_usdt=target_margin,
         )
         if qty <= 0:
             reject("entry_quantity_unavailable")
+        if state.execution_mode == "lead_usdm":
+            available = (state.exchange_snapshot or {}).get("available_usdt")
+            required_margin = (qty * price / settings.sizing.leverage
+                               * (1 + settings.fees.taker_bps / 10_000
+                                  + settings.risk.max_slippage_pct))
+            if (available is None or not math.isfinite(float(available))
+                    or float(available) < required_margin):
+                reject("insufficient_or_unavailable_margin")
         refreshed = replace(intent, price=price, quantity=qty, stop_price=stop)
         approval = assess_entry(
             refreshed, state.portfolio, state.current_equity, funding_rate, checked_at, settings,
             gross_notional_cap_pct=gross_cap, market_risk_state=market_risk.state.value,
+            per_symbol_margin_usdt=target_margin,
         )
         if not approval.allowed:
             reject(approval.reason)
@@ -894,7 +931,7 @@ def _reconcile_demo_funding(execution, state, now, *, position_monitor=None):
     active, trades = {}, []
     for event in state.events:
         if (event.get("event") != "paper_fill"
-                or event.get("execution_source") != "binance_usdm_demo"):
+                or event.get("execution_source") != getattr(execution, "source", "binance_usdm_demo")):
             continue
         symbol = event["symbol"]
         if event.get("action") == "OPEN":
@@ -998,7 +1035,7 @@ def _close_position(is_demo, execution, state, symbol, price, reason, at, fee_ra
                        "quantity": fill.get("filled", position.quantity), "price": fill.get("average"),
                        "gross_pnl": gross, "funding_paid": funding, "net_pnl": net,
                        "pnl_recorded": net is not None, "source": MEAN_REVERSION,
-                       "execution_source": "binance_usdm_demo", "orderId": fill.get("id"),
+                       "execution_source": _execution_source(state), "orderId": fill.get("id"),
                        **observations}
         if fees is not None:
             close_event["fees"] = fees
@@ -1089,7 +1126,7 @@ def _demo_sync_stopped(execution, state, at):
                            "price": stop_fill.get("average") if stop_fill else None,
                            "gross_pnl": gross, "funding_paid": funding, "net_pnl": net,
                            "pnl_recorded": net is not None, "source": MEAN_REVERSION,
-                           "execution_source": "binance_usdm_demo",
+                           "execution_source": _execution_source(state),
                            "orderId": stop_fill.get("order_id") if stop_fill else None,
                            "algoId": stop_fill.get("algo_id") if stop_fill else None,
                            **observations}
@@ -1128,7 +1165,7 @@ def _demo_sync_stopped(execution, state, at):
         for row in cancelled:
             state.events.append({"event": "demo_orphan_stop_cancelled", "at": at.isoformat(),
                                  "symbol": row["symbol"], "algoId": row["algo_id"],
-                                 "execution_source": "binance_usdm_demo"})
+                                 "execution_source": _execution_source(state)})
             logger.warning("Canceled orphaned bot protective stop for {} algoId={}",
                            row["symbol"], row["algo_id"])
     for symbol in local:
@@ -1146,7 +1183,7 @@ def _demo_sync_stopped(execution, state, at):
                         "event": "protective_stop_regression_detected", "at": at.isoformat(),
                         "symbol": symbol, "side": position.side.value,
                         **incident, "algoId": stop.get("id"),
-                        "execution_source": "binance_usdm_demo",
+                        "execution_source": _execution_source(state),
                     })
                     logger.error(
                         "Demo protective stop regressed for {}: recorded={} exchange={} algoId={}",
@@ -1161,7 +1198,7 @@ def _demo_sync_stopped(execution, state, at):
                         "event": "protective_stop_regression_cleared", "at": at.isoformat(),
                         "symbol": symbol, "side": position.side.value,
                         "previous_stop": regression["previous_stop"], "stop_price": observed_stop,
-                        "algoId": stop.get("id"), "execution_source": "binance_usdm_demo",
+                        "algoId": stop.get("id"), "execution_source": _execution_source(state),
                     })
                 meta["protective_stop"] = observed_stop
             meta["enabled"] = True
@@ -1185,7 +1222,7 @@ def _demo_sync_stopped(execution, state, at):
 
 
 def _invalidate_demo_stop_audit(state):
-    if state.execution_mode == "demo_usdm":
+    if state.execution_mode in {"demo_usdm", "lead_usdm"}:
         state.protective_stop_audit = {}
 
 
@@ -1472,7 +1509,7 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
             "previous_stop": tracked_stop, "stop_price": actual_stop,
             "requested_stop": proposed_stop, "previous_algo_id": tracked_order.get("id"),
             "algoId": updated.get("id"), "reason": stop_reason,
-            "execution_source": "binance_usdm_demo",
+            "execution_source": _execution_source(state),
         })
         logger.info("Demo protective stop updated for {}: {} -> {} algoId={}",
                     symbol, tracked_stop, actual_stop, updated.get("id"))
@@ -2222,6 +2259,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             if position_monitor is not None:
                 position_monitor()
 
+    if state.execution_mode == "lead_usdm":
+        hotlist = _filter_lead_candidates(hotlist, markets, execution)
     state.watchlist = hotlist
     if intrabar_entries and not _hotlist_cache_is_fresh(state, now):
         state.exit_management_by_symbol[HOTLIST_CACHE_KEY] = {"refreshed_at": now.isoformat()}
@@ -2834,6 +2873,10 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
     market_risk_state = market_risk.state.value
     market_risk_multiplier = (settings.market_risk.elevated_size_multiplier
                               if market_risk.state is MarketRiskState.RISK_ELEVATED else 1.0)
+    if (state.execution_mode == "lead_usdm"
+            and str((markets.get(symbol) or {}).get("id", "")).upper()
+            not in getattr(execution, "lead_market_ids", set())):
+        return None
     if is_demo and len(state.portfolio.positions) >= max_pos:
         return None
     if position_monitor is not None:
@@ -2855,12 +2898,14 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
     minimum_quantity = 0.0
     if is_demo:
         step_size, minimum_quantity = _entry_order_limits(markets.get(symbol) or {}, close)
+    target_margin = _target_margin_per_symbol(state, settings)
     qty = calculate_order_quantity(state.current_equity, close, state.portfolio, settings,
                                    step_size=step_size, minimum_quantity=minimum_quantity,
                                    size_multiplier=market_risk_multiplier,
                                    stop_price=stop,
                                    gross_notional_cap_pct=(settings.sizing.max_gross_notional_pct
-                                                           * market_risk_multiplier))
+                                                           * market_risk_multiplier),
+                                   target_margin_usdt=target_margin)
     if qty <= 0:
         return None
     intent = OrderIntent(symbol, side, Action.OPEN, qty, close, reason, Regime(regime_value),
@@ -2869,7 +2914,8 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
                              funding_rate, now, settings,
                              gross_notional_cap_pct=(settings.sizing.max_gross_notional_pct
                                                      * market_risk_multiplier),
-                             market_risk_state=market_risk_state)
+                             market_risk_state=market_risk_state,
+                             per_symbol_margin_usdt=target_margin)
     if not approval.allowed:
         return None
     execution_kwargs = {}
@@ -3088,61 +3134,99 @@ def main() -> int:
     parser.add_argument("--poll", type=int, default=300, help="poll interval in seconds")
     parser.add_argument("--max-positions", type=int, default=5)
     parser.add_argument("--equity", type=float, default=10_000.0)
-    parser.add_argument("--state", type=Path, default=Path("data/paper/mr_candidate_portfolio.json"))
+    parser.add_argument("--state", type=Path, default=None)
     parser.add_argument("--demo", action="store_true",
                         help="run on Binance USDT-M testnet demo (default: local paper, no key)")
+    parser.add_argument("--live", action="store_true",
+                        help="run the 8766 strategy on a Binance Lead Portfolio account")
     parser.add_argument("--intrabar-entries", action="store_true",
                         help="local paper only: closed-1H entries with live-price stop monitoring")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
     args = parser.parse_args()
     if args.poll < 1:
         parser.error("--poll must be at least one second")
-    if args.intrabar_entries and args.demo:
-        parser.error("--intrabar-entries is local-paper only; do not combine it with --demo")
+    if args.demo and args.live:
+        parser.error("--demo and --live cannot be combined")
+    if args.intrabar_entries and (args.demo or args.live):
+        parser.error("--intrabar-entries is local-paper only")
+
+    live_confirmed = False
+    if args.live:
+        if not sys.stdin.isatty():
+            parser.error("--live requires an interactive console confirmation")
+        print("实盘将通过 Binance Lead Portfolio API 发送真实委托。输入 LEAD 才继续：", flush=True)
+        try:
+            live_confirmed = input().strip() == "LEAD"
+        except EOFError:
+            live_confirmed = False
+        if not live_confirmed:
+            print("未确认，已退出；未连接账户。")
+            return 2
+
+    settings = load_settings()
+    mode = resolve_execution_mode(bot_mode=settings.runtime.bot_mode,
+                                  testnet=(settings.runtime.binance_testnet if args.live else args.demo),
+                                  live_flag=args.live,
+                                  live_confirmed=live_confirmed)
 
     def path(value: Path) -> Path:
         return value if value.is_absolute() else PROJECT_ROOT / value
 
-    state_path = path(args.state)
+    default_state = (Path("data/live/lead_portfolio.json") if args.live
+                     else Path("data/paper/mr_candidate_portfolio.json"))
+    state_path = path(args.state or default_state).resolve()
+    if args.live and state_path.is_relative_to(PROJECT_ROOT / "data" / "paper"):
+        parser.error("--live requires a separate state file outside data/paper")
     state_path_existed = state_path.exists()
-    settings = load_settings()
 
     log_dir = PROJECT_ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
     logger.remove()
-    log_name = "mr_intrabar_paper.log" if args.intrabar_entries else "mr_candidate_paper.log"
+    log_name = ("mr_lead_live.log" if args.live else
+                "mr_intrabar_paper.log" if args.intrabar_entries else "mr_candidate_paper.log")
     logger.add(log_dir / log_name, rotation="10 MB", retention=7,
                enqueue=True, level="INFO", backtrace=False, diagnose=False,
                filter=redact_log_record)
-    pid_name = "ema50_intrabar_paper.pid" if args.intrabar_entries else "mr_candidate_paper.pid"
-    pid_path = PROJECT_ROOT / "data" / "paper" / pid_name
+    pid_name = ("ema50_lead_live.pid" if args.live else
+                "ema50_intrabar_paper.pid" if args.intrabar_entries else "mr_candidate_paper.pid")
+    pid_dir = "live" if args.live else "paper"
+    pid_path = PROJECT_ROOT / "data" / pid_dir / pid_name
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
 
-    mode = resolve_execution_mode(bot_mode=settings.runtime.bot_mode,
-                                  testnet=args.demo, live_flag=False)
-    is_demo = mode.name == "demo_usdm"
+    is_exchange_execution = mode.name in {"demo_usdm", "lead_usdm"}
+    is_demo = is_exchange_execution
 
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
     configure_system_proxy(exchange)
-    demo_exchange = None
+    account_exchange = None
     execution = None
     try:
         state = MultiPaperState.load(state_path, initial_equity=args.equity)
-        state.execution_mode = mode.name
+        if state_path_existed and state.execution_mode != mode.name:
+            raise RuntimeError(
+                f"state file execution mode is {state.execution_mode}; refusing to reuse it for {mode.name}"
+            )
+        if not state_path_existed:
+            state.execution_mode = mode.name
         checkpoint = _RunnerCheckpoint(state, state_path)
-        if is_demo:
-            demo_exchange = create_demo_usdm(settings.runtime)
-            execution = DemoExecutionService(demo_exchange, settings)
+        if is_exchange_execution:
+            if mode.name == "lead_usdm":
+                account_exchange = create_lead_usdm(settings.runtime)
+                execution = LeadPortfolioExecutionService(account_exchange, settings)
+            else:
+                account_exchange = create_demo_usdm(settings.runtime)
+                execution = DemoExecutionService(account_exchange, settings)
             try:
                 state.exchange_snapshot = _initialize_demo(execution)
             except ccxt.BaseError as exc:
-                state.events.append({"event": "demo_startup_failed", "at": _utc_now().isoformat(),
-                                     "phase": "account_initialization", "endpoint": "demo",
+                state.events.append({"event": "account_startup_failed", "at": _utc_now().isoformat(),
+                                     "phase": "account_initialization", "endpoint": mode.name,
                                      "error": type(exc).__name__, "order_may_have_been_sent": False})
                 if state_path_existed:
                     checkpoint.try_save()
-                logger.error("Demo startup failed before entry processing: {}", type(exc).__name__)
+                logger.error("{} startup failed before entry processing: {}", mode.name,
+                             type(exc).__name__)
                 return 1
             try:
                 entries_reconciled = _reconcile_pending_entries(execution, state, checkpoint)
@@ -3150,7 +3234,7 @@ def main() -> int:
                 entries_reconciled = False
             if entries_reconciled and not _demo_sync_stopped(execution, state, datetime.now(timezone.utc)):
                 checkpoint.try_save()
-                raise RuntimeError("Demo positions do not match the local ledger; refusing to start")
+                raise RuntimeError(f"{mode.name} positions do not match the local ledger; refusing to start")
             if not state_path_existed:
                 state.initial_equity = float(state.exchange_snapshot["equity"])
                 state.cash = state.initial_equity
@@ -3165,12 +3249,12 @@ def main() -> int:
             state.strategy_variant = candidate_variant
         checkpoint.try_save()
 
-        logger.info("Starting MR candidate paper: mode={} strategy={} max_positions={} risk_per_trade_pct={} poll={} intrabar_entries={} runner_build_id={} time_filter_build_id={} state={}",
+        logger.info("Starting MR candidate: mode={} strategy={} max_positions={} risk_per_trade_pct={} poll={} intrabar_entries={} runner_build_id={} time_filter_build_id={} state={}",
                     mode.name, candidate_variant, args.max_positions,
                     settings.risk.max_single_trade_risk_pct * 100, args.poll,
                     args.intrabar_entries, RUNNER_BUILD_ID, TIME_FILTER_BUILD_ID, state_path)
         market_cache = IntrabarMarketCache() if args.intrabar_entries else None
-        closed_market_cache = ClosedMarketCache() if is_demo else None
+        closed_market_cache = ClosedMarketCache() if is_exchange_execution else None
         retry_after = _persisted_market_retry_after(state) if args.intrabar_entries else None
         market_failure_attempt = 0
         last_position_monitor_at = 0.0
@@ -3285,7 +3369,7 @@ def main() -> int:
                                        position_monitor=monitor_demo_positions)
             state.record_equity(now)
             saved = checkpoint.try_save()
-            logger.info("MR candidate paper equity={} open_positions={}",
+            logger.info("MR candidate equity={} open_positions={}",
                         round(state.current_equity, 4), len(state.portfolio.positions))
             if args.once:
                 return 0 if saved and cycle_completed else 1
@@ -3298,8 +3382,8 @@ def main() -> int:
                 time.sleep(min(float(args.poll), remaining))
     finally:
         exchange.close()
-        if demo_exchange is not None:
-            demo_exchange.close()
+        if account_exchange is not None:
+            account_exchange.close()
     return 0
 
 

@@ -198,6 +198,7 @@ class Session(Section):
 class Sizing(Section):
     leverage: Annotated[int, Field(gt=0, le=3)]
     margin_per_symbol_usdt: Positive
+    live_margin_equity_pct: Fraction
     max_symbols: Count
     max_gross_notional_pct: Positive
     max_directional_notional_pct: Positive

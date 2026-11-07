@@ -23,6 +23,11 @@ from bot.live.paper import effective_max_hold_hours, runner_tail_is_exempt
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def _exchange_execution_source(mode: str) -> str | None:
+    return {"demo_usdm": "binance_usdm_demo",
+            "lead_usdm": "binance_usdm_lead"}.get(mode)
+
+
 def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None,
                          end_date: str | None = None,
                          current_positions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -35,10 +40,11 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
     upper = datetime.combine(end, datetime_time.max, SHANGHAI) if end else None
     fills = []
     source_events = state.get("events", [])
-    demo_mode = state.get("execution_mode") == "demo_usdm"
-    if demo_mode:
+    exchange_source = _exchange_execution_source(state.get("execution_mode", ""))
+    exchange_mode = exchange_source is not None
+    if exchange_mode:
         source_events = [event for event in source_events
-                         if event.get("execution_source") == "binance_usdm_demo"
+                         if event.get("execution_source") == exchange_source
                          or event.get("event") in {"demo_partial_fill_reconciled",
                                                     "external_position_reconciled_flat"}]
     for event in source_events:
@@ -92,7 +98,7 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
                                 else event.get("price")),
                 "opened_at": event.get("opened_at") or at.isoformat(),
                 "entry_fee": (float(event["fee"]) if event.get("fee") is not None
-                              else None if demo_mode else 0.0),
+                              else None if exchange_mode else 0.0),
                 "entry_reason": event.get("reason", event.get("entry_reason")),
                 "entry_regime": event.get("regime", event.get("entry_regime")),
                 "strategy_sample_eligible": event.get("strategy_sample_eligible", True),
@@ -104,11 +110,11 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
                 "entry_price": None, "opened_at": None, "entry_fee": 0.0,
             })
             trade.update({"closed_at": (event.get("closed_at", at.isoformat())
-                                          if demo_mode else at.isoformat()),
+                                          if exchange_mode else at.isoformat()),
                           "exit_price": event.get("price"),
                           "realized_pnl": float(event["net_pnl"]) if event.get("net_pnl") is not None else None,
                           "fees": (float(event["fees"]) if event.get("fees") is not None
-                                   else None if demo_mode else 0.0), "exit_reason": event.get("reason"),
+                                   else None if exchange_mode else 0.0), "exit_reason": event.get("reason"),
                           "entry_reason": event.get("entry_reason", trade.get("entry_reason")),
                           "entry_regime": event.get("entry_regime", trade.get("entry_regime")),
                           "held_hours": event.get("held_hours"), "mfe_r": event.get("mfe_r"),
@@ -121,7 +127,7 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
                               "strategy_sample_eligible", trade.get("strategy_sample_eligible", True)),
                           "sample_exclusion_reason": event.get(
                               "sample_exclusion_reason", trade.get("sample_exclusion_reason"))})
-            if demo_mode:
+            if exchange_mode:
                 trade.update({
                     "exit_time_verified": event.get("exit_time_verified"),
                     "reconciled_at": event.get("reconciled_at"),
@@ -476,13 +482,15 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
     mark_prices = state.get("mark_prices", {})
     exit_states = state.get("exit_management_by_symbol", {})
     margin_states = state.get("isolated_margin_by_symbol", {})
-    demo_mode = state.get("execution_mode") == "demo_usdm"
-    if demo_mode:
-        events = [event for event in events if event.get("execution_source") == "binance_usdm_demo"
+    exchange_source = _exchange_execution_source(state.get("execution_mode", ""))
+    exchange_mode = exchange_source is not None
+    lead_mode = state.get("execution_mode") == "lead_usdm"
+    if exchange_mode:
+        events = [event for event in events if event.get("execution_source") == exchange_source
                   or event.get("event") == "external_position_reconciled_flat"]
-    exchange_snapshot = state.get("exchange_snapshot", {}) if demo_mode else {}
+    exchange_snapshot = state.get("exchange_snapshot", {}) if exchange_mode else {}
     exchange_positions = exchange_snapshot.get("positions", {})
-    if demo_mode:
+    if exchange_mode:
         display_positions = {}
         for symbol, live in exchange_positions.items():
             local = state.get("positions", {}).get(symbol, {})
@@ -514,7 +522,7 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
         margin = margin_states.get(symbol, {})
         qty, entry = float(raw["quantity"]), float(raw["entry_price"])
         mmr = float(margin.get("maintenance_margin_rate", 0.0))
-        margin_value = (raw.get("exchange_initial_margin") if demo_mode
+        margin_value = (raw.get("exchange_initial_margin") if exchange_mode
                         else margin.get("initial_margin"))
         allocated = float(margin_value) if margin_value is not None else 0.0
         maintenance_amount = float(margin.get("maintenance_amount", 0.0))
@@ -536,12 +544,14 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
             "reason": raw["reason"], "opened_at": raw["opened_at"], "price": price,
             "unrealized_pnl": pnl,
             "price_source": "Binance 最新成交价" if raw_price is not None else "最近可用行情",
-            "pnl_source": "Demo 账户快照" if demo_mode else "本机行情估算",
-            "pnl_updated_at": exchange_snapshot.get("at") if demo_mode else now.isoformat(),
+            "pnl_source": ("Lead Portfolio 账户快照" if lead_mode else "Demo 账户快照")
+                          if exchange_mode else "本机行情估算",
+            "pnl_updated_at": exchange_snapshot.get("at") if exchange_mode else now.isoformat(),
             "margin_mode": raw.get("margin_mode") or ("isolated" if margin_value is not None else "legacy"),
             "isolated_margin": allocated if margin_value is not None else None,
-            "margin_source": "Binance Demo 交易所快照" if demo_mode else "本地 Paper 账本",
-            "margin_updated_at": exchange_snapshot.get("at") if demo_mode else now.isoformat(),
+            "margin_source": ("Binance Lead Portfolio 快照" if lead_mode else "Binance Demo 交易所快照")
+                             if exchange_mode else "本地 Paper 账本",
+            "margin_updated_at": exchange_snapshot.get("at") if exchange_mode else now.isoformat(),
             "leverage": raw.get("exchange_leverage", margin.get("leverage")), "maintenance_margin": maintenance,
             "liquidation_price_estimate": liq,
             "stop_distance_pct": abs(float(price) - stop_price) / float(price) * 100
@@ -585,12 +595,12 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
             )
         else:
             position["stop_net_if_closed"] = None
-    equity = (float(exchange_snapshot.get("equity")) if demo_mode and exchange_snapshot.get("equity") is not None
+    equity = (float(exchange_snapshot.get("equity")) if exchange_mode and exchange_snapshot.get("equity") is not None
               else cash + unrealized + sum(float(item.get("initial_margin", 0.0)) for item in margin_states.values()))
     closes = [event for event in events if event.get("event") == "paper_fill" and event.get("action") == "CLOSE"
               and event.get("strategy_sample_eligible", True)
               and event.get("net_pnl") is not None]
-    external_closes = [event for event in events if demo_mode
+    external_closes = [event for event in events if exchange_mode
                        and event.get("event") == "external_position_reconciled_flat"
                        and event.get("strategy_sample_eligible", True)]
     recorded_external_closes = [event for event in external_closes
@@ -774,7 +784,11 @@ class DashboardService:
                 self._cached = build_snapshot(state, price=price, market_error=error,
                                               state_updated_at=state_stat.st_mtime)
             self._cached_at = time.monotonic()
-            self._cached["manual_close_enabled"] = state.get("version") == 2 and state.get("account_type") == "multi_symbol_paper"
+            self._cached["manual_close_enabled"] = (
+                state.get("version") == 2
+                and state.get("account_type") == "multi_symbol_paper"
+                and state.get("execution_mode") != "lead_usdm"
+            )
             return self._cached
 
     def orders(self, *, start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
@@ -789,8 +803,10 @@ class DashboardService:
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         if state.get("version") != 2 or state.get("account_type") != "multi_symbol_paper":
             raise ValueError("manual close is available only for multi-symbol paper mode")
+        if state.get("execution_mode") == "lead_usdm":
+            raise ValueError("manual close through the Paper dashboard is unavailable for Lead Portfolio mode")
         exchange_positions = (state.get("exchange_snapshot", {}).get("positions", {})
-                              if state.get("execution_mode") == "demo_usdm" else {})
+                              if _exchange_execution_source(state.get("execution_mode", "")) else {})
         if symbol not in state.get("positions", {}) and symbol not in exchange_positions:
             raise LookupError("the selected symbol has no open paper position")
         request = self.manual_close_store.submit_unique(symbol)

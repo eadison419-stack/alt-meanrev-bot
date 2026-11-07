@@ -113,6 +113,16 @@ def test_quantity_targets_fixed_margin_and_rounds_down():
     assert calculate_order_quantity(3000, 10, PortfolioState(), settings, step_size=0.3, minimum_quantity=301) == 0
 
 
+def test_quantity_can_use_equity_scaled_lead_margin_without_changing_default_target():
+    settings = load_settings(env_file=None)
+    fixed = calculate_order_quantity(3000, 10, PortfolioState(), settings, step_size=0.1)
+    scaled = calculate_order_quantity(1000, 10, PortfolioState(), settings, step_size=0.1,
+                                      target_margin_usdt=134.2)
+
+    assert fixed == pytest.approx(300.0)
+    assert scaled == pytest.approx(40.2)
+
+
 def test_quantity_shrinks_to_configured_stop_risk_budget():
     settings = load_settings(env_file=None)
     quantity = calculate_order_quantity(
