@@ -55,7 +55,7 @@ try {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $stdoutPath = Join-Path $stdoutDirectory "mr_lead_background-$stamp.stdout.log"
     $stderrPath = Join-Path $stdoutDirectory "mr_lead_background-$stamp.stderr.log"
-    $argumentLine = "-u `"$runner`" --live --background-confirmed --state `"$statePath`""
+    $argumentLine = "-u `"$runner`" --live --background-confirmed --poll 60 --state `"$statePath`""
     $backgroundProcess = Start-Process -FilePath $python -ArgumentList $argumentLine `
         -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
@@ -90,7 +90,7 @@ while ([DateTime]::UtcNow -lt $startDeadline) {
                     $ready = $state.execution_mode -eq 'lead_usdm' -and
                         $state.execution_status -eq 'synchronized' -and
                         $state.exchange_snapshot.host -eq 'https://fapi.binance.com' -and
-                        $state.strategy_variant -eq 'ema50_deviation_candidate' -and
+                        $state.strategy_variant -eq 'ema50_daily_gate_closed_h1_mean_reversion' -and
                         $state.inconsistencies.Count -eq 0 -and
                         $snapshotAge.TotalSeconds -ge -30 -and $snapshotAge.TotalSeconds -lt 60
                     if ($ready) { $runnerPid = $pidValue; break }

@@ -78,7 +78,7 @@ function Get-DemoLedgerHealth {
         $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
         $snapshot = $state.exchange_snapshot
         if ($state.execution_mode -ne 'demo_usdm') { $reasons.Add('execution_mode') }
-        if ($state.strategy_variant -ne 'ema50_deviation_candidate') { $reasons.Add('strategy_variant') }
+        if ($state.strategy_variant -ne 'ema50_daily_gate_closed_h1_mean_reversion') { $reasons.Add('strategy_variant') }
         if ($state.execution_status -ne 'synchronized') { $reasons.Add('execution_status') }
         if ($snapshot.host -ne 'https://demo-fapi.binance.com') { $reasons.Add('snapshot_host') }
         if (-not $snapshot.at) { $reasons.Add('snapshot_time_missing') }
@@ -146,7 +146,7 @@ function Start-DemoRunner {
         $script:NextAttemptAt = (Get-Date).AddSeconds($script:RetryDelaySeconds)
         $script:GraceUntil = (Get-Date).Add($HeartbeatLimit)
         $script:MissingCredentialLogged = $false
-        Write-WatchdogLog "Started USDⓈ-M Demo runner pid=$($process.Id); strategy=ema50_deviation_candidate; BOT_MODE=paper; BINANCE_TESTNET=true"
+        Write-WatchdogLog "Started USDⓈ-M Demo runner pid=$($process.Id); strategy=ema50_daily_gate_closed_h1_mean_reversion; poll=60s; BOT_MODE=paper; BINANCE_TESTNET=true"
     } finally {
         if ($null -eq $oldKey) { Remove-Item Env:\BINANCE_API_KEY -ErrorAction SilentlyContinue } else { $env:BINANCE_API_KEY = $oldKey }
         if ($null -eq $oldSecret) { Remove-Item Env:\BINANCE_API_SECRET -ErrorAction SilentlyContinue } else { $env:BINANCE_API_SECRET = $oldSecret }

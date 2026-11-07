@@ -761,8 +761,8 @@ class DemoExecutionService:
             # The market fill and remaining position are already confirmed. Preserve them
             # for the caller even when stop cleanup needs a later reconciliation cycle.
             stale_stops = [stop] if stop else [{"id": None, "reason": "stop_cleanup_unverified"}]
-            logger.error("Demo partial fill confirmed for {} but superseded stop cleanup failed: {}",
-                         symbol, cleanup_error)
+            logger.error("{} partial fill confirmed for {} but superseded stop cleanup failed: {}",
+                         self.label, symbol, cleanup_error)
         return {"fill": fill, "position": updated, "stop": replacement, "host": self.host,
                 "reason": reason, "stale_stops": stale_stops,
                 "stop_cleanup_error": cleanup_error}
@@ -803,13 +803,13 @@ class DemoExecutionService:
                                  abs_tol=max(actual_price * 1e-9, 1e-12))
             )
             if not valid:
-                raise RuntimeError("cannot replace an unverified or stale Demo protective stop")
+                raise RuntimeError(f"cannot replace an unverified or stale {self.label} protective stop")
             current_stop_price = actual_price
         else:
             current_stop_price = _number(position.stop_price, float("nan"))
             current_stop_price = float(self.exchange.price_to_precision(symbol, current_stop_price))
             if not math.isfinite(current_stop_price) or current_stop_price <= 0:
-                raise RuntimeError("cannot replace a Demo stop without a valid existing risk stop")
+                raise RuntimeError(f"cannot replace a {self.label} stop without a valid existing risk stop")
 
         if position.side is Side.LONG:
             if candidate < current_stop_price:

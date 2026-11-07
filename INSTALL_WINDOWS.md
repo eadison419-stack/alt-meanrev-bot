@@ -62,13 +62,13 @@ Demo 使用测试环境私有 API，并会真实发送测试委托、创建保�
 .\run-demo-paper.ps1         # 持续运行，按 Ctrl+C 停止
 ~~~
 
-Demo 状态默认写入 `data/paper/demo_portfolio.json`；当前启动脚本使用 EMA50 偏离候选策略：4H 收盘价相对 EMA50 偏离至少 1%，再由已收盘 1H K 线方向确认；持仓按 EMA20 中轨保护及结构止损管理。此操作会向 Binance USDⓈ-M Demo 发送测试委托，不会启动正式盘交易。候选策略仍属前瞻验证，不代表已证明有稳定收益。
+Demo 状态默认写入 `data/paper/demo_portfolio.json`；当前启动脚本使用已收盘日线 EMA50 方向门槛、4H EMA50 偏离和已收盘 1H 反转确认，并使用同一止损、退出及账户权益比例仓位规则。此操作会向 Binance USDⓈ-M Demo 发送测试委托，不会启动正式盘交易。候选策略仍属前瞻验证，不代表已证明有稳定收益。
 
 Demo watchdog 文件随项目源码提供。本机 Startup 快捷方式已配置为启动该 watchdog；它会重启 EMA50 偏离候选 Runner，并检查 Demo 账本与最近交易所快照的同步状态。其他电脑不会因安装项目自动注册该启动项。
 
 ## Binance Futures Lead Portfolio 实盘（真实委托）
 
-该入口运行 8766 的 `ema50_deviation_candidate`，沿用同一入场、止损、退出和风控逻辑。它使用生产 USDⓈ-M API；每次启动都要求在控制台输入 `LEAD`。不要在确认前运行。账户连接及只读初始化已核验，尚未验证真实委托及跟单成交同步。
+该入口运行 8766 的 `ema50_daily_gate_closed_h1_mean_reversion`：在相同的 4H EMA50 偏离与已收盘 1H 反转条件上应用已收盘日线 EMA50 方向门槛。目标保证金按当前 Lead 账户权益的 13.42% 计算，默认每 60 秒轮询。它使用生产 USDⓈ-M API；每次启动都要求在控制台输入 `LEAD`。不要在确认前运行。账户连接及只读初始化已核验，尚未验证真实委托及跟单成交同步。
 
 启用前应先完成以下准备：
 

@@ -1,11 +1,19 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import threading
 from urllib.request import Request, urlopen
 import pytest
 
 from bot.config import load_settings
 from bot.live.dashboard import DashboardService, build_multi_snapshot, build_order_snapshot, build_snapshot, serve_dashboard
+
+
+def test_dashboard_frontend_treats_lead_portfolio_as_an_exchange_account():
+    html_path = Path(__file__).resolve().parents[1] / "src" / "bot" / "live" / "dashboard.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert "function isExchangeMode(mode){return mode==='demo_usdm'||mode==='lead_usdm'}" in html
+    assert "function accountModeLabel(mode){return mode==='lead_usdm'?'Binance Lead Portfolio'" in html
 
 
 def sample_state():

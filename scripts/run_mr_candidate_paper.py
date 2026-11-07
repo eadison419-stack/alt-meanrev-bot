@@ -208,7 +208,8 @@ def _initialize_demo(execution):
         except ccxt.BaseError as exc:
             if attempt == 2 or not mr_scan.retryable_read(exc):
                 raise
-            logger.warning("Demo startup read failed; retry {}/3: {}", attempt + 1, type(exc).__name__)
+            logger.warning("{} startup read failed; retry {}/3: {}",
+                           _execution_label(execution), attempt + 1, type(exc).__name__)
             time.sleep(attempt + 1)
 
 
@@ -244,10 +245,30 @@ def _execution_source(state):
             else "binance_usdm_demo")
 
 
+def _execution_label(execution, state=None):
+    label = getattr(execution, "label", None)
+    if label:
+        return str(label)
+    mode = getattr(state, "execution_mode", None)
+    if mode == "lead_usdm":
+        return "Lead Portfolio"
+    return "local Paper" if mode == "local_paper" else "Demo"
+
+
 def _target_margin_per_symbol(state, settings):
-    if state.execution_mode == "lead_usdm":
+    if state.execution_mode in {"demo_usdm", "lead_usdm"}:
         return state.current_equity * settings.sizing.live_margin_equity_pct
     return settings.sizing.margin_per_symbol_usdt
+
+
+def _default_poll_for_mode(mode_name):
+    return 60 if mode_name in {"demo_usdm", "lead_usdm"} else 300
+
+
+def _strategy_variant_for_mode(mode_name, *, intrabar_entries=False):
+    if mode_name in {"demo_usdm", "lead_usdm"} or intrabar_entries:
+        return "ema50_daily_gate_closed_h1_mean_reversion"
+    return "ema50_deviation_candidate"
 
 
 def _filter_lead_candidates(hotlist, markets, execution):
@@ -273,7 +294,9 @@ def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, le
         attempt = None
         if scan_row is not None:
             if checkpoint is None:
-                raise mr_scan.ScanCheckpointError("Demo scan requires durable state storage")
+                raise mr_scan.ScanCheckpointError(
+                    f"{_execution_label(execution, state)} scan requires durable state storage"
+                )
             client_id = mr_scan.client_order_id(symbol, side.value, scan_row["bar"])
             attempt = state.mr_entry_attempts.setdefault(client_id, {
                 "symbol": symbol, "side": side.value, "bar": scan_row["bar"],
@@ -1103,7 +1126,8 @@ def _demo_sync_stopped(execution, state, at):
                 try:
                     stop_fill = resolver(symbol, stop, position.quantity)
                 except Exception as exc:
-                    logger.warning("Cannot verify Demo stop fill for {}: {}", symbol, type(exc).__name__)
+                    logger.warning("Cannot verify {} stop fill for {}: {}",
+                                   _execution_label(execution, state), symbol, type(exc).__name__)
             try:
                 cleanup = getattr(execution, "cancel_saved_stop_if_open", None)
                 if callable(cleanup):
@@ -1117,8 +1141,8 @@ def _demo_sync_stopped(execution, state, at):
                     "position_count": len(state.portfolio.positions),
                     "mismatch_count": 1, "mismatches": [mismatch],
                 }
-                logger.error("Demo position {} is flat but stop cleanup failed: {}",
-                             symbol, type(exc).__name__)
+                logger.error("{} position {} is flat but stop cleanup failed: {}",
+                             _execution_label(execution, state), symbol, type(exc).__name__)
                 return False
 
             verified_closed_at = _verified_fill_timestamp(stop_fill) if stop_fill else None
@@ -1173,7 +1197,10 @@ def _demo_sync_stopped(execution, state, at):
         try:
             cancelled = orphan_cleanup(live)
         except Exception as exc:
-            mismatch = f"orphaned Demo protective stop cleanup: {type(exc).__name__}"
+            mismatch = (
+                f"orphaned {_execution_label(execution, state)} protective stop cleanup: "
+                f"{type(exc).__name__}"
+            )
             state.execution_status = "inconsistent"
             state.inconsistencies = [mismatch]
             state.protective_stop_audit = {
@@ -1181,7 +1208,8 @@ def _demo_sync_stopped(execution, state, at):
                 "position_count": len(state.portfolio.positions),
                 "mismatch_count": 1, "mismatches": [mismatch],
             }
-            logger.error("Demo orphan-stop cleanup failed: {}", type(exc).__name__)
+            logger.error("{} orphan-stop cleanup failed: {}",
+                         _execution_label(execution, state), type(exc).__name__)
             return False
         for row in cancelled:
             state.events.append({"event": "demo_orphan_stop_cancelled", "at": at.isoformat(),
@@ -1207,8 +1235,8 @@ def _demo_sync_stopped(execution, state, at):
                         "execution_source": _execution_source(state),
                     })
                     logger.error(
-                        "Demo protective stop regressed for {}: recorded={} exchange={} algoId={}",
-                        symbol, previous_stop, observed_stop, stop.get("id"),
+                        "{} protective stop regressed for {}: recorded={} exchange={} algoId={}",
+                        _execution_label(execution, state), symbol, previous_stop, observed_stop, stop.get("id"),
                     )
                 meta["stop_regression"] = incident
                 meta["protective_stop"] = float(previous_stop)
@@ -1262,7 +1290,8 @@ def _demo_stop_regression_mismatches(state) -> list[str]:
             continue
         if _stop_is_less_protective(position.side, float(observed), float(recorded)):
             mismatches.append(
-                f"{symbol}: active Demo stop {float(observed)} is less protective than recorded stop {float(recorded)}"
+                f"{symbol}: active {'Lead Portfolio' if state.execution_mode == 'lead_usdm' else 'Demo'} stop "
+                f"{float(observed)} is less protective than recorded stop {float(recorded)}"
             )
     return mismatches
 
@@ -1298,7 +1327,8 @@ def _audit_demo_protective_stops(execution, state, now):
     if mismatches:
         state.execution_status = "inconsistent"
         state.inconsistencies = mismatches
-        logger.error("Demo protective stop audit {}: {}", status, "; ".join(mismatches))
+        logger.error("{} protective stop audit {}: {}",
+                     _execution_label(execution, state), status, "; ".join(mismatches))
         return False
     state.execution_status = "synchronized"
     state.inconsistencies = []
@@ -1328,7 +1358,8 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
     snapshot_fresh = _demo_snapshot_is_fresh(state, now)
     if (not snapshot_fresh or (state.execution_status != "synchronized" and not recent_audit_error)):
         if not _demo_sync_stopped(execution, state, now):
-            logger.error("Demo position monitor paused: exchange state is not synchronized")
+            logger.error("{} position monitor paused: exchange state is not synchronized",
+                         _execution_label(execution, state))
             return True
 
     if state.execution_status != "synchronized":
@@ -1352,7 +1383,8 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
                             decision_at, fee_rate, slip_rate)
             if symbol not in state.portfolio.positions:
                 dirty = True
-                logger.info("Demo max-hold exit {} held_hours={:.3f}", symbol, held_hours)
+                logger.info("{} max-hold exit {} held_hours={:.3f}",
+                            _execution_label(execution, state), symbol, held_hours)
 
     if not state.portfolio.positions:
         return dirty
@@ -1402,12 +1434,13 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
                 "event": "demo_position_quote_status", "at": checked_at.isoformat(),
                 "symbol": symbol, "status": quote_status,
                 "previous_status": previous_status, "quote_age_ms": quote_age_ms,
+                "execution_mode": state.execution_mode,
             })
             if quote_status == "fresh":
-                logger.info("Demo position quote recovered for {}", symbol)
+                logger.info("{} position quote recovered for {}", _execution_label(execution, state), symbol)
             else:
-                logger.warning("Demo position quote unavailable for {} status={}",
-                               symbol, quote_status)
+                logger.warning("{} position quote unavailable for {} status={}",
+                               _execution_label(execution, state), symbol, quote_status)
             dirty = True
         dirty = True  # Persist each valid excursion sample and the latest freshness result.
         if price is None:
@@ -1463,8 +1496,9 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
             _close_position(True, execution, state, symbol, price, reason,
                             checked_at, fee_rate, slip_rate)
             if symbol not in state.portfolio.positions:
-                logger.info("Demo structure invalidation exit {} {} quote={} level={} hard_stop={}",
-                            symbol, position.side.value, price, invalid_price, current_stop)
+                logger.info("{} structure invalidation exit {} {} quote={} level={} hard_stop={}",
+                            _execution_label(execution, state), symbol, position.side.value, price,
+                            invalid_price, current_stop)
             continue
 
         favorable = (best_price - entry) if position.side is Side.LONG else (entry - best_price)
@@ -1515,7 +1549,8 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
                                              stop_price=proposed_stop)
         except Exception as exc:
             _invalidate_demo_stop_audit(state)
-            logger.warning("Demo stop move failed for {}: {}", symbol, type(exc).__name__)
+            logger.warning("{} stop move failed for {}: {}",
+                           _execution_label(execution, state), symbol, type(exc).__name__)
             state.exit_management_by_symbol[symbol] = meta
             continue
 
@@ -1532,8 +1567,8 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
             "algoId": updated.get("id"), "reason": stop_reason,
             "execution_source": _execution_source(state),
         })
-        logger.info("Demo protective stop updated for {}: {} -> {} algoId={}",
-                    symbol, tracked_stop, actual_stop, updated.get("id"))
+        logger.info("{} protective stop updated for {}: {} -> {} algoId={}",
+                    _execution_label(execution, state), symbol, tracked_stop, actual_stop, updated.get("id"))
         _invalidate_demo_stop_audit(state)
         state.exit_management_by_symbol[symbol] = meta
 
@@ -2335,7 +2370,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
 
     if is_demo:
         if not _demo_sync_stopped(execution, state, now):
-            logger.error("Demo positions do not match the local ledger; entries paused")
+            logger.error("{} positions do not match the local ledger; entries paused",
+                         _execution_label(execution, state))
             return
         if _demo_stop_audit_due(state, now):
             _audit_demo_protective_stops(execution, state, now)
@@ -3152,7 +3188,8 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
 def main() -> int:
     sys.excepthook = redacted_excepthook
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--poll", type=int, default=300, help="poll interval in seconds")
+    parser.add_argument("--poll", type=int, default=None,
+                        help="poll interval in seconds (default: 60 for exchange modes, 300 for local paper)")
     parser.add_argument("--max-positions", type=int, default=5)
     parser.add_argument("--equity", type=float, default=10_000.0)
     parser.add_argument("--state", type=Path, default=None)
@@ -3165,7 +3202,7 @@ def main() -> int:
                         help="local paper only: closed-1H entries with live-price stop monitoring")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
     args = parser.parse_args()
-    if args.poll < 1:
+    if args.poll is not None and args.poll < 1:
         parser.error("--poll must be at least one second")
     if args.demo and args.live:
         parser.error("--demo and --live cannot be combined")
@@ -3182,6 +3219,8 @@ def main() -> int:
                                   testnet=(settings.runtime.binance_testnet if args.live else args.demo),
                                   live_flag=args.live,
                                   live_confirmed=live_confirmed)
+    if args.poll is None:
+        args.poll = _default_poll_for_mode(mode.name)
 
     def path(value: Path) -> Path:
         return value if value.is_absolute() else PROJECT_ROOT / value
@@ -3253,8 +3292,9 @@ def main() -> int:
                 state.initial_equity = float(state.exchange_snapshot["equity"])
                 state.cash = state.initial_equity
 
-        candidate_variant = ("ema50_daily_gate_closed_h1_mean_reversion" if args.intrabar_entries
-                             else "ema50_deviation_candidate")
+        candidate_variant = _strategy_variant_for_mode(
+            mode.name, intrabar_entries=args.intrabar_entries,
+        )
         if state.strategy_variant != candidate_variant:
             state.events.append({"event": "strategy_variant_changed",
                                  "at": datetime.now(timezone.utc).isoformat(),
@@ -3311,8 +3351,10 @@ def main() -> int:
                             "event": "demo_position_quote_status", "at": monitor_at.isoformat(),
                             "symbol": symbol, "status": monitor["quote_status"],
                             "previous_status": previous_status,
+                            "execution_mode": state.execution_mode,
                         })
-                logger.exception("Demo position monitor failed: {}", type(exc).__name__)
+                logger.exception("{} position monitor failed: {}",
+                                 _execution_label(execution, state), type(exc).__name__)
                 dirty = True
             if dirty:
                 state.record_equity(datetime.now(timezone.utc))

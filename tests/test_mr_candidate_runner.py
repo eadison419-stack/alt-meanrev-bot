@@ -75,16 +75,40 @@ def test_background_confirmation_cannot_enable_nonlive_mode():
         runner._confirm_live(args, runner.argparse.ArgumentParser())
 
 
-def test_lead_target_margin_tracks_live_equity_and_keeps_paper_target_fixed():
+def test_exchange_target_margin_tracks_current_equity_and_local_paper_stays_fixed():
     settings = load_settings(env_file=None)
     lead = MultiPaperState(initial_equity=1_000, cash=1_000, execution_mode="lead_usdm",
+                           exchange_snapshot={"equity": 1_000})
+    demo = MultiPaperState(initial_equity=1_000, cash=1_000, execution_mode="demo_usdm",
                            exchange_snapshot={"equity": 1_000})
     paper = MultiPaperState(initial_equity=1_000, cash=1_000)
 
     assert runner._target_margin_per_symbol(lead, settings) == pytest.approx(134.2)
     lead.exchange_snapshot["equity"] = 1_250
     assert runner._target_margin_per_symbol(lead, settings) == pytest.approx(167.75)
+    assert runner._target_margin_per_symbol(demo, settings) == pytest.approx(134.2)
+    demo.exchange_snapshot["equity"] = 1_250
+    assert runner._target_margin_per_symbol(demo, settings) == pytest.approx(167.75)
     assert runner._target_margin_per_symbol(paper, settings) == 1_000
+
+
+@pytest.mark.parametrize(("mode", "expected"), [
+    ("demo_usdm", 60), ("lead_usdm", 60), ("local_paper", 300),
+])
+def test_default_poll_matches_execution_mode(mode, expected):
+    assert runner._default_poll_for_mode(mode) == expected
+
+
+@pytest.mark.parametrize("mode", ["demo_usdm", "lead_usdm"])
+def test_exchange_modes_are_labeled_with_the_daily_gate_strategy(mode):
+    assert runner._strategy_variant_for_mode(mode) == "ema50_daily_gate_closed_h1_mean_reversion"
+
+
+def test_local_paper_strategy_variant_tracks_entry_mode():
+    assert runner._strategy_variant_for_mode("local_paper") == "ema50_deviation_candidate"
+    assert runner._strategy_variant_for_mode("local_paper", intrabar_entries=True) == (
+        "ema50_daily_gate_closed_h1_mean_reversion"
+    )
 
 
 def test_lead_candidate_filter_keeps_only_portfolio_whitelisted_usdt_symbols():

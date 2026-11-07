@@ -13,7 +13,8 @@ def test_windows_watchdog_reads_mixed_escaped_and_literal_unicode_as_utf8(tmp_pa
         pytest.skip("Windows PowerShell integration check")
     symbol = "牛来/USDT:USDT"
     state = {
-        "execution_mode": "demo_usdm", "strategy_variant": "ema50_deviation_candidate",
+        "execution_mode": "demo_usdm",
+        "strategy_variant": "ema50_daily_gate_closed_h1_mean_reversion",
         "execution_status": "synchronized", "positions": {symbol: {}},
         "exchange_snapshot": {
             "host": "https://demo-fapi.binance.com",
