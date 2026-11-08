@@ -180,6 +180,8 @@ def parse_live_position(row: dict[str, Any]) -> dict[str, Any] | None:
     return {
         "symbol": row.get("symbol") or row.get("info", {}).get("symbol"), "side": side, "quantity": quantity,
         "entry_price": entry, "unrealized_pnl": unrealized,
+        "mark_price": row.get("markPrice") or row.get("info", {}).get("markPrice"),
+        "liquidation_price": row.get("liquidationPrice") or row.get("info", {}).get("liquidationPrice"),
         "margin_mode": row.get("marginMode") or row.get("info", {}).get("marginType"),
         "leverage": row.get("leverage") or row.get("info", {}).get("leverage"),
         "initial_margin": row.get("initialMargin"), "info": row.get("info", {}),

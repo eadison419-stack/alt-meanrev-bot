@@ -61,6 +61,24 @@ class RiskDecision:
     details: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class EntryExposure:
+    """Fresh marked exposure and remaining loss to verified active stops."""
+
+    long_notional: float
+    short_notional: float
+    stop_risk: float
+
+    def __post_init__(self):
+        if any(not math.isfinite(v) or v < 0 for v in (
+                self.long_notional, self.short_notional, self.stop_risk)):
+            raise ValueError("entry exposure must be finite and non-negative")
+
+    @property
+    def gross_notional(self):
+        return self.long_notional + self.short_notional
+
+
 def _market_risk_multiplier(market_risk_state: str, settings) -> float:
     state = str(market_risk_state or "PAUSE_NEW").upper()
     if state == "NORMAL":
@@ -132,6 +150,10 @@ def calculate_order_quantity(
     gross_notional_cap_pct: float | None = None,
     stop_price: float | None = None,
     target_margin_usdt: float | None = None,
+    target_notional_usdt: float | None = None,
+    exposure: EntryExposure | None = None,
+    side: Side | None = None,
+    portfolio_risk_cap_pct: float | None = None,
 ) -> float:
     """Size to target margin, then cap quantity by stop risk when a stop is supplied."""
     values = (equity, mark_price, step_size, minimum_quantity, size_multiplier)
@@ -146,13 +168,17 @@ def calculate_order_quantity(
         raise ValueError("target margin must be finite and positive")
     target_notional = (Decimal(str(target_margin))
                        * Decimal(str(settings.sizing.leverage)) * Decimal(str(size_multiplier)))
+    if target_notional_usdt is not None:
+        if not math.isfinite(target_notional_usdt) or target_notional_usdt <= 0:
+            raise ValueError("target notional must be finite and positive")
+        target_notional = Decimal(str(target_notional_usdt)) * Decimal(str(size_multiplier))
     cap_pct = settings.sizing.max_gross_notional_pct
     if gross_notional_cap_pct is not None:
         if not math.isfinite(gross_notional_cap_pct) or gross_notional_cap_pct < 0:
             raise ValueError("gross notional cap must be finite and non-negative")
         cap_pct = min(cap_pct, gross_notional_cap_pct)
     gross_cap = Decimal(str(equity)) * Decimal(str(cap_pct))
-    current_gross = Decimal(str(portfolio.gross_notional))
+    current_gross = Decimal(str(exposure.gross_notional if exposure else portfolio.gross_notional))
     remaining_gross = max(Decimal(0), gross_cap - current_gross)
     if stop_price is None and remaining_gross < target_notional:
         return 0.0
@@ -165,6 +191,17 @@ def calculate_order_quantity(
         risk_per_unit = (abs(Decimal(str(mark_price)) - Decimal(str(stop_price)))
                          + (Decimal(str(mark_price)) + Decimal(str(stop_price))) * cost_rate)
         risk_budget = Decimal(str(equity)) * Decimal(str(settings.risk.max_single_trade_risk_pct))
+        if exposure is not None:
+            if side is None or portfolio_risk_cap_pct is None:
+                raise ValueError("marked exposure requires a side and portfolio risk cap")
+            current_directional = (exposure.long_notional if Side(side) is Side.LONG
+                                   else exposure.short_notional)
+            directional_remaining = max(Decimal(0),
+                Decimal(str(equity)) * Decimal(str(settings.sizing.max_directional_notional_pct))
+                * Decimal(str(size_multiplier)) - Decimal(str(current_directional)))
+            raw_quantity = min(raw_quantity, directional_remaining / Decimal(str(mark_price)))
+            risk_budget = min(risk_budget, max(Decimal(0), Decimal(str(equity))
+                * Decimal(str(portfolio_risk_cap_pct)) - Decimal(str(exposure.stop_risk))))
         if risk_per_unit <= 0 or risk_budget <= 0:
             return 0.0
         raw_quantity = min(raw_quantity, risk_budget / risk_per_unit)
@@ -194,6 +231,9 @@ def assess_entry(
     reserved_short_notional: float = 0.0,
     reserved_symbols: int = 0,
     per_symbol_margin_usdt: float | None = None,
+    per_symbol_notional_usdt: float | None = None,
+    exposure: EntryExposure | None = None,
+    portfolio_risk_cap_pct: float | None = None,
 ) -> RiskDecision:
     """Approve or reject an opening intent; all missing risk inputs fail closed."""
     if intent.action is not Action.OPEN:
@@ -274,6 +314,10 @@ def assess_entry(
         return RiskDecision(False, "per_symbol_margin_invalid")
     symbol_cap = (symbol_margin * settings.sizing.leverage
                   * risk_multiplier)
+    if per_symbol_notional_usdt is not None:
+        if not math.isfinite(per_symbol_notional_usdt) or per_symbol_notional_usdt <= 0:
+            return RiskDecision(False, "per_symbol_notional_invalid")
+        symbol_cap = per_symbol_notional_usdt * risk_multiplier
     if intent.notional > symbol_cap:
         return RiskDecision(False, "per_symbol_notional_cap", details={
             "order_notional": intent.notional,
@@ -292,6 +336,14 @@ def assess_entry(
             "max_risk": risk_limit,
             "equity": equity,
         })
+    if exposure is not None:
+        if portfolio_risk_cap_pct is None or not math.isfinite(portfolio_risk_cap_pct) or portfolio_risk_cap_pct <= 0:
+            return RiskDecision(False, "portfolio_stop_risk_cap_invalid")
+        if exposure.stop_risk + estimated_risk > equity * portfolio_risk_cap_pct + 1e-10:
+            return RiskDecision(False, "portfolio_stop_risk_cap", details={
+                "existing_stop_risk": exposure.stop_risk, "new_stop_risk": estimated_risk,
+                "max_risk": equity * portfolio_risk_cap_pct,
+            })
     gross_cap_pct = settings.sizing.max_gross_notional_pct * risk_multiplier
     if gross_notional_cap_pct is not None:
         if not math.isfinite(gross_notional_cap_pct) or gross_notional_cap_pct < 0:
@@ -304,7 +356,8 @@ def assess_entry(
             return RiskDecision(False, "reserved_exposure_invalid")
     gross_cap = equity * gross_cap_pct
     reserved_gross = reserved_long_notional + reserved_short_notional
-    if portfolio.gross_notional + reserved_gross + intent.notional > gross_cap:
+    current_gross = exposure.gross_notional if exposure else portfolio.gross_notional
+    if current_gross + reserved_gross + intent.notional > gross_cap:
         return RiskDecision(False, "market_risk_budget_cap" if gross_cap_pct
                             < settings.sizing.max_gross_notional_pct
                             else "gross_notional_cap")
@@ -312,6 +365,9 @@ def assess_entry(
         position.notional for position in portfolio.positions.values()
         if position.side is intent.side
     )
+    if exposure is not None:
+        current_directional = (exposure.long_notional if intent.side is Side.LONG
+                               else exposure.short_notional)
     reserved_directional = reserved_long_notional if intent.side is Side.LONG else reserved_short_notional
     directional_cap = equity * settings.sizing.max_directional_notional_pct * risk_multiplier
     directional_total = current_directional + reserved_directional + intent.notional

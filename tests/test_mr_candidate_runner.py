@@ -83,9 +83,9 @@ def test_exchange_target_margin_tracks_current_equity_and_local_paper_stays_fixe
                            exchange_snapshot={"equity": 1_000})
     paper = MultiPaperState(initial_equity=1_000, cash=1_000)
 
-    assert runner._target_margin_per_symbol(lead, settings) == pytest.approx(134.2)
+    assert runner._target_margin_per_symbol(lead, settings) is None
     lead.exchange_snapshot["equity"] = 1_250
-    assert runner._target_margin_per_symbol(lead, settings) == pytest.approx(167.75)
+    assert runner._target_margin_per_symbol(lead, settings) is None
     assert runner._target_margin_per_symbol(demo, settings) == pytest.approx(134.2)
     demo.exchange_snapshot["equity"] = 1_250
     assert runner._target_margin_per_symbol(demo, settings) == pytest.approx(167.75)

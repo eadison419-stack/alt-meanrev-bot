@@ -9,6 +9,7 @@ from bot.entry_quality import EntrySignalContext, execution_quote
 from bot.exchange.binance_usdm import FAPI_URLS
 from bot.execution import DemoExecutionService, EntryPreflightRejected
 from bot.live.multi_paper import MultiPaperState
+from bot.portfolio import Position
 from bot.market_risk import MarketRiskAssessment, MarketRiskState
 from bot.regime import Regime
 from bot.risk import OrderIntent, calculate_order_quantity
@@ -85,6 +86,26 @@ def test_fresh_executable_quote_rechecks_size_and_only_observes_atr_caps(monkeyp
     assert audit["adverse_quote_atr"] == pytest.approx(0.2)
     assert all(item["would_block"] for item in audit["atr_threshold_observations"])
     assert audit["observe_only"] is True
+
+
+def test_lead_quote_guard_refreshes_account_and_uses_active_stops(monkeypatch):
+    guard, _, audit, intent, state, settings, clock, client = _guard(monkeypatch)
+    state.execution_mode = "lead_usdm"
+    state.execution_status = "synchronized"
+    state.exchange_snapshot = {"at": NOW.isoformat(), "equity": 1000, "positions": {
+        "OLD": {"side": "long", "quantity": 1, "mark_price": 120}}}
+    state.portfolio.positions["OLD"] = Position("OLD", Side.LONG, 1, 100, 90, NOW, "old", "MID")
+    state.exchange_orders_by_symbol["OLD"] = {"stop": {"id": "s", "amount": 1, "stop_price": 90.2}}
+    state.protective_stop_audit = {"status": "verified", "mismatch_count": 0, "position_count": 1}
+    calls = []
+    monkeypatch.setattr(runner, "_demo_sync_stopped", lambda *args: calls.append("account") or True)
+    monkeypatch.setattr(runner, "_audit_demo_protective_stops", lambda *args: calls.append("stops") or True)
+    refreshed, stop = guard(intent, intent.stop_price)
+    assert calls == ["account", "stops"]
+    assert audit["existing_portfolio_stop_risk"] == pytest.approx(29.9804)
+    assert audit["existing_portfolio_stop_risk"] + audit["new_planned_risk"] <= 40
+    assert refreshed.notional <= 600 and stop == 96.6
+    assert state.portfolio.positions["OLD"].stop_price == 90
 
 
 @pytest.mark.parametrize("age,reason", [(15.001, "entry_quote_stale"), (-0.001, "entry_quote_from_future")])

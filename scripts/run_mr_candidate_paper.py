@@ -67,6 +67,7 @@ from bot.mr_candidate import (MidExitState, staged_profit_lock_stop,
                               structure_invalid_triggered, structure_reentry_confirmed,
                               trailing_stop)
 from bot.portfolio import Position, classify_exit_category
+from bot.lead_risk import lead_entry_exposure, settings_for_execution
 from bot.regime import Regime, classify_regimes
 from bot.risk import (OrderIntent, assess_entry, calculate_adaptive_stop,
                       calculate_order_quantity, funding_rate_rejection_reason)
@@ -256,9 +257,22 @@ def _execution_label(execution, state=None):
 
 
 def _target_margin_per_symbol(state, settings):
-    if state.execution_mode in {"demo_usdm", "lead_usdm"}:
+    if state.execution_mode == "lead_usdm":
+        return None  # Lead quantity is determined by notional and stop risk, before leverage.
+    if state.execution_mode == "demo_usdm":
         return state.current_equity * settings.sizing.live_margin_equity_pct
     return settings.sizing.margin_per_symbol_usdt
+
+
+def _entry_capital_limits(state, settings, side, now):
+    if state.execution_mode != "lead_usdm":
+        return {}, {}
+    exposure = lead_entry_exposure(state, settings, now)
+    notional = state.current_equity * settings.lead_risk.max_symbol_notional_pct
+    common = {"exposure": exposure,
+              "portfolio_risk_cap_pct": settings.lead_risk.max_portfolio_stop_risk_pct}
+    return ({**common, "side": side, "target_notional_usdt": notional},
+            {**common, "per_symbol_notional_usdt": notional})
 
 
 def _default_poll_for_mode(mode_name):
@@ -327,6 +341,8 @@ def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, le
                       if entry_preflight is not None else {})
             if attempt is not None:
                 kwargs.update(client_order_id=client_id, on_submit=on_submit)
+            if state.execution_mode == "lead_usdm" and entry_audit is not None:
+                kwargs["on_safety_plan"] = lambda plan: entry_audit.update(capital_safety=dict(plan))
             result = execution.open(intent, stop_price=stop, **kwargs)
         except EntryPreflightRejected as exc:
             if attempt is not None:
@@ -385,6 +401,9 @@ def _record_demo_open(state, symbol, side, reason, regime_value, result, entry_a
                          "clientOrderId": (fill.get("clientOrderId")
                                            or (entry_audit or {}).get("clientOrderId")),
                          "execution_source": _execution_source(state)})
+    if result.get("capital_safety") is not None:
+        state.events.append({"event": "lead_entry_capital_verified", "symbol": symbol,
+                             "at": opened_at.isoformat(), **result["capital_safety"]})
     if entry_audit is not None:
         _record_entry_execution_fill(state, position, result, entry_audit)
     return position
@@ -468,6 +487,11 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
     def before_submit(intent, planned_stop):
         if _utc_now() > deadline:
             reject("entry_signal_expired")
+        if state.execution_mode == "lead_usdm":
+            if (mr_scan.unresolved_attempts(state)
+                    or not _demo_sync_stopped(execution, state, _utc_now())
+                    or not _audit_demo_protective_stops(execution, state, _utc_now())):
+                reject("lead_account_not_synchronized")
         # Public quote is optional attribution evidence. Fetch Demo last so the
         # executable reference does not wait behind an additional network call.
         audit["public_quote"], public_error = quote(exchange)
@@ -527,33 +551,35 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
             reject("entry_stop_invalid")
         step, minimum = _entry_order_limits(market, price)
         target_margin = _target_margin_per_symbol(state, settings)
+        try:
+            quantity_limits, approval_limits = _entry_capital_limits(state, settings, context.side, checked_at)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            reject("lead_entry_risk_inputs_unavailable")
         qty = calculate_order_quantity(
             state.current_equity, price, state.portfolio, settings,
             step_size=step, minimum_quantity=minimum, size_multiplier=multiplier,
             stop_price=stop, gross_notional_cap_pct=gross_cap,
             target_margin_usdt=target_margin,
+            **quantity_limits,
         )
         if qty <= 0:
             reject("entry_quantity_unavailable")
-        if state.execution_mode == "lead_usdm":
-            available = (state.exchange_snapshot or {}).get("available_usdt")
-            required_margin = (qty * price / settings.sizing.leverage
-                               * (1 + settings.fees.taker_bps / 10_000
-                                  + settings.risk.max_slippage_pct))
-            if (available is None or not math.isfinite(float(available))
-                    or float(available) < required_margin):
-                reject("insufficient_or_unavailable_margin")
         refreshed = replace(intent, price=price, quantity=qty, stop_price=stop)
         approval = assess_entry(
             refreshed, state.portfolio, state.current_equity, funding_rate, checked_at, settings,
             gross_notional_cap_pct=gross_cap, market_risk_state=market_risk.state.value,
             per_symbol_margin_usdt=target_margin,
+            **approval_limits,
         )
         if not approval.allowed:
             reject(approval.reason)
         audit.update({"planned_price": price, "planned_quantity": qty,
                       "planned_stop": stop,
                       "top_quote_covers_quantity": demo_quote["quantity"] >= qty})
+        if quantity_limits:
+            audit.update({"existing_portfolio_stop_risk": quantity_limits["exposure"].stop_risk,
+                          "new_planned_risk": approval.details["estimated_risk"],
+                          "max_portfolio_stop_risk": state.current_equity * settings.lead_risk.max_portfolio_stop_risk_pct})
         _record_preflight_decision(state, audit, None, _utc_now())
         return refreshed, stop
 
@@ -3114,14 +3140,28 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
     minimum_quantity = 0.0
     if is_demo:
         step_size, minimum_quantity = _entry_order_limits(markets.get(symbol) or {}, close)
+    if state.execution_mode == "lead_usdm" and (
+            not _demo_snapshot_is_fresh(state, _utc_now())
+            or set(state.exchange_snapshot.get("positions", {})) != set(state.portfolio.positions)
+            or state.protective_stop_audit.get("status") != "verified"):
+        # A preceding fill invalidates the snapshot/audit; refresh before sizing the next candidate.
+        if (not _demo_sync_stopped(execution, state, _utc_now())
+                or not _audit_demo_protective_stops(execution, state, _utc_now())):
+            return None
     target_margin = _target_margin_per_symbol(state, settings)
+    try:
+        quantity_limits, approval_limits = _entry_capital_limits(state, settings, side, _utc_now())
+    except (KeyError, TypeError, ValueError, OverflowError):
+        state.events.append({"event": "entry_signal_blocked", "symbol": symbol,
+                             "at": _utc_now().isoformat(), "reason": "lead_entry_risk_inputs_unavailable"})
+        return None
     qty = calculate_order_quantity(state.current_equity, close, state.portfolio, settings,
                                    step_size=step_size, minimum_quantity=minimum_quantity,
                                    size_multiplier=market_risk_multiplier,
                                    stop_price=stop,
                                    gross_notional_cap_pct=(settings.sizing.max_gross_notional_pct
                                                            * market_risk_multiplier),
-                                   target_margin_usdt=target_margin)
+                                   target_margin_usdt=target_margin, **quantity_limits)
     if qty <= 0:
         return None
     intent = OrderIntent(symbol, side, Action.OPEN, qty, close, reason, Regime(regime_value),
@@ -3131,7 +3171,7 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
                              gross_notional_cap_pct=(settings.sizing.max_gross_notional_pct
                                                      * market_risk_multiplier),
                              market_risk_state=market_risk_state,
-                             per_symbol_margin_usdt=target_margin)
+                             per_symbol_margin_usdt=target_margin, **approval_limits)
     if not approval.allowed:
         return None
     execution_kwargs = {}
@@ -3382,6 +3422,7 @@ def main() -> int:
                                   testnet=(settings.runtime.binance_testnet if args.live else args.demo),
                                   live_flag=args.live,
                                   live_confirmed=live_confirmed)
+    settings = settings_for_execution(settings, mode.name)
     if args.poll is None:
         args.poll = _default_poll_for_mode(mode.name)
 
@@ -3426,6 +3467,13 @@ def main() -> int:
         if not state_path_existed:
             state.execution_mode = mode.name
         checkpoint = _RunnerCheckpoint(state, state_path)
+        if mode.name == "lead_usdm":
+            state.events.append({"event": "lead_risk_policy_loaded", "at": _utc_now().isoformat(),
+                                 **settings.lead_risk.model_dump(),
+                                 "max_single_trade_risk_pct": settings.risk.max_single_trade_risk_pct,
+                                 "max_gross_notional_pct": settings.sizing.max_gross_notional_pct,
+                                 "max_directional_notional_pct": settings.sizing.max_directional_notional_pct,
+                                 "max_symbols": settings.sizing.max_symbols})
         if is_exchange_execution:
             if mode.name == "lead_usdm":
                 account_exchange = create_lead_usdm(settings.runtime)

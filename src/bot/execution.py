@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 import math
 import time
+from types import SimpleNamespace
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from loguru import logger
 from bot.exchange.binance_usdm import (DEMO_REST_ROOT, LIVE_REST_ROOT, parse_live_position,
                                        verify_demo_urls, verify_live_urls)
 from bot.signals import Action, Side
+from bot.lead_risk import liquidation_is_safe, parse_brackets, select_leverage
 
 
 BOT_ORDER_PREFIX = "mrb"
@@ -143,17 +146,50 @@ class DemoExecutionService:
         return market_step or step, minimum, min_cost
 
     def _prepare_symbol(self, symbol: str) -> None:
+        self._prepare_margin(symbol)
+        leverage = int(self.settings.sizing.leverage)
+        result = self.exchange.set_leverage(leverage, symbol)
+        actual = (result or {}).get("leverage")
+        if actual is not None and int(actual) != leverage:
+            raise RuntimeError("Binance did not confirm the configured leverage")
+
+    def _prepare_margin(self, symbol: str) -> None:
         self._verify_urls()
         try:
             self.exchange.set_margin_mode("isolated", symbol)
         except Exception as exc:
             if "No need to change margin type" not in str(exc) and "already isolated" not in str(exc).lower():
                 raise
-        leverage = int(self.settings.sizing.leverage)
-        result = self.exchange.set_leverage(leverage, symbol)
-        actual = (result or {}).get("leverage")
-        if actual is not None and int(actual) != leverage:
-            raise RuntimeError("Binance did not confirm the configured leverage")
+
+    def _prepare_entry(self, intent):
+        self._prepare_symbol(intent.symbol)
+        return None
+
+    def _finalize_entry(self, intent, preparation):
+        return None
+
+    def _verify_new_position(self, intent, live_position, stop, safety):
+        return None
+
+    def _check_or_exit_new_position(self, intent, stop, safety):
+        try:
+            live = self._position(intent.symbol)
+            self._verify_new_position(intent, live, stop, safety)
+            return live
+        except Exception as safety_error:
+            try:
+                current = self._position(intent.symbol)
+                if current is not None:
+                    if current["side"] != intent.side.value:
+                        raise RuntimeError("new position side changed during safety verification")
+                    self._market_fill(intent.symbol, "sell" if intent.side is Side.LONG else "buy",
+                                      current["quantity"], reduce_only=True)
+                if self._position(intent.symbol) is not None:
+                    raise RuntimeError("new position safety exit is not flat")
+                self.cancel_saved_stop_if_open(intent.symbol, stop)
+            except Exception as close_error:
+                raise RuntimeError("new position safety verification and emergency close failed; reconciliation required") from close_error
+            raise RuntimeError("new position failed liquidation/protection verification and was reduceOnly closed; reconcile fills before further entries") from safety_error
 
     def _market_fill(self, symbol: str, side: str, quantity: float, *, reduce_only: bool,
                      client_order_id: str | None = None) -> dict[str, Any]:
@@ -911,6 +947,14 @@ class DemoExecutionService:
         if average <= 0 or not math.isclose(live["entry_price"], average, rel_tol=1e-7, abs_tol=1e-12):
             return {"status": "entry_price_mismatch"}
         stop = stops[0]
+        saved_stop = {"id": str(stop["algoId"]), "clientOrderId": stop.get("clientAlgoId"),
+                      "stop_price": _number(stop["triggerPrice"]), "amount": filled}
+        safety = (attempt.get("audit") or {}).get("capital_safety")
+        if self.mode == "lead" and safety is not None:
+            # A restart between fill and readback must not bypass the new-entry guard.
+            identity = SimpleNamespace(symbol=symbol, side=Side(attempt["side"]))
+            safety = dict(safety)
+            live = self._check_or_exit_new_position(identity, saved_stop, safety)
         fill = {"id": str(order["orderId"]), "clientOrderId": attempt["clientOrderId"],
                 "filled": filled, "average": average, "trade_data_verified": True}
         if all(row.get("commission") is not None and row.get("commissionAsset") == "USDT"
@@ -921,8 +965,8 @@ class DemoExecutionService:
             fill["closed_at"] = datetime.fromtimestamp(max(times) / 1000, timezone.utc).isoformat()
         return {"status": "protected", "result": {
             "fill": fill, "position": live,
-            "stop": {"id": str(stop["algoId"]), "clientOrderId": stop.get("clientAlgoId"),
-                     "stop_price": _number(stop["triggerPrice"]), "amount": filled},
+            "stop": saved_stop,
+            "capital_safety": safety,
             "order_submitted_at": attempt["submitted_at"],
         }}
 
@@ -930,7 +974,8 @@ class DemoExecutionService:
              before_submit: Callable | None = None,
              submission_deadline: datetime | None = None,
              client_order_id: str | None = None,
-             on_submit: Callable | None = None) -> dict[str, Any]:
+             on_submit: Callable | None = None,
+             on_safety_plan: Callable | None = None) -> dict[str, Any]:
         if intent.action is not Action.OPEN:
             raise ValueError("open executor accepts only OPEN intents")
         if stop_price is None or not math.isfinite(stop_price) or stop_price <= 0:
@@ -941,7 +986,7 @@ class DemoExecutionService:
         self._ensure_one_way()
         if self._position(intent.symbol) is not None:
             raise RuntimeError("exchange position already exists for symbol")
-        self._prepare_symbol(intent.symbol)
+        preparation = self._prepare_entry(intent)
         if before_submit is not None:
             original = (intent.symbol, intent.side, intent.action, intent.source)
             intent, stop_price = before_submit(intent, stop_price)
@@ -965,6 +1010,9 @@ class DemoExecutionService:
             raise validation_error("protective stop must be below planned long entry")
         if intent.side is Side.SHORT and stop_price <= intent.price:
             raise validation_error("protective stop must be above planned short entry")
+        safety = self._finalize_entry(replace(intent, quantity=amount, stop_price=stop_price), preparation)
+        if safety is not None and on_safety_plan is not None:
+            on_safety_plan(safety)
         submitted_at = _utc_now()
         if submission_deadline is not None and submitted_at > submission_deadline:
             raise EntryPreflightRejected("entry_signal_expired")
@@ -1002,7 +1050,11 @@ class DemoExecutionService:
             except Exception as close_error:
                 raise RuntimeError("protective stop placement failed and emergency reduceOnly close failed; account is inconsistent") from close_error
             raise RuntimeError("protective stop placement failed; position was emergency-closed") from stop_error
+        if safety is not None:
+            # Keep the strategy stop active throughout readback and any reduceOnly safety exit.
+            live_position = self._check_or_exit_new_position(intent, stop, safety)
         return {"fill": fill, "position": live_position, "stop": stop,
+                "capital_safety": safety,
                 "order_submitted_at": submitted_at.isoformat(),
                 "host": self.host, "reason": intent.reason, "regime": intent.regime.value}
 
@@ -1208,3 +1260,68 @@ class LeadPortfolioExecutionService(DemoExecutionService):
 
     def __init__(self, exchange, settings):
         super().__init__(exchange, settings, mode="lead", auto_one_way=False)
+
+    def _prepare_entry(self, intent):
+        self._verify_urls()
+        market_id = self.exchange.market(intent.symbol)["id"]
+        try:
+            brackets = parse_brackets(self.exchange.fapiPrivateGetLeverageBracket({
+                "symbol": market_id,
+            }), market_id)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise EntryPreflightRejected("lead_leverage_brackets_invalid") from exc
+        config = self.exchange.fapiPrivateGetSymbolConfig({"symbol": market_id})
+        if (not isinstance(config, list) or len(config) != 1
+                or config[0].get("symbol") != market_id
+                or str(config[0].get("isAutoAddMargin")).lower() not in {"false", "0"}):
+            raise EntryPreflightRejected("lead_auto_add_margin_unverified")
+        self._prepare_margin(intent.symbol)
+        return brackets
+
+    def _finalize_entry(self, intent, preparation):
+        self._verify_urls()
+        balance = self.exchange.fetch_balance()
+        available = (balance.get("info") or {}).get("availableBalance")
+        if available is None:
+            available = (balance.get("USDT") or {}).get("free")
+        try:
+            safety = select_leverage(intent.side, intent.price, intent.quantity, intent.stop_price,
+                                     preparation, self.settings, available)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise EntryPreflightRejected("lead_no_safe_leverage_or_margin") from exc
+        if self._position(intent.symbol) is not None:
+            raise EntryPreflightRejected("lead_position_appeared_before_leverage_change")
+        result = self.exchange.set_leverage(safety["leverage"], intent.symbol)
+        try:
+            actual = float(result["leverage"])
+            limit = float(result["maxNotionalValue"])
+            if (not math.isfinite(actual) or actual != safety["leverage"]
+                    or not math.isfinite(limit) or limit < intent.notional):
+                raise ValueError("unconfirmed leverage/notional limit")
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise EntryPreflightRejected("lead_leverage_confirmation_failed") from exc
+        return safety
+
+    def _verify_new_position(self, intent, live_position, stop, safety):
+        if (live_position is None or live_position["side"] != intent.side.value
+                or live_position.get("margin_mode") != "isolated"
+                or not math.isclose(float(live_position["quantity"]), float(stop["amount"]), rel_tol=1e-8)
+                or not liquidation_is_safe(intent.side, live_position["entry_price"], stop["stop_price"],
+                                           live_position.get("liquidation_price"), self.settings.lead_risk)):
+            raise RuntimeError("new Lead position liquidation buffer is unverified or insufficient")
+        market_id = self.exchange.market(intent.symbol)["id"]
+        config = self.exchange.fapiPrivateGetSymbolConfig({"symbol": market_id})
+        if (not isinstance(config, list) or len(config) != 1
+                or config[0].get("symbol") != market_id
+                or float(config[0].get("leverage", 0)) != safety["leverage"]
+                or str(config[0].get("isAutoAddMargin")).lower() not in {"false", "0"}):
+            raise RuntimeError("new Lead position leverage or auto margin readback failed")
+        position = SimpleNamespace(side=intent.side, quantity=live_position["quantity"])
+        rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+        active = [row for row in rows if str(row.get("algoStatus")).upper() == "NEW"
+                  and str(row.get("orderType")).upper() == "STOP_MARKET"]
+        if (len(active) != 1 or active[0].get("workingType") != "CONTRACT_PRICE"
+                or not self._saved_stop_matches(intent.symbol, position, stop, active[0], position.quantity)):
+            raise RuntimeError("new Lead position protective stop readback failed")
+        safety["actual_liquidation_price"] = float(live_position["liquidation_price"])
+        safety["verified"] = True

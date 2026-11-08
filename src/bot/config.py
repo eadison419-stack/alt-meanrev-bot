@@ -223,6 +223,22 @@ class Risk(Section):
     max_single_trade_risk_pct: Fraction
 
 
+class LeadRisk(Section):
+    min_leverage: Annotated[int, Field(ge=3, le=10)]
+    max_leverage: Annotated[int, Field(ge=3, le=10)]
+    max_symbol_notional_pct: Fraction
+    max_portfolio_stop_risk_pct: Fraction
+    daily_drawdown_halt_pct: Fraction
+    liquidation_stop_distance_multiple: Annotated[float, Field(ge=2, allow_inf_nan=False)]
+    min_stop_liquidation_gap_pct: Annotated[float, Field(ge=0.01, le=1, allow_inf_nan=False)]
+
+    @model_validator(mode="after")
+    def valid_leverage_range(self):
+        if self.min_leverage > self.max_leverage:
+            raise ValueError("Lead minimum leverage cannot exceed maximum leverage")
+        return self
+
+
 class MarketRisk(Section):
     enabled: bool
     symbol: str
@@ -469,6 +485,7 @@ class Settings(Section):
     sizing: Sizing
     pyramiding: Pyramiding
     risk: Risk
+    lead_risk: LeadRisk
     market_risk: MarketRisk
     symbol_regime: SymbolRegime
     mean_reversion_match: MeanReversionMatch

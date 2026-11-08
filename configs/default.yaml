@@ -131,7 +131,7 @@ session:
 sizing:
   leverage: 3
   margin_per_symbol_usdt: 1000
-  live_margin_equity_pct: 0.1342 # Demo and Lead: target margin as a share of current account equity
+  live_margin_equity_pct: 0.1342 # Demo only: target margin as a share of current account equity
   max_symbols: 5
   max_gross_notional_pct: 1.8
   max_directional_notional_pct: 0.9
@@ -146,6 +146,16 @@ risk:
   max_slippage_pct: 0.0015
   funding_abs_block: 0.001
   max_single_trade_risk_pct: 0.02
+
+# Lead new entries only. Stops and signal/exit rules remain shared with Demo.
+lead_risk:
+  min_leverage: 3
+  max_leverage: 10
+  max_symbol_notional_pct: 0.60
+  max_portfolio_stop_risk_pct: 0.04
+  daily_drawdown_halt_pct: 0.10
+  liquidation_stop_distance_multiple: 2.0
+  min_stop_liquidation_gap_pct: 0.01
 
 market_risk:
   enabled: true
