@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 import time
 from typing import Any, Callable
 from uuid import uuid4
 
+from ccxt import OrderNotFound
 from loguru import logger
 
 from bot.exchange.binance_usdm import (DEMO_REST_ROOT, LIVE_REST_ROOT, parse_live_position,
@@ -810,14 +811,68 @@ class DemoExecutionService:
             symbol, str(order_id), stop, expected_quantity,
         )
 
+    def _inspect_missing_entry_attempt(self, attempt: dict[str, Any],
+                                        market_id: str) -> dict[str, Any]:
+        """Confirm absence only while Binance still retains unfilled order history."""
+        def blocked(reason):
+            return {"status": "missing_order_unconfirmed", "reason": reason}
+
+        try:
+            submitted = datetime.fromisoformat(str(attempt["submitted_at"]).replace("Z", "+00:00"))
+            quantity = float(attempt["quantity"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return blocked("invalid_saved_submission")
+        if (submitted.tzinfo is None or not math.isfinite(quantity) or quantity <= 0
+                or attempt.get("side") not in {"long", "short"}
+                or not str(attempt.get("clientOrderId", "")).startswith(f"{BOT_ORDER_PREFIX}_")
+                or attempt.get("status") not in {"submitting", "uncertain"}
+                or attempt.get("result")):
+            return blocked("invalid_saved_submission")
+        now = _utc_now()
+        start = submitted - timedelta(minutes=1)
+        # Allow REST propagation, and stay inside the three-day retention of
+        # canceled/expired orders with no fills. Never infer absence after pruning.
+        if now - submitted < timedelta(minutes=5) or now - start >= timedelta(days=3):
+            return blocked("submission_outside_verifiable_window")
+        symbol = attempt["symbol"]
+        if self._position(symbol) is not None:
+            return blocked("symbol_position_exists")
+        window = {"symbol": market_id, "startTime": int(start.timestamp() * 1000),
+                  "endTime": int(now.timestamp() * 1000), "limit": 1000}
+        queries = (
+            ("order_history", self.exchange.fapiPrivateGetAllOrders, window),
+            ("trade_history", self.exchange.fapiPrivateGetUserTrades, window),
+            ("open_orders", self.exchange.fapiPrivateGetOpenOrders, {"symbol": market_id}),
+            ("open_algo_orders", self.exchange.fapiPrivateGetOpenAlgoOrders, {"symbol": market_id}),
+        )
+        for name, query, params in queries:
+            rows = query(dict(params))
+            if not isinstance(rows, list):
+                return blocked(f"{name}_invalid_response")
+            # Any same-symbol activity is ambiguous, including a filled-then-flat
+            # position or another client order. A full page must never mean empty.
+            if rows:
+                return blocked(f"{name}_present")
+        if self._position(symbol) is not None:
+            return blocked("symbol_position_changed")
+        return {"status": "not_filled", "evidence": {
+            "kind": "missing_order_verified_empty", "clientOrderId": attempt["clientOrderId"],
+            "history_start_at": start.isoformat(), "history_end_at": now.isoformat(),
+            "checked_at": _utc_now().isoformat(), "order_count": 0, "trade_count": 0,
+            "open_order_count": 0, "open_algo_order_count": 0, "flat_position_checks": 2,
+        }}
+
     def inspect_entry_attempt(self, attempt: dict[str, Any]) -> dict[str, Any]:
         """Read-only recovery by the exact saved order identity; never resend."""
         self._verify_urls()
         symbol = attempt["symbol"]
         market_id = self.exchange.market(symbol)["id"]
-        order = self.exchange.fapiPrivateGetOrder({
-            "symbol": market_id, "origClientOrderId": attempt["clientOrderId"],
-        })
+        try:
+            order = self.exchange.fapiPrivateGetOrder({
+                "symbol": market_id, "origClientOrderId": attempt["clientOrderId"],
+            })
+        except OrderNotFound:
+            return self._inspect_missing_entry_attempt(attempt, market_id)
         if (str(order.get("clientOrderId")) != attempt["clientOrderId"]
                 or order.get("symbol") != market_id
                 or str(order.get("side")).upper() != ("BUY" if attempt["side"] == "long" else "SELL")

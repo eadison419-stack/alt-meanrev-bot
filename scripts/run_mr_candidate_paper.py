@@ -2318,8 +2318,12 @@ def _reconcile_pending_entries(execution, state, checkpoint):
                 attempt["status"] = "completed"
         elif status == "not_filled" and symbol not in state.portfolio.positions:
             attempt["status"] = "not_filled"
-        if attempt.get("reconciliation") != {"status": status, "error": report.get("error")}:
-            attempt["reconciliation"] = {"status": status, "error": report.get("error")}
+        reconciliation = {"status": status, "error": report.get("error")}
+        for field in ("reason", "evidence"):
+            if field in report:
+                reconciliation[field] = report[field]
+        if attempt.get("reconciliation") != reconciliation:
+            attempt["reconciliation"] = reconciliation
             state.events.append({"event": "entry_order_reconciliation", "at": _utc_now().isoformat(),
                                  "symbol": symbol, "clientOrderId": attempt["clientOrderId"],
                                  **attempt["reconciliation"]})

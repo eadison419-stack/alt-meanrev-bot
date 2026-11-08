@@ -321,8 +321,10 @@ def test_recovery_preserves_saved_preflight_quality_and_order_identity(recovery_
 
 
 @pytest.mark.parametrize("case,reason", [("flat", "filled_then_flat"), ("no_stop", "protection_unconfirmed"),
-                                         ("not_found", "query_failed")])
-def test_ambiguous_recovery_never_assumes_no_fill_or_resends(recovery_env, case, reason, tmp_path):
+                                         ("not_found", "missing_order_unconfirmed")])
+def test_ambiguous_recovery_never_assumes_no_fill_or_resends(recovery_env, case, reason, tmp_path,
+                                                          monkeypatch):
+    monkeypatch.setattr("bot.execution._utc_now", lambda: NOW)
     state, client, service = recovery_env
     if case in {"flat", "not_found"}:
         client.live = None
@@ -333,6 +335,165 @@ def test_ambiguous_recovery_never_assumes_no_fill_or_resends(recovery_env, case,
     assert not runner._reconcile_pending_entries(service, state, lambda: state.save(tmp_path / "state.json"))
     assert not state.portfolio.positions
     assert mr_scan.unresolved_attempts(state)[0]["reconciliation"]["status"] == reason
+
+
+@pytest.fixture
+def missing_order_env(recovery_env, monkeypatch):
+    state, client, service = recovery_env
+    monkeypatch.setattr("bot.execution._utc_now", lambda: NOW)
+    attempt = state.mr_entry_attempts["mrb_fixed"]
+    attempt["submitted_at"] = (NOW - timedelta(hours=1)).isoformat()
+    client.query_error = ccxt.OrderNotFound('binance {"code":-2013,"msg":"Order does not exist."}')
+    client.live = None
+    client.history_orders = []
+    client.history_trades = []
+    client.open_orders = []
+    client.stops = []
+    client.reads = []
+
+    def position(symbol):
+        client.reads.append(("position", symbol))
+        return client.live
+
+    def query(field, params):
+        client.reads.append((field, params))
+        result = getattr(client, field)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    service._position = position
+    client.fapiPrivateGetAllOrders = lambda params: query("history_orders", params)
+    client.fapiPrivateGetUserTrades = lambda params: query("history_trades", params)
+    client.fapiPrivateGetOpenOrders = lambda params: query("open_orders", params)
+    client.fapiPrivateGetOpenAlgoOrders = lambda params: query("stops", params)
+    client.create_order = lambda *a, **kw: pytest.fail("recovery must never resend an entry")
+    return state, client, service
+
+
+def test_missing_entry_resolves_only_after_complete_empty_history_and_flat_checks(missing_order_env,
+                                                                                tmp_path):
+    state, client, service = missing_order_env
+    path = tmp_path / "recovered.json"
+    assert runner._reconcile_pending_entries(service, state, lambda: state.save(path))
+    restored = MultiPaperState.load(path)
+    attempt = restored.mr_entry_attempts["mrb_fixed"]
+    assert attempt["status"] == "not_filled"
+    assert not mr_scan.unresolved_attempts(restored)
+    assert not restored.portfolio.positions
+    evidence = attempt["reconciliation"]["evidence"]
+    assert evidence["kind"] == "missing_order_verified_empty"
+    assert evidence["clientOrderId"] == "mrb_fixed"
+    assert evidence["flat_position_checks"] == 2
+    assert evidence["order_count"] == evidence["trade_count"] == 0
+    event = next(e for e in restored.events if e.get("event") == "entry_order_reconciliation")
+    assert event["evidence"] == evidence
+    assert not any(e.get("action") == "OPEN" for e in restored.events)
+    assert [name for name, _ in client.reads] == [
+        "position", "history_orders", "history_trades", "open_orders", "stops", "position",
+    ]
+    window = {"symbol": "FIRSTUSDT", "startTime": int((NOW - timedelta(minutes=61)).timestamp()*1000),
+              "endTime": int(NOW.timestamp()*1000), "limit": 1000}
+    assert client.reads[1][1] == client.reads[2][1] == window
+    before = list(client.reads)
+    assert runner._reconcile_pending_entries(service, restored, lambda: restored.save(path))
+    assert client.reads == before  # A terminal attempt is neither retried nor resent.
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("history_orders", [{"clientOrderId": "another-order"}], "order_history_present"),
+    ("history_trades", [{"qty": "1"}], "trade_history_present"),
+    ("open_orders", [{}], "open_orders_present"),
+    ("stops", [{}], "open_algo_orders_present"),
+    ("history_orders", [{}] * 1000, "order_history_present"),
+    ("history_orders", None, "order_history_invalid_response"),
+    ("history_trades", None, "trade_history_invalid_response"),
+    ("open_orders", {}, "open_orders_invalid_response"),
+    ("stops", None, "open_algo_orders_invalid_response"),
+])
+def test_missing_entry_keeps_gate_closed_for_activity_or_incomplete_reads(missing_order_env,
+                                                                          field, value, reason):
+    state, client, service = missing_order_env
+    setattr(client, field, value)
+    assert not runner._reconcile_pending_entries(service, state, None)
+    attempt = mr_scan.unresolved_attempts(state)[0]
+    assert attempt["status"] == "uncertain"
+    assert attempt["reconciliation"]["reason"] == reason
+    assert state.execution_status == "entry_reconciliation_required"
+
+
+@pytest.mark.parametrize("field", ["history_orders", "history_trades", "open_orders", "stops"])
+@pytest.mark.parametrize("error", [ccxt.AuthenticationError, ccxt.RequestTimeout])
+def test_missing_entry_read_failures_never_clear_uncertainty(missing_order_env, field, error):
+    state, client, service = missing_order_env
+    setattr(client, field, error("signature=must-not-be-recorded"))
+    assert not runner._reconcile_pending_entries(service, state, None)
+    attempt = mr_scan.unresolved_attempts(state)[0]
+    assert attempt["reconciliation"] == {"status": "query_failed", "error": error.__name__}
+    assert "must-not-be-recorded" not in str(state.to_dict())
+
+
+@pytest.mark.parametrize("updates", [
+    {"submitted_at": None}, {"submitted_at": "invalid"},
+    {"submitted_at": NOW.replace(tzinfo=None).isoformat()},
+    {"submitted_at": (NOW + timedelta(hours=1)).isoformat()},
+    {"submitted_at": (NOW - timedelta(minutes=5) + timedelta(milliseconds=1)).isoformat()},
+    {"submitted_at": (NOW - timedelta(days=3, minutes=-1)).isoformat()},
+    {"quantity": 0}, {"quantity": float("nan")}, {"side": "unknown"},
+    {"clientOrderId": "foreign"}, {"status": "protected"}, {"result": {"fill": {"id": "12"}}},
+])
+def test_missing_entry_needs_valid_submission_inside_propagation_and_retention_limits(
+        missing_order_env, updates):
+    state, client, service = missing_order_env
+    attempt = state.mr_entry_attempts["mrb_fixed"]
+    attempt.update(updates)
+    if "clientOrderId" in updates:
+        # The fake exact lookup still asserts the original saved identity.
+        def missing(params):
+            raise ccxt.OrderNotFound("missing")
+        client.fapiPrivateGetOrder = missing
+    assert not runner._reconcile_pending_entries(service, state, None)
+    assert mr_scan.unresolved_attempts(state)
+    assert attempt["reconciliation"]["status"] == "missing_order_unconfirmed"
+    assert not client.reads
+
+
+def test_missing_entry_accepts_five_minute_propagation_boundary(missing_order_env):
+    state, client, service = missing_order_env
+    state.mr_entry_attempts["mrb_fixed"]["submitted_at"] = (NOW - timedelta(minutes=5)).isoformat()
+    assert runner._reconcile_pending_entries(service, state, None)
+
+
+@pytest.mark.parametrize("error", [ccxt.AuthenticationError, ccxt.NetworkError])
+def test_failed_exact_lookup_does_not_trigger_absence_recovery(missing_order_env, error):
+    state, client, service = missing_order_env
+    client.query_error = error("private details")
+    assert not runner._reconcile_pending_entries(service, state, None)
+    assert mr_scan.unresolved_attempts(state)[0]["reconciliation"] == {
+        "status": "query_failed", "error": error.__name__,
+    }
+    assert not client.reads
+
+
+def test_empty_exchange_history_does_not_clear_an_existing_local_position(missing_order_env):
+    from bot.portfolio import Position
+
+    state, client, service = missing_order_env
+    state.portfolio.positions[FIRST] = Position(FIRST, Side.LONG, 1, 98, 96, NOW, "test", "MID")
+    assert not runner._reconcile_pending_entries(service, state, None)
+    assert mr_scan.unresolved_attempts(state)
+    assert FIRST in state.portfolio.positions
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_missing_entry_cannot_resolve_a_present_or_new_position(missing_order_env, when):
+    state, client, service = missing_order_env
+    live = {"side": "long", "quantity": 1., "entry_price": 98.}
+    positions = iter([live] if when == "before" else [None, live])
+    service._position = lambda symbol: next(positions)
+    assert not runner._reconcile_pending_entries(service, state, None)
+    assert mr_scan.unresolved_attempts(state)[0]["reconciliation"]["reason"] == (
+        "symbol_position_exists" if when == "before" else "symbol_position_changed")
 
 
 def test_confirmed_zero_fill_rejection_is_terminal(recovery_env, tmp_path):
