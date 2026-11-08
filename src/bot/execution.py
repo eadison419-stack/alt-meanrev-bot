@@ -297,6 +297,100 @@ class DemoExecutionService:
         except Exception:
             return None
 
+    def reconstruct_open_position(self, symbol: str, expected: dict[str, Any], *,
+                                  at: datetime | None = None) -> dict[str, Any]:
+        """Rebuild the current one-way position from bounded, verified USD-M fills."""
+        self._verify_urls()
+        at = at or _utc_now()
+        if at.tzinfo is None:
+            raise ValueError("position reconstruction time must be timezone-aware")
+        market_id = self.exchange.market(symbol)["id"]
+        start_ms = int((at.timestamp() - 90 * 24 * 60 * 60) * 1000)
+        rows = self.exchange.fapiPrivateGetUserTrades({
+            "symbol": market_id, "startTime": start_ms, "limit": 1000,
+        })
+        if not isinstance(rows, list) or len(rows) >= 1000:
+            raise RuntimeError("manual position trade history is incomplete or reached the API limit")
+        trades = []
+        seen_ids = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RuntimeError("manual position trade history contains an invalid row")
+            try:
+                trade_id = int(row["id"])
+                timestamp = int(row["time"])
+                quantity = float(row["qty"])
+                price = float(row["price"])
+                commission = float(row["commission"])
+                side = str(row["side"]).upper()
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("manual position trade history is incomplete") from exc
+            if (trade_id in seen_ids or timestamp < start_ms
+                    or timestamp > int(at.timestamp() * 1000) + 30_000
+                    or (row.get("symbol") is not None
+                        and str(row.get("symbol")).upper() != str(market_id).upper())
+                    or side not in {"BUY", "SELL"}
+                    or str(row.get("positionSide") or "BOTH").upper() != "BOTH"
+                    or not all(math.isfinite(value) for value in (quantity, price, commission))
+                    or quantity <= 0 or price <= 0 or commission < 0
+                    or row.get("commissionAsset") != "USDT"):
+                raise RuntimeError("manual position trade history has unsupported or invalid fields")
+            seen_ids.add(trade_id)
+            trades.append((timestamp, trade_id, side, quantity, price, commission))
+        trades.sort(key=lambda item: (item[0], item[1]))
+        if not trades:
+            raise RuntimeError("manual position trade history is empty")
+
+        signed_quantity = 0.0
+        average_entry = 0.0
+        entry_fee = 0.0
+        opened_at = None
+        for timestamp, _trade_id, side, quantity, price, commission in trades:
+            fill_signed = quantity if side == "BUY" else -quantity
+            if signed_quantity == 0 or signed_quantity * fill_signed > 0:
+                old_quantity = abs(signed_quantity)
+                signed_quantity += fill_signed
+                average_entry = ((average_entry * old_quantity + price * quantity)
+                                 / abs(signed_quantity))
+                entry_fee += commission
+                if opened_at is None:
+                    opened_at = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
+                continue
+
+            old_quantity = abs(signed_quantity)
+            closed_quantity = min(old_quantity, quantity)
+            remaining_old = old_quantity - closed_quantity
+            entry_fee *= remaining_old / old_quantity
+            signed_quantity += fill_signed
+            if remaining_old <= 1e-12:
+                average_entry = 0.0
+                entry_fee = 0.0
+                opened_at = None
+            if quantity > old_quantity:
+                opened_quantity = quantity - old_quantity
+                signed_quantity = math.copysign(opened_quantity, fill_signed)
+                average_entry = price
+                entry_fee = commission * opened_quantity / quantity
+                opened_at = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
+
+        try:
+            expected_side = str(expected["side"]).lower()
+            expected_quantity = float(expected["quantity"])
+            expected_entry = float(expected["entry_price"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("exchange position snapshot is incomplete") from exc
+        step, _, _ = self._market_rules(symbol)
+        if (expected_side not in {"long", "short"} or expected_quantity <= 0
+                or expected_entry <= 0 or not math.isfinite(expected_quantity)
+                or not math.isfinite(expected_entry) or opened_at is None
+                or abs(abs(signed_quantity) - expected_quantity) > max(step, expected_quantity * 1e-8)
+                or ("long" if signed_quantity > 0 else "short") != expected_side
+                or abs(average_entry - expected_entry) > max(expected_entry * 1e-6, 1e-10)):
+            raise RuntimeError("replayed fills do not match the current exchange position")
+        return {"side": expected_side, "quantity": expected_quantity,
+                "entry_price": average_entry, "opened_at": opened_at,
+                "entry_fee": entry_fee}
+
     def _position(self, symbol: str) -> dict[str, Any] | None:
         self._verify_urls()
         rows = self.exchange.fetch_positions([symbol])
@@ -325,7 +419,154 @@ class DemoExecutionService:
         if not stop or not stop.get("id"):
             return
         self._verify_urls()
+        if stop.get("external"):
+            current = self.exchange.fapiPrivateGetAlgoOrder({"algoId": str(stop["id"])}) or {}
+            step, _, _ = self._market_rules(symbol)
+            expected_quantity = _number(stop.get("amount"), float("nan"))
+            expected_price = _number(stop.get("stop_price"), float("nan"))
+            try:
+                expected_price = float(self.exchange.price_to_precision(symbol, expected_price))
+            except (TypeError, ValueError, OverflowError):
+                expected_price = float("nan")
+            if (str(current.get("algoId")) != str(stop["id"])
+                    or str(current.get("symbol") or "").upper()
+                    != str(self.exchange.market(symbol)["id"]).upper()
+                    or str(current.get("clientAlgoId") or "")
+                    != str(stop.get("clientOrderId") or "")
+                    or str(current.get("orderType") or "").upper() != "STOP_MARKET"
+                    or str(current.get("reduceOnly")).strip().lower() not in {"true", "1"}
+                    or (stop.get("order_side") and str(current.get("side") or "").upper()
+                        != str(stop["order_side"]).upper())
+                    or abs(_number(current.get("quantity")) - expected_quantity) > max(step, 1e-10)
+                    or not math.isfinite(expected_price)
+                    or not math.isclose(_number(current.get("triggerPrice")), expected_price,
+                                        rel_tol=1e-9, abs_tol=max(expected_price * 1e-9, 1e-12))):
+                raise RuntimeError("refusing to cancel an unverified adopted protective stop")
         self.exchange.fapiPrivateDeleteAlgoOrder({"algoId": stop["id"]})
+
+    def _saved_stop_matches(self, symbol: str, position, stop: dict[str, Any],
+                            row: dict[str, Any], quantity: float) -> bool:
+        market_id = str(self.exchange.market(symbol)["id"]).upper()
+        expected_side = "SELL" if position.side is Side.LONG else "BUY"
+        step, _, _ = self._market_rules(symbol)
+        client_id = str(row.get("clientAlgoId") or "")
+        is_owned = self._is_bot_reduce_stop(row)
+        is_adopted = bool(stop.get("external")) and client_id == str(stop.get("clientOrderId") or "")
+        try:
+            expected_price = float(self.exchange.price_to_precision(symbol, float(stop["stop_price"])))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        return (
+            str(row.get("algoId")) == str(stop.get("id"))
+            and str(row.get("symbol") or "").upper() == market_id
+            and (is_owned or is_adopted)
+            and str(row.get("orderType") or "").upper() == "STOP_MARKET"
+            and str(row.get("algoStatus") or "").upper() == "NEW"
+            and str(row.get("side") or "").upper() == expected_side
+            and str(row.get("reduceOnly")).strip().lower() in {"true", "1"}
+            and abs(_number(row.get("quantity")) - quantity) <= max(step, 1e-10)
+            and math.isclose(_number(row.get("triggerPrice")), expected_price,
+                             rel_tol=1e-9, abs_tol=max(expected_price * 1e-9, 1e-12))
+        )
+
+    def adopt_manual_position_stop(self, position, *, strategy_stop: float,
+                                   market_price: float) -> dict[str, Any]:
+        """Verify or install one strategy stop before the caller records an adopted position."""
+        symbol = position.symbol
+        self._verify_urls()
+        live = self._position(symbol)
+        step, _, _ = self._market_rules(symbol)
+        if (live is None or live["side"] != position.side.value
+                or abs(float(live["quantity"]) - float(position.quantity)) > max(step, 1e-10)
+                or abs(float(live["entry_price"]) - float(position.entry_price))
+                > max(float(position.entry_price) * 1e-6, 1e-10)):
+            raise RuntimeError("exchange position changed during manual adoption")
+        candidate = float(self.exchange.price_to_precision(symbol, strategy_stop))
+        market_price = float(market_price)
+        if (not math.isfinite(candidate) or candidate <= 0
+                or not math.isfinite(market_price) or market_price <= 0
+                or (position.side is Side.LONG and candidate >= market_price)
+                or (position.side is Side.SHORT and candidate <= market_price)):
+            raise RuntimeError("strategy stop is invalid or already crossed by the market")
+
+        market_id = self.exchange.market(symbol)["id"]
+        rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
+        active_stops = [row for row in rows
+                        if str(row.get("algoStatus") or "").upper() == "NEW"
+                        and str(row.get("orderType") or "").upper() == "STOP_MARKET"]
+        if len(active_stops) > 1:
+            raise RuntimeError("multiple active STOP_MARKET orders make manual adoption ambiguous")
+
+        old_stop = None
+        if active_stops:
+            row = active_stops[0]
+            if (not self._is_bot_reduce_stop(row)
+                    and str(row.get("reduceOnly")).strip().lower() not in {"true", "1"}):
+                raise RuntimeError("existing STOP_MARKET is not a confirmed reduceOnly protective order")
+            client_id = str(row.get("clientAlgoId") or "")
+            stop_price = _number(row.get("triggerPrice"), float("nan"))
+            quantity = _number(row.get("quantity"), float("nan"))
+            expected_side = "SELL" if position.side is Side.LONG else "BUY"
+            step, _, _ = self._market_rules(symbol)
+            valid = (
+                row.get("algoId") is not None
+                and str(row.get("symbol") or "").upper() == str(market_id).upper()
+                and str(row.get("side") or "").upper() == expected_side
+                and math.isfinite(quantity)
+                and abs(quantity - float(position.quantity)) <= max(step, 1e-10)
+                and math.isfinite(stop_price) and stop_price > 0
+                and ((position.side is Side.LONG and stop_price < market_price
+                      and stop_price < position.entry_price)
+                     or (position.side is Side.SHORT and stop_price > market_price
+                         and stop_price > position.entry_price))
+            )
+            if not valid:
+                raise RuntimeError("existing STOP_MARKET does not safely protect the current position")
+            old_stop = {"id": str(row["algoId"]), "clientOrderId": client_id,
+                        "stop_price": stop_price, "amount": quantity,
+                        "external": not self._is_bot_reduce_stop(row),
+                        "order_side": expected_side, "info": row}
+            tighter = (stop_price >= candidate if position.side is Side.LONG
+                       else stop_price <= candidate)
+            if tighter:
+                latest = self._position(symbol)
+                if (latest is None or latest["side"] != position.side.value
+                        or abs(float(latest["quantity"]) - float(position.quantity)) > max(step, 1e-10)
+                        or abs(float(latest["entry_price"]) - float(position.entry_price))
+                        > max(float(position.entry_price) * 1e-6, 1e-10)):
+                    raise RuntimeError("exchange position changed during manual adoption")
+                return old_stop
+
+        new_stop = self._place_stop(symbol, position.side.value, live["quantity"], candidate)
+        refreshed = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
+        verified = next((row for row in refreshed
+                         if str(row.get("algoId")) == str(new_stop["id"])), None)
+        saved = {**new_stop, "external": False,
+                 "order_side": "SELL" if position.side is Side.LONG else "BUY"}
+        if verified is None or not self._saved_stop_matches(
+                symbol, position, saved, verified, float(live["quantity"])):
+            try:
+                self._cancel_stop(symbol, new_stop)
+            finally:
+                raise RuntimeError("new strategy protective stop could not be verified")
+        latest = self._position(symbol)
+        if (latest is None or latest["side"] != position.side.value
+                or abs(float(latest["quantity"]) - float(position.quantity)) > max(step, 1e-10)
+                or abs(float(latest["entry_price"]) - float(position.entry_price))
+                > max(float(position.entry_price) * 1e-6, 1e-10)):
+            raise RuntimeError("exchange position changed during manual adoption")
+        if old_stop:
+            old_row = next((row for row in refreshed
+                            if str(row.get("algoId")) == str(old_stop["id"])), None)
+            if old_row is not None and not self._saved_stop_matches(
+                    symbol, position, old_stop, old_row, float(live["quantity"])):
+                raise RuntimeError("existing protective stop changed during replacement")
+            if old_row is not None:
+                self.exchange.fapiPrivateDeleteAlgoOrder({"algoId": old_stop["id"]})
+                remaining = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
+                if any(str(row.get("algoId")) == str(old_stop["id"]) for row in remaining):
+                    raise RuntimeError("existing protective stop cancellation was not confirmed")
+        return saved
 
     @staticmethod
     def _is_bot_reduce_stop(row: dict[str, Any]) -> bool:
@@ -382,7 +623,7 @@ class DemoExecutionService:
 
     def audit_active_protective_stops(self, positions: dict[str, Any],
                                       tracked_orders: dict[str, dict[str, Any]]) -> list[str]:
-        """Read-only verify each saved Demo position has exactly one matching bot stop."""
+        """Read-only verify each saved exchange position has its tracked protective stop."""
         self._verify_urls()
         mismatches = []
         for symbol, position in positions.items():
@@ -396,17 +637,10 @@ class DemoExecutionService:
                 {"symbol": self.exchange.market(symbol)["id"]}
             ) or []
             active = next((row for row in rows if str(row.get("algoId")) == stop_id), None)
-            expected_side = "SELL" if position.side.value == "long" else "BUY"
-            step, _, _ = self._market_rules(symbol)
-            expected_stop_price = float(self.exchange.price_to_precision(symbol, float(stop["stop_price"])))
             valid = (
                 active is not None
-                and self._is_bot_reduce_stop(active)
-                and str(active.get("algoStatus") or "").upper() == "NEW"
-                and str(active.get("side") or "").upper() == expected_side
-                and abs(_number(active.get("quantity")) - float(position.quantity)) <= max(step, 1e-10)
-                and math.isclose(_number(active.get("triggerPrice")), expected_stop_price,
-                                 rel_tol=1e-9, abs_tol=max(expected_stop_price * 1e-9, 1e-12))
+                and self._saved_stop_matches(symbol, position, stop, active,
+                                             float(position.quantity))
             )
             if not valid:
                 mismatches.append(f"{symbol}: saved protective stop is not active at the saved side/quantity/price")
@@ -414,7 +648,9 @@ class DemoExecutionService:
             extras = [row for row in rows
                       if str(row.get("algoId")) != stop_id
                       and str(row.get("algoStatus") or "").upper() == "NEW"
-                      and self._is_bot_reduce_stop(row)]
+                      and (self._is_bot_reduce_stop(row)
+                           or (stop.get("external")
+                               and str(row.get("orderType") or "").upper() == "STOP_MARKET"))]
             if extras:
                 mismatches.append(f"{symbol}: extra active bot protective stop(s) found")
         return mismatches
@@ -431,7 +667,7 @@ class DemoExecutionService:
                 self.exchange.fapiPrivateDeleteAlgoOrder({"algoId": algo_id})
 
     def cancel_saved_stop_if_open(self, symbol: str, stop: dict[str, Any] | None) -> None:
-        """Cancel and verify one saved bot stop after its exchange position is flat."""
+        """Cancel and verify one tracked protective stop after its position is flat."""
         if not stop or not stop.get("id"):
             return
         self._verify_urls()
@@ -442,8 +678,30 @@ class DemoExecutionService:
         if match is None:
             return
         client_id = str(match.get("clientAlgoId") or "")
-        if not client_id.startswith(f"{BOT_ORDER_PREFIX}_s_") or not match.get("reduceOnly"):
-            raise RuntimeError("saved stop id is not a confirmed bot-owned reduceOnly order")
+        is_bot = self._is_bot_reduce_stop(match)
+        is_adopted = bool(stop.get("external")) and client_id == str(stop.get("clientOrderId") or "")
+        expected_symbol = str(market_id).upper()
+        expected_quantity = _number(stop.get("amount"), float("nan"))
+        step, _, _ = self._market_rules(symbol)
+        expected_price = _number(stop.get("stop_price"), float("nan"))
+        try:
+            expected_price = float(self.exchange.price_to_precision(symbol, expected_price))
+        except (TypeError, ValueError, OverflowError):
+            expected_price = float("nan")
+        if (not (is_bot or is_adopted)
+                or str(match.get("symbol") or "").upper() != expected_symbol
+                or str(match.get("orderType") or "").upper() != "STOP_MARKET"
+                or str(match.get("algoStatus") or "").upper() != "NEW"
+                or str(match.get("reduceOnly")).strip().lower() not in {"true", "1"}
+                or (stop.get("order_side") and str(match.get("side") or "").upper()
+                    != str(stop["order_side"]).upper())
+                or (is_adopted and (
+                    abs(_number(match.get("quantity")) - expected_quantity) > max(step, 1e-10)
+                    or not math.isfinite(expected_price)
+                    or not math.isclose(_number(match.get("triggerPrice")), expected_price,
+                                        rel_tol=1e-9, abs_tol=max(expected_price * 1e-9, 1e-12))
+                ))):
+            raise RuntimeError("saved stop id is not a confirmed tracked reduceOnly order")
         self.exchange.fapiPrivateDeleteAlgoOrder({"algoId": algo_id})
         remaining = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
         if any(str(row.get("algoId")) == algo_id for row in remaining):
@@ -489,15 +747,23 @@ class DemoExecutionService:
     def resolve_protective_stop_fill(self, symbol: str, order_id: str,
                                      stop: dict[str, Any] | None,
                                      expected_quantity: float) -> dict[str, Any] | None:
-        """Return a fully verified fill for this bot's triggered reduceOnly stop."""
+        """Return a fully verified fill for a tracked reduceOnly protective stop."""
         if not stop or not stop.get("id"):
             return None
         self._verify_urls()
         market_id = self.exchange.market(symbol)["id"]
         algo = self.exchange.fapiPrivateGetAlgoOrder({"algoId": str(stop["id"])})
         reduce_only = str(algo.get("reduceOnly")).strip().lower() in {"true", "1"}
+        client_id = str(algo.get("clientAlgoId") or "")
+        tracked_client = (client_id.startswith(f"{BOT_ORDER_PREFIX}_s_")
+                          or (bool(stop.get("external"))
+                              and client_id == str(stop.get("clientOrderId") or "")))
+        algo_symbol = algo.get("symbol")
         if (str(algo.get("actualOrderId") or "") != str(order_id)
-                or not str(algo.get("clientAlgoId") or "").startswith(f"{BOT_ORDER_PREFIX}_s_")
+                or str(algo.get("algoId") or stop["id"]) != str(stop["id"])
+                or (algo_symbol is not None and str(algo_symbol).upper() != str(market_id).upper())
+                or (stop.get("external") and algo_symbol is None)
+                or not tracked_client
                 or not reduce_only
                 or str(algo.get("orderType") or "").upper() != "STOP_MARKET"):
             return None
@@ -532,7 +798,7 @@ class DemoExecutionService:
 
     def resolve_protective_stop_algo_fill(self, symbol: str, stop: dict[str, Any] | None,
                                           expected_quantity: float) -> dict[str, Any] | None:
-        """Resolve the triggered exchange order id for a tracked bot stop, then verify its fills."""
+        """Resolve the triggered exchange order id for a tracked stop, then verify its fills."""
         if not stop or not stop.get("id"):
             return None
         self._verify_urls()
@@ -790,7 +1056,10 @@ class DemoExecutionService:
             valid = (
                 str(current.get("algoId")) == str(stop["id"])
                 and str(current.get("symbol") or "").upper() == self.exchange.market(symbol)["id"].upper()
-                and str(current.get("clientAlgoId") or "").startswith(f"{BOT_ORDER_PREFIX}_s_")
+                and (self._is_bot_reduce_stop(current)
+                     or (bool(stop.get("external")
+                         and str(current.get("clientAlgoId") or "")
+                         == str(stop.get("clientOrderId") or ""))))
                 and str(current.get("orderType") or "").upper() == "STOP_MARKET"
                 and str(current.get("algoStatus") or "").upper() == "NEW"
                 and str(current.get("side") or "").upper() == expected_side
@@ -827,6 +1096,23 @@ class DemoExecutionService:
                 return stop
 
         new_stop = self._place_stop(symbol, position.side.value, live_position["quantity"], candidate)
+        if stop and stop.get("external"):
+            market_id = self.exchange.market(symbol)["id"]
+            rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
+            saved = {**new_stop, "external": False,
+                     "order_side": "SELL" if position.side is Side.LONG else "BUY"}
+            active = next((row for row in rows
+                           if str(row.get("algoId")) == str(new_stop["id"])), None)
+            if active is None or not self._saved_stop_matches(
+                    symbol, position, saved, active, float(live_position["quantity"])):
+                try:
+                    self._cancel_stop(symbol, new_stop)
+                finally:
+                    raise RuntimeError("replacement strategy stop could not be verified")
+            # Keep the verified new protection if the user's old order cannot be
+            # conclusively retired; the caller will pause management for review.
+            self._cancel_stop(symbol, stop)
+            return saved
         try:
             self._cancel_stop(position.symbol, stop)
         except Exception:

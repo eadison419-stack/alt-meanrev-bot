@@ -1180,6 +1180,40 @@ def _demo_sync_stopped(execution, state, at):
             state.events.append(close_event)
     local = set(state.portfolio.positions)
     pending_symbols = {row["symbol"] for row in mr_scan.unresolved_attempts(state)}
+    unknown = (live - local) - pending_symbols
+    if unknown and getattr(execution, "adopt_manual_positions", False):
+        if state.execution_mode != "lead_usdm" or pending_symbols:
+            reason = "manual position adoption requires a synchronized Lead account without pending entries"
+            state.execution_status = "inconsistent"
+            state.inconsistencies = [reason]
+            state.protective_stop_audit = {
+                "at": at.isoformat(), "status": "error",
+                "position_count": len(state.portfolio.positions),
+                "mismatch_count": 1, "mismatches": [reason],
+            }
+            return False
+        for symbol in sorted(unknown):
+            try:
+                _adopt_lead_manual_position(execution, state, symbol,
+                                           snapshot["positions"][symbol], at)
+            except Exception as exc:
+                reason = f"manual position adoption blocked for {symbol}: {type(exc).__name__}"
+                state.execution_status = "inconsistent"
+                state.inconsistencies = [reason]
+                state.protective_stop_audit = {
+                    "at": at.isoformat(), "status": "error",
+                    "position_count": len(state.portfolio.positions),
+                    "mismatch_count": 1, "mismatches": [reason],
+                }
+                state.events.append({
+                    "event": "manual_position_adoption_blocked", "at": at.isoformat(),
+                    "symbol": symbol, "reason": type(exc).__name__,
+                    "execution_source": _execution_source(state),
+                })
+                logger.error("Lead manual position adoption blocked for {}: {}",
+                             symbol, type(exc).__name__)
+                return False
+        local = set(state.portfolio.positions)
     if (live - local) - pending_symbols or local - live:
         state.execution_status = "inconsistent"
         mismatch = "exchange and local position symbols differ"
@@ -1268,6 +1302,124 @@ def _demo_sync_stopped(execution, state, at):
         state.execution_status = "synchronized"
         state.inconsistencies = []
     return True
+
+
+def _adoption_closed_frame(exchange, symbol, opened_at, timeframe, timeframe_ms,
+                           required_bars, history_bars):
+    opened_ms = int(opened_at.timestamp() * 1000)
+    limit = min(1499, max(required_bars, history_bars))
+    since = max(0, opened_ms - (limit + 1) * timeframe_ms)
+    rows = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit + 1)
+    completed = _closed(rows, timeframe_ms, opened_ms)
+    frame = ohlcv_frame(completed)
+    frame = frame.loc[~frame.index.duplicated(keep="last")].sort_index()
+    frame = frame.tail(history_bars)
+    expected_open_ms = (opened_ms // timeframe_ms) * timeframe_ms - timeframe_ms
+    if len(frame) < required_bars or not len(frame):
+        raise RuntimeError(f"insufficient completed {timeframe} history")
+    if int(frame.index[-1].timestamp() * 1000) != expected_open_ms:
+        raise RuntimeError(f"completed {timeframe} history does not reach the entry time")
+    if len(frame) > 1:
+        differences = frame.index.to_series().diff().dropna().dt.total_seconds() * 1000
+        if not (differences == timeframe_ms).all():
+            raise RuntimeError(f"completed {timeframe} history has gaps")
+    validate_ohlcv(frame)
+    return frame
+
+
+def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at):
+    if not getattr(execution, "adopt_manual_positions", False):
+        raise RuntimeError("manual adoption is disabled")
+    if state.execution_mode != "lead_usdm" or symbol in state.portfolio.positions:
+        raise RuntimeError("manual adoption is restricted to untracked Lead positions")
+    settings = execution.settings
+    if not execution.exchange.markets:
+        execution.exchange.load_markets()
+    market_id = str(execution.exchange.market(symbol).get("id") or "").upper()
+    if not market_id or market_id not in getattr(execution, "lead_market_ids", set()):
+        raise RuntimeError("manual position is outside the verified Lead contract whitelist")
+    recovered = execution.reconstruct_open_position(symbol, exchange_position, at=at)
+    side = Side(recovered["side"])
+    opened_at = recovered["opened_at"]
+    atr_required = settings.lookback.atr_len + 1
+    frame1 = _adoption_closed_frame(
+        execution.exchange, symbol, opened_at, "1h", HOUR_MS,
+        max(atr_required, settings.stops.swing_lookback_1h),
+        60,
+    )
+    regime_required = max(
+        settings.lookback.min_regime_bars_4h,
+        settings.regime.atrpct_lookback,
+        settings.lookback.range_bars_4h + 1,
+        settings.lookback.slow_lookback_4h + 1,
+        settings.lookback.adx_len * 3,
+    )
+    frame4 = _adoption_closed_frame(
+        execution.exchange, symbol, opened_at, "4h", FOUR_H_MS, regime_required,
+        max(regime_required, 100),
+    )
+    atr_series = atr(frame1, settings.lookback.atr_len)
+    entry_atr = float(atr_series.iloc[-1])
+    if not math.isfinite(entry_atr) or entry_atr <= 0:
+        raise RuntimeError("entry-time ATR is unavailable")
+    swing = frame1.tail(settings.stops.swing_lookback_1h)
+    swing_low, swing_high = float(swing["low"].min()), float(swing["high"].max())
+    structure_price = swing_low if side is Side.LONG else swing_high
+    strategy_stop, _ = calculate_adaptive_stop(
+        side, float(recovered["entry_price"]), entry_atr, structure_price, settings,
+    )
+    regimes = classify_regimes(frame4, settings)
+    entry_regime = regimes.iloc[-1]["regime"]
+    if entry_regime is None:
+        raise RuntimeError("entry-time 4H regime is unavailable")
+    regime_value = entry_regime.value if isinstance(entry_regime, Regime) else str(entry_regime)
+
+    ticker = execution.exchange.fetch_ticker(symbol)
+    checked_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    market_price = _ticker_price(
+        {symbol: ticker}, symbol, checked_ms, max_age_ms=DEMO_POSITION_QUOTE_MAX_AGE_MS,
+    )
+    if market_price is None:
+        raise RuntimeError("fresh contract price is unavailable")
+    observed_at = _ticker_observed_at({symbol: ticker})
+    if observed_at is None or observed_at > datetime.now(timezone.utc) + timedelta(seconds=30):
+        raise RuntimeError("contract price timestamp is invalid")
+
+    candidate_position = Position(
+        symbol, side, float(recovered["quantity"]), float(recovered["entry_price"]),
+        float(strategy_stop), opened_at, "manual_position_adopted", regime_value, MEAN_REVERSION,
+    )
+    stop = execution.adopt_manual_position_stop(
+        candidate_position, strategy_stop=strategy_stop, market_price=market_price,
+    )
+    position = Position(
+        symbol, side, float(recovered["quantity"]), float(recovered["entry_price"]),
+        float(stop["stop_price"]), opened_at, "manual_position_adopted", regime_value, MEAN_REVERSION,
+    )
+    state.portfolio.positions[symbol] = position
+    state.exchange_orders_by_symbol[symbol] = {"stop": stop}
+    state.entry_costs[symbol] = {"entry_fee": float(recovered["entry_fee"])}
+    state.mark_prices[symbol] = market_price
+    _initialize_entry_metadata(
+        state, symbol, position, True, market_price, float(stop["stop_price"]),
+        entry_atr, swing_low, swing_high, observed_price=market_price,
+        observed_at=observed_at, telemetry_history_complete=False,
+    )
+    _invalidate_demo_stop_audit(state)
+    state.events.append({
+        "event": "manual_position_adopted", "at": at.isoformat(), "symbol": symbol,
+        "side": side.value, "quantity": position.quantity,
+        "entry_price": position.entry_price, "opened_at": opened_at.isoformat(),
+        "reason": position.reason, "regime": position.regime,
+        "fee": float(recovered["entry_fee"]),
+        "stop_price": position.stop_price, "entry_history_complete": True,
+        "excursion_history_complete": False, "execution_source": _execution_source(state),
+        "strategy_sample_eligible": False,
+        "sample_exclusion_reason": "manual_position_adopted",
+    })
+    logger.warning("Lead adopted manual position {} {} quantity={} entry={} stop={}",
+                   symbol, side.value, position.quantity, position.entry_price,
+                   position.stop_price)
 
 
 def _invalidate_demo_stop_audit(state):
@@ -2890,7 +3042,8 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
 
 
 def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
-                               entry_atr, swing_low, swing_high):
+                               entry_atr, swing_low, swing_high, *, observed_price=None,
+                               observed_at=None, telemetry_history_complete=True):
     initial_risk = (abs(opened.entry_price - opened.stop_price)
                     if is_demo else abs(close - stop))
     state.exit_management_by_symbol[symbol] = {
@@ -2900,8 +3053,10 @@ def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
         "structure_low": swing_low,
         "structure_high": swing_high,
         "initial_risk": initial_risk,
-        "best_price": opened.entry_price if is_demo else close,
-        "worst_price": opened.entry_price if is_demo else close,
+        "best_price": (opened.entry_price if is_demo and observed_price is None
+                       else close if observed_price is None else observed_price),
+        "worst_price": (opened.entry_price if is_demo and observed_price is None
+                        else close if observed_price is None else observed_price),
         "last_close": close,
         "no_progress_count": 0,
         "mid_reached": False,
@@ -2912,12 +3067,12 @@ def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
         state.exit_management_by_symbol[symbol].update({
             "telemetry_enabled": True,
             "telemetry_initial_stop_price": float(opened.stop_price),
-            "telemetry_best_price": float(opened.entry_price),
-            "telemetry_worst_price": float(opened.entry_price),
-            "telemetry_history_complete": True,
+            "telemetry_best_price": float(opened.entry_price if observed_price is None else observed_price),
+            "telemetry_worst_price": float(opened.entry_price if observed_price is None else observed_price),
+            "telemetry_history_complete": bool(telemetry_history_complete),
             "telemetry_bar_count": 0,
             "telemetry_sample_count": 0,
-            "telemetry_last_sample_at": opened.opened_at.isoformat(),
+            "telemetry_last_sample_at": (observed_at or opened.opened_at).isoformat(),
         })
 
 
@@ -3197,6 +3352,8 @@ def main() -> int:
                         help="run on Binance USDT-M testnet demo (default: local paper, no key)")
     parser.add_argument("--live", action="store_true",
                         help="run the 8766 strategy on a Binance Lead Portfolio account")
+    parser.add_argument("--adopt-manual-positions", action="store_true",
+                        help="Lead only: reconstruct and manage untracked positions with the existing strategy")
     parser.add_argument("--background-confirmed", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--intrabar-entries", action="store_true",
                         help="local paper only: closed-1H entries with live-price stop monitoring")
@@ -3206,6 +3363,8 @@ def main() -> int:
         parser.error("--poll must be at least one second")
     if args.demo and args.live:
         parser.error("--demo and --live cannot be combined")
+    if args.adopt_manual_positions and not args.live:
+        parser.error("--adopt-manual-positions requires --live")
     if args.intrabar_entries and (args.demo or args.live):
         parser.error("--intrabar-entries is local-paper only")
 
@@ -3267,6 +3426,7 @@ def main() -> int:
             if mode.name == "lead_usdm":
                 account_exchange = create_lead_usdm(settings.runtime)
                 execution = LeadPortfolioExecutionService(account_exchange, settings)
+                execution.adopt_manual_positions = bool(args.adopt_manual_positions)
             else:
                 account_exchange = create_demo_usdm(settings.runtime)
                 execution = DemoExecutionService(account_exchange, settings)
@@ -3303,10 +3463,11 @@ def main() -> int:
             state.strategy_variant = candidate_variant
         checkpoint.try_save()
 
-        logger.info("Starting MR candidate: mode={} strategy={} max_positions={} risk_per_trade_pct={} poll={} intrabar_entries={} runner_build_id={} time_filter_build_id={} state={}",
+        logger.info("Starting MR candidate: mode={} strategy={} max_positions={} risk_per_trade_pct={} poll={} intrabar_entries={} adopt_manual_positions={} runner_build_id={} time_filter_build_id={} state={}",
                     mode.name, candidate_variant, args.max_positions,
                     settings.risk.max_single_trade_risk_pct * 100, args.poll,
-                    args.intrabar_entries, RUNNER_BUILD_ID, TIME_FILTER_BUILD_ID, state_path)
+                    args.intrabar_entries, bool(args.adopt_manual_positions),
+                    RUNNER_BUILD_ID, TIME_FILTER_BUILD_ID, state_path)
         market_cache = IntrabarMarketCache() if args.intrabar_entries else None
         closed_market_cache = ClosedMarketCache() if is_exchange_execution else None
         retry_after = _persisted_market_retry_after(state) if args.intrabar_entries else None

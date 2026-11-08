@@ -1,3 +1,5 @@
+param([switch]$AdoptManualPositions)
+
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
@@ -66,7 +68,8 @@ try {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $stdoutPath = Join-Path $stdoutDirectory "mr_lead_background-$stamp.stdout.log"
     $stderrPath = Join-Path $stdoutDirectory "mr_lead_background-$stamp.stderr.log"
-    $argumentLine = "-u `"$runner`" --live --background-confirmed --poll 60 --state `"$statePath`""
+    $adoptionArgument = if ($AdoptManualPositions) { ' --adopt-manual-positions' } else { '' }
+    $argumentLine = "-u `"$runner`" --live --background-confirmed --poll 60 --state `"$statePath`"$adoptionArgument"
     $backgroundProcess = Start-Process -FilePath $python -ArgumentList $argumentLine `
         -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
@@ -93,6 +96,7 @@ while ([DateTime]::UtcNow -lt $startDeadline) {
                 $candidate.CommandLine.IndexOf($runner, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
                 $candidate.CommandLine.IndexOf($statePath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
                 $candidate.CommandLine -match '(?<!\S)--live(?!\S)' -and
+                (($candidate.CommandLine -match '(?<!\S)--adopt-manual-positions(?!\S)') -eq [bool]$AdoptManualPositions) -and
                 (Test-Path -LiteralPath $statePath -PathType Leaf)) {
                 try {
                     $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json

@@ -80,7 +80,7 @@ Lead 实盘入口运行 `ema50_daily_gate_closed_h1_mean_reversion`：在相同�
 
 1. 在 Binance 的 Futures Copy Trading 中建立 Lead Portfolio，并将资金转入该 Portfolio。Binance 当前说明创建 Lead Portfolio 时投入金额至少为 1,000 USDT；账户余额要求与跟单产品资格以 Binance 页面显示为准（[Lead Portfolio 创建说明](https://www.binance.com/en/support/faq/detail/bbd4c3725f3a474f8976b6ed70ea2c95)）。
 2. 在该 Lead Portfolio 的 API 页面创建专用 Copy Trading API Key，仅开启 Futures 权限并限制可信 IP。不要启用提现权限；该 API Key 仅支持 USDT Futures，且不支持 Multi-Assets Mode（[Lead Trading API Key 说明](https://www.binance.com/en/support/faq/detail/2bec848b904b422197ce121d0925f20b)）。
-3. 确认该 Lead 账户使用单向持仓模式，且账户内没有机器人账本以外的仓位。机器人会在启动时对账；发现持仓不匹配便拒绝继续。该账户应由这一个 Runner 管理。
+3. 确认该 Lead 账户使用单向持仓模式。默认必须没有机器人账本以外的仓位；若要接管手动开仓，须在 Runner 或看护器启动时显式启用 `--adopt-manual-positions` 或 `-AdoptManualPositions`。接管会从最近 90 天、最多 1,000 条成交记录重放当前仓位，并仅用入场时已经收盘的 1H／4H K 线重建策略止损上下文。成交或行情不足、账户快照与重放不符、现有止损无法确认、止损已被穿越时，不会记入接管成功；账户保持不一致并暂停新开仓和仓位管理，需人工核对。同币种在单向持仓中是一个汇总仓位，无法拆分手动和机器人数量。
 4. 用下列命令将 Lead 专用凭据存入当前 Windows 用户的 Credential Manager；Demo Key 与 Lead Key 使用不同目标。
 5. 运行实盘前核对当前账本、Runner 和 API Key。启动时程序会核对 Lead 身份和 Binance 返回的 USDT 合约白名单，并只评估白名单币种（[Binance Copy Trading API](https://developers.binance.com/en/docs/catalog/advanced-trading-copy-trading/api/rest-api/future-copy-trading)）。运行后会管理真实持仓，并可能自动发送市价开平仓及保护止损委托。
 
@@ -88,6 +88,9 @@ Lead 实盘入口运行 `ema50_daily_gate_closed_h1_mean_reversion`：在相同�
 .\scripts\setup_lead_credentials.ps1
 .\run-lead-live.ps1               # 前台持续运行；输入 LEAD；Ctrl+C 停止
 .\run-lead-live-background.ps1   # 输入 LEAD；初始化同步后可关闭 PowerShell
+# 可选：接管当前账本外手动持仓；其他行为仍沿用现有策略
+.\run-lead-live.ps1 --adopt-manual-positions
+.\run-lead-live-background.ps1 -AdoptManualPositions
 ~~~
 
 从前台运行切换到后台前，先在原 PowerShell 窗口按 `Ctrl+C` 并等进程退出，再运行后台脚本。后台脚本检测到已有 Lead 实盘进程时会拒绝重复启动。后台模式不会在 Windows 重启后自动启动，也不负责崩溃重启；需要停止后台实例时，先核对当前运行 PID 与账户状态，再从 Windows 进程管理中结束对应 Runner。
@@ -106,6 +109,7 @@ Lead 实盘状态独立保存在 `data/live/lead_portfolio.json`，日志为 `lo
 
 ~~~powershell
 .\run-lead-watchdog.ps1          # 输入 LEAD；接管已有正确实例或在没有实例时启动实盘 Runner
+.\run-lead-watchdog.ps1 -AdoptManualPositions  # 自动恢复时也保持手动持仓接管模式
 .\run-lead-watchdog.ps1 -Status  # 只读查看看护器、Runner 和本地账户快照健康
 .\run-lead-watchdog.ps1 -Stop    # 仅停止看护器，Runner 保持运行
 ~~~

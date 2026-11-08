@@ -95,10 +95,29 @@ $relative='python.exe .\\scripts\\run_mr_candidate_paper.py --live --state .\\da
  WrongState=(Test-ExpectedLeadRunner ([pscustomobject]@{{CommandLine=$good.Replace('lead_portfolio.json','other.json')}}))
  Demo=(Test-ExpectedLeadRunner ([pscustomobject]@{{CommandLine=($good+' --demo')}}))
  NoLiveFlag=(Test-ExpectedLeadRunner ([pscustomobject]@{{CommandLine=$good.Replace('--live','')}}))
+Adopted=(Test-ExpectedLeadRunner ([pscustomobject]@{{CommandLine=($good+' --adopt-manual-positions')}}) -RequireManualAdoption)
+UnexpectedAdoption=(Test-ExpectedLeadRunner ([pscustomobject]@{{CommandLine=($good+' --adopt-manual-positions')}}))
+MissingAdoption=(Test-ExpectedLeadRunner ([pscustomobject]@{{CommandLine=$good}}) -RequireManualAdoption)
 }}|ConvertTo-Json -Compress
 """)
     assert result == {"Absolute": True, "Relative": True, "WrongState": False,
-                      "Demo": False, "NoLiveFlag": False}
+                      "Demo": False, "NoLiveFlag": False, "Adopted": True,
+                      "UnexpectedAdoption": False, "MissingAdoption": False}
+
+
+def test_lead_entry_scripts_parse_with_manual_adoption_switch():
+    paths = [ROOT / "scripts" / "watch_lead_live.ps1",
+             ROOT / "run-lead-watchdog.ps1",
+             ROOT / "run-lead-live-background.ps1"]
+    quoted = ",".join("'{}'".format(_quote(path)) for path in paths)
+    result = subprocess.run(
+        [SHELL, "-NoProfile", "-Command",
+         f"$errors=@();foreach($path in @({quoted})){{$tokens=$null;$parseErrors=$null;"
+         "[System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$parseErrors)|Out-Null;"
+         "$errors+=@($parseErrors)};if($errors.Count){$errors|Out-String|Write-Error;exit 1}"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_discovery_includes_foreign_live_state_and_process_children(tmp_path):
@@ -128,13 +147,13 @@ $StatePath='{_quote(tmp_path / 'absent.json')}'
 function Get-LeadRunnerProcesses {{ $script:FakeProcesses }}
 function Test-ExpectedLeadRunner {{ param($Process); return $script:Expected }}
 function Get-LeadLedgerHealth {{ $script:Health }}
-function Start-LeadRunner {{ $script:Starts++ ; if($script:FailStart){{throw 'mock start failed'}} }}
+function Start-LeadRunner {{ param([switch]$ManualAdoption);$script:Starts++;$script:StartedAdoption=[bool]$ManualAdoption;if($script:FailStart){{throw 'mock start failed'}} }}
 function Stop-Process {{ throw 'Live process termination must never be called' }}
 function Write-LeadWatchdogLog {{ param($Message);$script:Messages.Add($Message) }}
 function Reset-State {{
  $script:IsArmed=$true;$script:ManagedRunnerPid=0;$script:NextAttemptAt=[DateTime]::MinValue
  $script:RetryDelaySeconds=60;$script:GraceUntil=[DateTime]::MinValue;$script:LastWarning=$null
- $script:LastStartedAt=[DateTimeOffset]::MaxValue;$script:Starts=0;$script:FailStart=$false
+$script:LastStartedAt=[DateTimeOffset]::MaxValue;$script:Starts=0;$script:StartedAdoption=$null;$script:FailStart=$false
  $script:FakeProcesses=@();$script:Expected=$true
  $script:Health=[pscustomobject]@{{Healthy=$true;Reasons=@()}}
  $script:Messages=[Collections.Generic.List[string]]::new()
@@ -150,7 +169,8 @@ Reset-State;$script:FakeProcesses=@($live,[pscustomobject]@{{ProcessId=20;Parent
 Reset-State;$script:FakeProcesses=@($live);$script:Expected=$false;Invoke-LeadWatchdogCheck;$results.ForeignStarts=$script:Starts
 Reset-State;$script:ManagedRunnerPid=10;Invoke-LeadWatchdogCheck
 $results.ExitWaited=($script:Starts -eq 0 -and $script:NextAttemptAt -gt (Get-Date) -and $script:RetryDelaySeconds -eq 120)
-$script:NextAttemptAt=[DateTime]::MinValue;Invoke-LeadWatchdogCheck;$results.RecoveryStarts=$script:Starts
+$script:NextAttemptAt=[DateTime]::MinValue;Invoke-LeadWatchdogCheck;$results.RecoveryStarts=$script:Starts;$results.RecoveryAdoption=$script:StartedAdoption
+Reset-State;$script:NextAttemptAt=[DateTime]::MinValue;Invoke-LeadWatchdogCheck -RequireManualAdoption;$results.OptInRecoveryAdoption=$script:StartedAdoption
 Reset-State;$script:FailStart=$true;Invoke-LeadWatchdogCheck;$results.StartFailureWaited=($script:NextAttemptAt -gt (Get-Date))
 Reset-State;$StatePath='{_quote(auth_failure)}';$script:ManagedRunnerPid=10;$script:LastStartedAt=[DateTimeOffset]::UtcNow.AddMinutes(-1);Invoke-LeadWatchdogCheck
 $results.AuthenticationWaited=($script:RetryDelaySeconds -eq 600 -and $script:NextAttemptAt -gt (Get-Date).AddSeconds(290))
@@ -160,7 +180,8 @@ $results|ConvertTo-Json -Compress
 """)
     assert result == {"MissingStarts": 1, "BackoffStarts": 0, "Adopted": 10, "AdoptionStarts": 0,
                       "StaleStarts": 0, "StaleWarned": True, "DuplicateStarts": 0, "ForeignStarts": 0,
-                      "ExitWaited": True, "RecoveryStarts": 1, "StartFailureWaited": True,
+                      "ExitWaited": True, "RecoveryStarts": 1, "RecoveryAdoption": False,
+                      "OptInRecoveryAdoption": True, "StartFailureWaited": True,
                       "AuthenticationWaited": True, "BackoffCapped": True, "UnarmedBlocked": True}
 
 
@@ -188,13 +209,15 @@ $script:ExistingRunner=$true;Start-LeadRunner
 $result.NoCredentialReadForExistingRunner=([AltMeanrevCredentialStore]::Calls -eq 2)
 $script:IsArmed=$false;try{{Start-LeadRunner}}catch{{}}
 $result.NoCredentialReadWhenUnarmed=([AltMeanrevCredentialStore]::Calls -eq 2)
+$script:IsArmed=$true;$script:ExistingRunner=$false;$script:FailStart=$false;Start-LeadRunner -ManualAdoption
+$result.OptInArguments=($script:Captured.Arguments -match '--adopt-manual-positions')
 $result|ConvertTo-Json -Compress
 """)
     assert result == {"LeadEnvironment": True, "CredentialMatch": True, "Hidden": True,
                       "CorrectTarget": True, "ManagedPid": 123, "LiveArguments": True,
                       "RestoredAfterSuccess": True, "RestoredAfterFailure": True,
                       "NoCredentialReadForExistingRunner": True,
-                      "NoCredentialReadWhenUnarmed": True}
+                      "NoCredentialReadWhenUnarmed": True, "OptInArguments": True}
 
 
 @pytest.mark.parametrize("args", [[], ["-Armed"]])

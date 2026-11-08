@@ -941,6 +941,56 @@ def test_demo_position_sync_uses_tracked_exchange_stop_for_dashboard():
     assert state.exit_management_by_symbol[symbol]["enabled"] is True
 
 
+def test_manual_position_adoption_is_explicit_and_lead_only(monkeypatch):
+    symbol = "KOMA/USDT:USDT"
+    now = datetime(2026, 11, 8, 3, tzinfo=timezone.utc)
+    live_position = {"side": "short", "quantity": 10_000.0, "entry_price": 0.02003}
+    adopted = []
+
+    class Execution:
+        adopt_manual_positions = False
+
+        def sync_snapshot(self):
+            return {"positions": {symbol: live_position}}
+
+    def install(_execution, state, requested_symbol, _exchange_position, at):
+        assert requested_symbol == symbol and at == now
+        position = Position(symbol, Side.SHORT, 10_000.0, 0.02003, 0.021,
+                            now - timedelta(hours=1), "manual_position_adopted", Regime.MID.value)
+        state.portfolio.positions[symbol] = position
+        state.exchange_orders_by_symbol[symbol] = {
+            "stop": {"id": "algo-1", "stop_price": 0.021},
+        }
+        runner._invalidate_demo_stop_audit(state)
+        adopted.append(requested_symbol)
+
+    execution = Execution()
+    state = MultiPaperState(initial_equity=1_000, cash=1_000)
+    state.execution_mode = "lead_usdm"
+    assert not runner._demo_sync_stopped(execution, state, now)
+    assert adopted == []
+    assert state.execution_status == "inconsistent"
+
+    monkeypatch.setattr(runner, "_adopt_lead_manual_position", install)
+    execution.adopt_manual_positions = True
+    assert runner._demo_sync_stopped(execution, state, now)
+    assert adopted == [symbol]
+    assert state.execution_status == "synchronized"
+    assert state.portfolio.positions[symbol].reason == "manual_position_adopted"
+
+    demo = MultiPaperState(initial_equity=1_000, cash=1_000)
+    demo.execution_mode = "demo_usdm"
+    assert not runner._demo_sync_stopped(execution, demo, now)
+    assert adopted == [symbol]
+
+
+def test_adopt_manual_positions_flag_requires_live_mode(monkeypatch):
+    monkeypatch.setattr(runner.sys, "argv", ["run_mr_candidate_paper.py", "--adopt-manual-positions"])
+    with pytest.raises(SystemExit) as error:
+        runner.main()
+    assert error.value.code == 2
+
+
 def test_demo_strategy_close_records_exchange_fill_costs_and_pnl():
     symbol = "APR/USDT:USDT"
     opened_at = datetime(2026, 10, 26, 3, tzinfo=timezone.utc)

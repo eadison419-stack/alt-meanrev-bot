@@ -49,7 +49,8 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
                                                     "external_position_reconciled_flat"}]
     for event in source_events:
         if event.get("event") not in {"paper_fill", "demo_partial_fill_reconciled",
-                                      "external_position_reconciled_flat"}:
+                                      "external_position_reconciled_flat",
+                                      "manual_position_adopted"}:
             continue
         try:
             at = datetime.fromisoformat(event["at"].replace("Z", "+00:00"))
@@ -90,7 +91,8 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
                 candidates.update(symbols_by_client_order_id.get(str(client_order_id), ()))
             if len(candidates) == 1:
                 symbol = next(iter(candidates))
-        if event.get("action") == "OPEN" or event.get("event") == "demo_partial_fill_reconciled":
+        if (event.get("action") == "OPEN"
+                or event.get("event") in {"demo_partial_fill_reconciled", "manual_position_adopted"}):
             active[symbol] = {
                 "symbol": symbol, "side": event.get("side"),
                 "quantity": event.get("filled_quantity", event.get("quantity")),

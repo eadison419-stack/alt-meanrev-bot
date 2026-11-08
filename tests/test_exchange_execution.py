@@ -294,7 +294,8 @@ def test_readonly_active_stop_audit_checks_saved_order_against_actual_position(m
             super().__init__()
             self.open_algo_calls = []
             self.rows = [{
-                "algoId": 123, "clientAlgoId": "mrb_s_test", "orderType": "STOP_MARKET",
+                "algoId": 123, "clientAlgoId": "mrb_s_test", "symbol": "ADAUSDT",
+                "orderType": "STOP_MARKET",
                 "algoStatus": "NEW", "side": "SELL", "quantity": "2.0",
                 "triggerPrice": "95.0", "reduceOnly": True,
             }]
@@ -572,6 +573,179 @@ def test_unverified_or_incomplete_stop_trade_is_not_recorded():
     assert service.resolve_protective_stop_fill(
         "ADA/USDT:USDT", "close-1", {"id": "algo-1"}, 2.0,
     ) is None
+
+
+def test_manual_position_reconstruction_replays_adds_and_partial_closes():
+    from datetime import datetime, timedelta, timezone
+
+    opened = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    rows = [
+        {"id": 1, "symbol": "ADAUSDT", "time": int(opened.timestamp() * 1000),
+         "side": "BUY", "positionSide": "BOTH", "qty": "2", "price": "100",
+         "commission": "0.2", "commissionAsset": "USDT"},
+        {"id": 2, "symbol": "ADAUSDT", "time": int((opened + timedelta(hours=1)).timestamp() * 1000),
+         "side": "BUY", "positionSide": "BOTH", "qty": "1", "price": "110",
+         "commission": "0.11", "commissionAsset": "USDT"},
+        {"id": 3, "symbol": "ADAUSDT", "time": int((opened + timedelta(hours=2)).timestamp() * 1000),
+         "side": "SELL", "positionSide": "BOTH", "qty": "2", "price": "120",
+         "commission": "0.24", "commissionAsset": "USDT"},
+    ]
+
+    class TradeClient(OrderSpy):
+        def market(self, _symbol):
+            return {"id": "ADAUSDT"}
+
+        def fapiPrivateGetUserTrades(self, params):
+            assert params["symbol"] == "ADAUSDT" and params["limit"] == 1000
+            return rows
+
+    service = DemoExecutionService(TradeClient(), SimpleNamespace())
+    service._market_rules = lambda _symbol: (0.01, 0.01, 0.0)
+    current = opened + timedelta(hours=3)
+    result = service.reconstruct_open_position(
+        "ADA/USDT:USDT",
+        {"side": "long", "quantity": 1.0, "entry_price": 310 / 3},
+        at=current,
+    )
+
+    assert result["side"] == "long"
+    assert result["quantity"] == 1.0
+    assert result["entry_price"] == pytest.approx(310 / 3)
+    assert result["entry_fee"] == pytest.approx(0.31 / 3)
+    assert result["opened_at"] == opened
+
+
+def test_manual_position_reconstruction_rejects_unsupported_commission_currency():
+    from datetime import datetime, timezone
+
+    class TradeClient(OrderSpy):
+        def market(self, _symbol):
+            return {"id": "ADAUSDT"}
+
+        def fapiPrivateGetUserTrades(self, _params):
+            return [{"id": 1, "symbol": "ADAUSDT", "time": 1_791_000_000_000,
+                     "side": "BUY", "positionSide": "BOTH", "qty": "1", "price": "100",
+                     "commission": "0.001", "commissionAsset": "BNB"}]
+
+    service = DemoExecutionService(TradeClient(), SimpleNamespace())
+    with pytest.raises(RuntimeError, match="unsupported or invalid"):
+        service.reconstruct_open_position(
+            "ADA/USDT:USDT", {"side": "long", "quantity": 1, "entry_price": 100},
+            at=datetime(2026, 10, 4, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.parametrize(("existing_stop", "strategy_stop", "expected_stop", "external"), [
+    (95.0, 90.0, 95.0, True),
+    (90.0, 95.0, 95.0, False),
+])
+def test_manual_position_adoption_preserves_tighter_stop_or_tightens_it(
+        existing_stop, strategy_stop, expected_stop, external):
+    from datetime import datetime, timezone
+    from bot.portfolio import Position
+
+    class StopClient(OrderSpy):
+        def __init__(self):
+            super().__init__()
+            self.active = [{
+                "algoId": "manual-stop", "clientAlgoId": "manual-client-id",
+                "symbol": "ADAUSDT", "orderType": "STOP_MARKET", "algoStatus": "NEW",
+                "side": "SELL", "quantity": "2", "triggerPrice": str(existing_stop),
+                "reduceOnly": True,
+            }]
+
+        def market(self, _symbol):
+            return {"id": "ADAUSDT"}
+
+        def price_to_precision(self, _symbol, price):
+            return str(round(float(price), 2))
+
+        def fapiPrivateGetOpenAlgoOrders(self, _params):
+            return list(self.active)
+
+        def fapiPrivateDeleteAlgoOrder(self, params):
+            self.active = [row for row in self.active if row["algoId"] != params["algoId"]]
+
+    exchange = StopClient()
+    service = DemoExecutionService(exchange, SimpleNamespace())
+    service._market_rules = lambda _symbol: (0.01, 0.01, 0.0)
+    service._position = lambda _symbol: {"side": "long", "quantity": 2.0, "entry_price": 100.0}
+
+    def place(symbol, side, amount, stop_price):
+        row = {"algoId": "bot-stop", "clientAlgoId": "mrb_s_new", "symbol": "ADAUSDT",
+               "orderType": "STOP_MARKET", "algoStatus": "NEW", "side": "SELL",
+               "quantity": str(amount), "triggerPrice": str(stop_price), "reduceOnly": True}
+        exchange.active.append(row)
+        return {"id": "bot-stop", "clientOrderId": "mrb_s_new", "stop_price": stop_price,
+                "amount": amount, "info": row}
+
+    service._place_stop = place
+    position = Position("ADA/USDT:USDT", Side.LONG, 2.0, 100.0, strategy_stop,
+                        datetime(2026, 10, 1, tzinfo=timezone.utc),
+                        "manual_position_adopted", Regime.LOW.value)
+    saved = service.adopt_manual_position_stop(
+        position, strategy_stop=strategy_stop, market_price=100.0,
+    )
+
+    assert saved["stop_price"] == expected_stop
+    assert saved["external"] is external
+    assert len(exchange.active) == 1
+    assert exchange.active[0]["algoId"] == saved["id"]
+
+
+def test_trailing_stop_replacement_validates_and_retires_adopted_manual_stop():
+    from datetime import datetime, timezone
+    from bot.portfolio import Position
+
+    class StopClient(OrderSpy):
+        def __init__(self):
+            super().__init__()
+            self.active = [{
+                "algoId": "manual-stop", "clientAlgoId": "manual-client-id",
+                "symbol": "ADAUSDT", "orderType": "STOP_MARKET", "algoStatus": "NEW",
+                "side": "SELL", "quantity": "2", "triggerPrice": "95", "reduceOnly": True,
+            }]
+
+        def market(self, _symbol):
+            return {"id": "ADAUSDT"}
+
+        def price_to_precision(self, _symbol, price):
+            return str(round(float(price), 2))
+
+        def fapiPrivateGetAlgoOrder(self, params):
+            return next(row for row in self.active if str(row["algoId"]) == params["algoId"])
+
+        def fapiPrivateGetOpenAlgoOrders(self, _params):
+            return list(self.active)
+
+        def fapiPrivateDeleteAlgoOrder(self, params):
+            self.active = [row for row in self.active if row["algoId"] != params["algoId"]]
+
+    exchange = StopClient()
+    service = DemoExecutionService(exchange, SimpleNamespace())
+    service._market_rules = lambda _symbol: (0.01, 0.01, 0.0)
+    service._position = lambda _symbol: {"side": "long", "quantity": 2.0, "entry_price": 100.0}
+
+    def place(symbol, side, amount, stop_price):
+        row = {"algoId": "bot-stop", "clientAlgoId": "mrb_s_new", "symbol": "ADAUSDT",
+               "orderType": "STOP_MARKET", "algoStatus": "NEW", "side": "SELL",
+               "quantity": str(amount), "triggerPrice": str(stop_price), "reduceOnly": True}
+        exchange.active.append(row)
+        return {"id": "bot-stop", "clientOrderId": "mrb_s_new", "stop_price": stop_price,
+                "amount": amount, "info": row}
+
+    service._place_stop = place
+    position = Position("ADA/USDT:USDT", Side.LONG, 2.0, 100.0, 95.0,
+                        datetime(2026, 10, 1, tzinfo=timezone.utc),
+                        "manual_position_adopted", Regime.LOW.value)
+    saved = {"id": "manual-stop", "clientOrderId": "manual-client-id", "stop_price": 95.0,
+             "amount": 2.0, "external": True, "order_side": "SELL"}
+
+    updated = service.replace_stop(position, stop=saved, stop_price=98.0)
+
+    assert updated["id"] == "bot-stop"
+    assert updated["stop_price"] == 98.0
+    assert [row["algoId"] for row in exchange.active] == ["bot-stop"]
 
 
 def test_failed_demo_entry_never_creates_local_paper_position():

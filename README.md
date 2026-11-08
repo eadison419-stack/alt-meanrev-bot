@@ -50,7 +50,11 @@ USDⓈ-M Demo 需要单独录入 Demo 专用凭据并手动启动，入口为 `.
 
 现行策略已提供独立 Binance Futures Lead Portfolio 实盘入口。该入口必须使用 Lead Portfolio 专用 API Key 和独立账本；手动启动 Runner 或启用看护器时都要在终端输入 `LEAD` 确认。账户连接及只读初始化已核验，真实委托和跟单成交同步尚未验收。前台启动方式会随启动它的 PowerShell 终止；如需关闭 PowerShell 后继续运行，先按 `Ctrl+C` 停止前台实例，再使用 `run-lead-live-background.ps1`。不得使用普通 Futures API Key 或把密钥写入项目文件。
 
+默认情况下，Lead Runner 仍会因账本外仓位而拒绝同步。若要让它接管手动开仓，必须显式添加 `--adopt-manual-positions`（后台脚本与看护器使用同名 `-AdoptManualPositions` 开关）。接管仅回放最近 90 天且不超过 1,000 条的该币成交，并使用入场时已收盘 1H／4H 行情重建 ATR、摆动结构和状态；无法完整重建时保持不一致并暂停开仓／仓位管理。它按现有自适应止损计算，保留更紧且已验证的 `STOP_MARKET reduceOnly` 止损，否则先确认新策略止损有效再替换较宽止损。若止损已被市场穿越、订单不唯一或复核失败，不会自动市价平仓或猜测入场信息。接管后使用已有退出管理；机器人自主入场、止损与退出策略不变。Lead 使用单向持仓，同一币种的手动与机器人成交已合并时按交易所汇总仓位管理，无法拆成两笔独立仓位。该功能尚未在实盘激活或验收。
+
 `run-lead-watchdog.ps1` 可在一次 `LEAD` 确认后隐藏看护实盘 Runner：已有正确实例时直接接管，进程退出后按退避规则恢复。活进程的账户或心跳异常只写本地日志，不强杀。`-Status` 查看进程与账本健康，`-Stop` 只停止看护并保留 Runner；主动停止 Runner 前先停止看护。看护授权仅持续到该看护器退出或 Windows 重启，届时需重新启用。详见 [实盘看护说明](INSTALL_WINDOWS.md#lead-runner-看护器)。
+
+要在 Lead Runner 中接管账本外的手动持仓，可在看护器首次启用时使用 `.\run-lead-watchdog.ps1 -AdoptManualPositions`。看护器会在后续恢复时保持同一开关；已有看护器或 Runner 不会自动切换模式，切换前须按实盘操作流程停止并重新启用。
 
 ## Dashboard 与登录启动
 

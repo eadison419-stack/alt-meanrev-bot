@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$Armed, [switch]$CheckOnce)
+param([switch]$Armed, [switch]$CheckOnce, [switch]$AdoptManualPositions)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -49,9 +49,11 @@ function Get-LeadRunnerRoots {
 }
 
 function Test-ExpectedLeadRunner {
-    param($Process)
+    param($Process, [switch]$RequireManualAdoption)
     if (-not $Process.CommandLine -or $Process.CommandLine -notmatch '(?<!\S)--live(?!\S)' -or
         $Process.CommandLine -match '(?<!\S)--demo(?!\S)') { return $false }
+    $hasAdoption = $Process.CommandLine -match '(?<!\S)--adopt-manual-positions(?!\S)'
+    if ([bool]$hasAdoption -ne [bool]$RequireManualAdoption) { return $false }
     $scriptMatch = [regex]::Match($Process.CommandLine, '(?:"([^"]*run_mr_candidate_paper\.py)"|(\S*run_mr_candidate_paper\.py))')
     $stateMatch = [regex]::Match($Process.CommandLine, '--state(?:=|\s+)(?:"([^"]+)"|(\S+))')
     if (-not $scriptMatch.Success -or -not $stateMatch.Success) { return $false }
@@ -102,6 +104,7 @@ function Set-LeadRetryBackoff {
 }
 
 function Start-LeadRunner {
+    param([switch]$ManualAdoption)
     if (-not $script:IsArmed) { throw 'Lead watchdog has not been armed' }
     if (@(Get-LeadRunnerProcesses).Count -gt 0) {
         Write-LeadWatchdogLog 'A live Runner appeared before recovery; duplicate start deferred'
@@ -126,7 +129,8 @@ function Start-LeadRunner {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
         $stdout = Join-Path $LogDirectory "lead-runner-$stamp.stdout.log"
         $stderr = Join-Path $LogDirectory "lead-runner-$stamp.stderr.log"
-        $arguments = '-u "{0}" --live --background-confirmed --poll 60 --state "{1}"' -f $RunnerScript, $StatePath
+        $adoptionArgument = if ($ManualAdoption) { ' --adopt-manual-positions' } else { '' }
+        $arguments = '-u "{0}" --live --background-confirmed --poll 60 --state "{1}"{2}' -f $RunnerScript, $StatePath, $adoptionArgument
         if (@(Get-LeadRunnerProcesses).Count -gt 0) {
             Write-LeadWatchdogLog 'A live Runner appeared during recovery preparation; duplicate start deferred'
             return
@@ -145,6 +149,7 @@ function Start-LeadRunner {
 }
 
 function Invoke-LeadWatchdogCheck {
+    param([switch]$RequireManualAdoption)
     if (-not $script:IsArmed) { throw 'Lead watchdog has not been armed' }
     $now = Get-Date
     $processes = @(Get-LeadRunnerProcesses)
@@ -165,12 +170,12 @@ function Invoke-LeadWatchdogCheck {
             return
         }
         if ($now -lt $script:NextAttemptAt) { return }
-        try { Start-LeadRunner }
+        try { Start-LeadRunner -ManualAdoption:$RequireManualAdoption }
         catch { Set-LeadRetryBackoff -Reason "Lead start failed: $($_.Exception.GetType().Name)" }
         return
     }
     $roots = @(Get-LeadRunnerRoots $processes)
-    if ($roots.Count -ne 1 -or -not (Test-ExpectedLeadRunner $roots[0])) {
+    if ($roots.Count -ne 1 -or -not (Test-ExpectedLeadRunner $roots[0] -RequireManualAdoption:$RequireManualAdoption)) {
         if ($script:LastWarning -ne 'runner_identity') {
             Write-LeadWatchdogLog "Multiple or incompatible live runner roots=$($roots.Count); no process will be started or stopped"
             $script:LastWarning = 'runner_identity'
@@ -199,7 +204,7 @@ if ($CheckOnce) {
     $processes = @(Get-LeadRunnerProcesses)
     $roots = @(Get-LeadRunnerRoots $processes)
     $health = Get-LeadLedgerHealth
-    $expected = $roots.Count -eq 1 -and (Test-ExpectedLeadRunner $roots[0])
+    $expected = $roots.Count -eq 1 -and (Test-ExpectedLeadRunner $roots[0] -RequireManualAdoption:$AdoptManualPositions)
     [pscustomobject]@{ RunnerRoots = $roots.Count; ExpectedRunner = $expected; LedgerHealthy = $health.Healthy; Reasons = $health.Reasons } | ConvertTo-Json -Compress
     if (-not $expected -or -not $health.Healthy) { exit 1 }
     exit 0
@@ -230,7 +235,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $ProjectRoot 'data\live\lead_watchdog.pid'), [string]$PID)
     Write-LeadWatchdogLog 'Lead watchdog armed for this process lifetime; check=30s; heartbeat=300s; live-process termination disabled'
     while ($true) {
-        try { Invoke-LeadWatchdogCheck }
+        try { Invoke-LeadWatchdogCheck -RequireManualAdoption:$AdoptManualPositions }
         catch { Write-LeadWatchdogLog "Lead watchdog check failed safely: $($_.Exception.GetType().Name)" }
         Start-Sleep -Seconds 30
     }

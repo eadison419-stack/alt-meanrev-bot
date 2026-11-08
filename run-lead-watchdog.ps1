@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$Status, [switch]$Stop)
+param([switch]$Status, [switch]$Stop, [switch]$AdoptManualPositions)
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath($PSScriptRoot)
@@ -7,6 +7,9 @@ $watchdog = Join-Path $projectRoot 'scripts\watch_lead_live.ps1'
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if (-not (Test-Path -LiteralPath $watchdog -PathType Leaf)) { throw "Lead watchdog script not found: $watchdog" }
 if ($Status -and $Stop) { throw 'Use either -Status or -Stop' }
+if ($AdoptManualPositions -and ($Status -or $Stop)) {
+    throw '-AdoptManualPositions applies only when arming the watchdog'
+}
 $active = @(Get-CimInstance Win32_Process | Where-Object {
     $_.Name -match '^(?:powershell|pwsh)\.exe$' -and $_.CommandLine -and
     $_.CommandLine.IndexOf($watchdog, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
@@ -19,16 +22,29 @@ if ($Stop) {
 }
 if ($Status) {
     Write-Output "Lead watchdog processes=$($active.Count)"
-    & $powershell -NoProfile -ExecutionPolicy Bypass -File $watchdog -CheckOnce
+    $statusAdoption = $false
+    if ($active.Count -eq 1) {
+        $statusAdoption = $active[0].CommandLine -match '(?<!\S)-AdoptManualPositions(?!\S)'
+    }
+    $statusArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchdog, '-CheckOnce')
+    if ($statusAdoption) { $statusArguments += '-AdoptManualPositions' }
+    & $powershell @statusArguments
     if ($active.Count -ne 1) { exit 1 }
     exit $LASTEXITCODE
 }
 if ($active.Count -gt 1) { throw 'Multiple Lead watchdog processes are present; inspect them before enabling another' }
 if ($active.Count -gt 0) {
+    $activeAdoption = $active[0].CommandLine -match '(?<!\S)-AdoptManualPositions(?!\S)'
+    if ($activeAdoption -ne [bool]$AdoptManualPositions) {
+        throw 'Lead watchdog is already armed with a different manual-adoption mode; stop it before changing modes.'
+    }
     Write-Output "Lead watchdog is already armed (PID $(($active.ProcessId | Sort-Object) -join ', ')); no duplicate started."
     exit 0
 }
 Write-Host 'This arms automatic recovery of the real Lead Runner until this watchdog stops.'
+if ($AdoptManualPositions) {
+    Write-Host 'This also enables reconstruction and strategy management of untracked Lead positions.'
+}
 Write-Host 'Windows restart ends this authorization. Stop the watchdog before intentionally stopping the Runner.'
 $confirmation = Read-Host 'Type LEAD to arm the live watchdog'
 if ($confirmation -cne 'LEAD') { Write-Output 'Not confirmed; Lead watchdog was not started.'; exit 2 }
@@ -40,6 +56,7 @@ try {
     $logs = Join-Path $projectRoot 'logs'
     New-Item -ItemType Directory -Path $logs -Force | Out-Null
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Armed' -f $watchdog
+    if ($AdoptManualPositions) { $arguments += ' -AdoptManualPositions' }
     $startedAt = [DateTime]::UtcNow
     $process = Start-Process -FilePath $powershell -ArgumentList $arguments `
         -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru `
