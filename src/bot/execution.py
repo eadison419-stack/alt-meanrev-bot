@@ -10,11 +10,12 @@ from types import SimpleNamespace
 from typing import Any, Callable
 from uuid import uuid4
 
-from ccxt import OrderNotFound
+from ccxt import OrderNotFound, RequestTimeout
 from loguru import logger
 
 from bot.exchange.binance_usdm import (DEMO_REST_ROOT, LIVE_REST_ROOT, parse_live_position,
                                        verify_demo_urls, verify_live_urls)
+from bot.exchange.clock import active_clock, ExchangeClockError
 from bot.signals import Action, Side
 from bot.lead_risk import liquidation_is_safe, parse_brackets, select_leverage
 
@@ -27,7 +28,17 @@ class EntryPreflightRejected(RuntimeError):
 
 
 def _utc_now():
+    if active_clock() is not None:
+        return active_clock().now()
     return datetime.now(timezone.utc)
+
+
+def _require_entry_clock():
+    if active_clock() is not None:
+        try:
+            active_clock().require_fresh()
+        except ExchangeClockError as exc:
+            raise EntryPreflightRejected("exchange_clock_stale_or_unavailable") from exc
 
 
 def _number(value, default=0.0) -> float:
@@ -118,7 +129,7 @@ class DemoExecutionService:
         unrealized = sum(item["unrealized_pnl"] for item in positions.values())
         equity = _number(info.get("totalMarginBalance"), total + unrealized)
         return {
-            "at": datetime.now(timezone.utc).isoformat(),
+            "at": _utc_now().isoformat(),
             "host": self.host,
             "usdt_balance": total,
             "available_usdt": free,
@@ -200,14 +211,21 @@ class DemoExecutionService:
         params = {"clientOrderId": client_id, "newOrderRespType": "RESULT"}
         if reduce_only:
             params["reduceOnly"] = True
-        order = self.exchange.create_order(symbol, "market", side, quantity, None, params)
+        try:
+            order = self.exchange.create_order(symbol, "market", side, quantity, None, params)
+        except (OrderNotFound, RequestTimeout):
+            order = self._lookup_submitted_market_order(symbol, side, quantity, reduce_only, client_id)
         order_id = order.get("id") or (order.get("info") or {}).get("orderId")
         if not order_id:
             raise RuntimeError("USDⓈ-M exchange returned no orderId; reconciliation required")
         filled = _number(order.get("filled"), _number((order.get("info") or {}).get("executedQty")))
         average = _number(order.get("average"), _number((order.get("info") or {}).get("avgPrice")))
         if not filled or not average:
-            order = self.exchange.fetch_order(order_id, symbol)
+            try:
+                order = self.exchange.fetch_order(order_id, symbol)
+            except (OrderNotFound, RequestTimeout):
+                order = self._lookup_submitted_market_order(symbol, side, quantity, reduce_only,
+                                                             client_id, expected_order_id=order_id)
             filled = _number(order.get("filled"), _number((order.get("info") or {}).get("executedQty")))
             average = _number(order.get("average"), _number((order.get("info") or {}).get("avgPrice")))
         status = order.get("status")
@@ -241,6 +259,34 @@ class DemoExecutionService:
         return {"id": str(order_id), "clientOrderId": client_id, "filled": filled,
                 "status": status, "average": average, "side": side,
                 **fill_data, "info": order.get("info", {})}
+
+    def _lookup_submitted_market_order(self, symbol, side, quantity, reduce_only, client_id,
+                                       *, expected_order_id=None):
+        """Allow short read propagation after submit; never send the market order again."""
+        market_id = self.exchange.market(symbol)["id"]
+        params = {"symbol": market_id, "origClientOrderId": client_id}
+        for delay in (0, .2, .5, 1):
+            if delay:
+                time.sleep(delay)
+            try:
+                row = self.exchange.fapiPrivateGetOrder(params)
+            except (OrderNotFound, RequestTimeout):
+                continue
+            order_id = str(row.get("orderId") or "")
+            if (not order_id or row.get("symbol") != market_id or row.get("clientOrderId") != client_id
+                    or (expected_order_id is not None and order_id != str(expected_order_id))
+                    or str(row.get("type")).upper() != "MARKET" or row.get("side") != side.upper()
+                    or str(row.get("positionSide")).upper() != "BOTH"
+                    or str(row.get("reduceOnly")).lower() != str(reduce_only).lower()
+                    or not math.isclose(_number(row.get("origQty")), quantity, rel_tol=1e-8, abs_tol=1e-12)):
+                raise RuntimeError("submitted market order identity mismatch; reconciliation required")
+            status = str(row.get("status")).upper()
+            filled, average = _number(row.get("executedQty")), _number(row.get("avgPrice"))
+            if status in {"FILLED", "CANCELED", "EXPIRED"} and 0 < filled <= quantity and average > 0:
+                return {"id": order_id, "filled": filled, "average": average, "status": "closed", "info": row}
+            if status in {"CANCELED", "EXPIRED", "REJECTED"} and filled == 0:
+                break
+        raise OrderNotFound("submitted market fill not confirmed by client order id; reconciliation required")
 
     def funding_fee(self, symbol: str, opened_at: datetime, closed_at: datetime) -> float | None:
         """Return verified USDT funding income for one completed Demo position."""
@@ -976,6 +1022,7 @@ class DemoExecutionService:
              client_order_id: str | None = None,
              on_submit: Callable | None = None,
              on_safety_plan: Callable | None = None) -> dict[str, Any]:
+        _require_entry_clock()
         if intent.action is not Action.OPEN:
             raise ValueError("open executor accepts only OPEN intents")
         if stop_price is None or not math.isfinite(stop_price) or stop_price <= 0:
@@ -1024,8 +1071,14 @@ class DemoExecutionService:
             if submission_deadline is not None and _utc_now() > submission_deadline:
                 raise EntryPreflightRejected("entry_signal_expired")
         fill_kwargs = {"client_order_id": client_order_id} if client_order_id else {}
+        _require_entry_clock()
         fill = self._market_fill(intent.symbol, side, amount, reduce_only=False, **fill_kwargs)
         live_position = self._position(intent.symbol)
+        for delay in (.2, .5):
+            if live_position is not None:
+                break
+            time.sleep(delay)
+            live_position = self._position(intent.symbol)
         if live_position is None or live_position["side"] != intent.side.value:
             raise RuntimeError("market fill did not produce the expected exchange position")
         if step > 0 and abs(live_position["quantity"] - fill["filled"]) > step + 1e-12:

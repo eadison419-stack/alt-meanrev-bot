@@ -114,6 +114,7 @@ def _mock_main(monkeypatch, tmp_path, state):
     monkeypatch.setattr(runner, "DemoExecutionService", lambda *a: client)
     monkeypatch.setattr(runner.MultiPaperState, "load", lambda *a, **kw: state)
     monkeypatch.setattr(runner, "_initialize_demo", lambda *a: {"equity": 5000})
+    monkeypatch.setattr(runner, "_initialize_exchange_clock", lambda *a: None)
     monkeypatch.setattr(runner, "_reconcile_pending_entries", lambda *a: True)
     monkeypatch.setattr(runner, "_demo_sync_stopped", lambda *a: True)
     monkeypatch.setattr(runner, "logger", SimpleNamespace(**{

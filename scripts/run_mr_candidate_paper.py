@@ -52,6 +52,8 @@ from bot.data.klines import (filter_tradable_crypto_universe, hot_activity_metri
 from bot.exchange.binance_usdm import (create_demo_usdm, create_lead_usdm,
                                        resolve_execution_mode)
 from bot.exchange.network import configure_system_proxy
+from bot.exchange.clock import ExchangeClock, ExchangeClockError, active_clock, activate_clock
+from bot.exchange.public_candles import CandleBatchReader, prefetched_read
 from bot.entry_quality import EntrySignalContext, execution_quote
 from bot.execution import (DemoExecutionService, EntryPreflightRejected,
                            LeadPortfolioExecutionService)
@@ -118,7 +120,57 @@ class ClosedMarketCache:
 
 
 def _utc_now():
+    if active_clock() is not None:
+        return active_clock().now()
     return datetime.now(timezone.utc)
+
+
+def _require_entry_clock():
+    if active_clock() is not None:
+        active_clock().require_fresh()
+
+
+def _refresh_exchange_clock(clock, exchange, state):
+    if clock.age() < clock.REFRESH_SECONDS:
+        return
+    try:
+        status = clock.synchronize(exchange)
+    except Exception as exc:
+        state.events.append({"event": "exchange_clock_sync_failed", "at": _utc_now().isoformat(),
+                             "error": type(exc).__name__, "new_entries_paused": clock.age() > clock.MAX_AGE_SECONDS})
+        logger.warning("Exchange clock refresh failed: {}", type(exc).__name__)
+    else:
+        state.events.append({"event": "exchange_clock_calibrated", "at": _utc_now().isoformat(), **status})
+
+
+def _initialize_exchange_clock(exchange, state):
+    clock = ExchangeClock()
+    status = clock.synchronize(exchange)
+    activate_clock(clock)
+    state.events.append({"event": "exchange_clock_calibrated", "at": _utc_now().isoformat(), **status})
+    return clock
+
+
+def _background_reads_allowed(now):
+    boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return (boundary - now).total_seconds() > 60
+
+
+def _wait_for_closed_hour():
+    clock = active_clock()
+    if clock is None:
+        return
+    boundary = _utc_now().replace(minute=0, second=0, microsecond=0)
+    # At a UTC boundary the data cutoff must also confirm that hour has closed.
+    delay = (boundary - clock.lower_now()).total_seconds()
+    if delay > 0:
+        time.sleep(delay + .001)
+
+
+def _public_read_deadline(now, settings):
+    hour = now.replace(minute=0, second=0, microsecond=0)
+    entry_deadline = hour + timedelta(seconds=settings.execution.confirm_delay_sec_max)
+    return entry_deadline if now <= entry_deadline else hour + timedelta(hours=1, seconds=-5)
 
 
 def _next_poll_delay(now, poll, *, align_hourly=False, cycle_started_at=None):
@@ -198,6 +250,8 @@ def _wait_with_monitor(seconds, monitor=None):
         if remaining <= 0:
             return
         time.sleep(min(DEMO_POSITION_MONITOR_POLL_SECONDS, remaining) if monitor else remaining)
+        if time.monotonic() >= deadline:
+            return  # Start the next cycle before another potentially slow monitor read.
         if monitor is not None:
             monitor()
 
@@ -485,6 +539,10 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
                                max_age_sec=settings.execution.entry_quote_max_age_sec)
 
     def before_submit(intent, planned_stop):
+        try:
+            _require_entry_clock()
+        except ExchangeClockError:
+            reject("exchange_clock_stale_or_unavailable")
         if _utc_now() > deadline:
             reject("entry_signal_expired")
         if state.execution_mode == "lead_usdm":
@@ -788,7 +846,7 @@ def _reconcile_structure_invalidation_cooldowns(state):
         state.portfolio.last_exit_category[symbol] = "stop_loss"
         state.events.append({
             "event": "entry_cooldown_policy_updated",
-            "at": datetime.now(timezone.utc).isoformat(),
+            "at": _utc_now().isoformat(),
             "source": MEAN_REVERSION,
             "symbol": symbol,
             "reason": event.get("reason"),
@@ -1401,14 +1459,14 @@ def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at)
     regime_value = entry_regime.value if isinstance(entry_regime, Regime) else str(entry_regime)
 
     ticker = execution.exchange.fetch_ticker(symbol)
-    checked_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    checked_ms = int(_utc_now().timestamp() * 1000)
     market_price = _ticker_price(
         {symbol: ticker}, symbol, checked_ms, max_age_ms=DEMO_POSITION_QUOTE_MAX_AGE_MS,
     )
     if market_price is None:
         raise RuntimeError("fresh contract price is unavailable")
     observed_at = _ticker_observed_at({symbol: ticker})
-    if observed_at is None or observed_at > datetime.now(timezone.utc) + timedelta(seconds=30):
+    if observed_at is None or observed_at > _utc_now() + timedelta(seconds=30):
         raise RuntimeError("contract price timestamp is invalid")
 
     candidate_position = Position(
@@ -1549,7 +1607,7 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
         return True
 
     dirty = False
-    decision_at = datetime.now(timezone.utc)
+    decision_at = _utc_now()
     max_hold_hours = float(settings.exits.max_hold_bars)
     for symbol, position in list(state.portfolio.positions.items()):
         opened_at = _aware_datetime(position.opened_at)
@@ -1578,7 +1636,7 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
             ticker = {}
             quote_error = type(exc).__name__
 
-        checked_at = datetime.now(timezone.utc)
+        checked_at = _utc_now()
         checked_ms = int(checked_at.timestamp() * 1000)
         quote_timestamp = (ticker or {}).get("timestamp")
         try:
@@ -1756,16 +1814,21 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
 # --- universe + bars ------------------------------------------------------------------
 
 def _closed(frame_rows, timeframe_ms, now_ms):
+    if active_clock() is not None:
+        now_ms = min(now_ms, int(active_clock().lower_now().timestamp() * 1000))
     return [r for r in frame_rows if len(r) >= 6 and int(r[0]) + timeframe_ms <= now_ms]
 
 
-def _daily_direction_gate(exchange, symbol, signal_at, span, *, fail_on_market_error=False):
+def _daily_direction_gate(exchange, symbol, signal_at, span, *, fail_on_market_error=False,
+                          prefetched=None):
     """Return a fail-closed direction from completed UTC daily candles only."""
     signal_at = signal_at.replace(tzinfo=timezone.utc) if signal_at.tzinfo is None else signal_at
     signal_at = signal_at.astimezone(timezone.utc)
     signal_ms = int(signal_at.timestamp() * 1000)
     try:
-        rows = exchange.fetch_ohlcv(symbol, "1d", limit=max(span + 1, 100))
+        request = (symbol, "1d", max(span + 1, 100))
+        rows = prefetched_read(prefetched if prefetched is not None else {}, request,
+            lambda: exchange.fetch_ohlcv(symbol, "1d", limit=request[2]))
     except ccxt.BaseError as exc:
         _raise_market_error_if_needed(exc, fail_on_market_error)
         return {
@@ -1843,12 +1906,13 @@ def _cached_daily_direction_gate(exchange, symbol, signal_at, span, cache, **kwa
     return result
 
 
-def _cached_four_hour(exchange, symbol, now_ms, cache):
+def _cached_four_hour(exchange, symbol, now_ms, cache, *, prefetched=None):
     key = now_ms // FOUR_H_MS
     saved = cache.four_hour.get(symbol) if cache is not None else None
     if saved is not None and saved[0] == key:
         return saved[1]
-    rows = _closed(exchange.fetch_ohlcv(symbol, "4h", limit=100), FOUR_H_MS, now_ms)
+    rows = _closed(prefetched_read(prefetched if prefetched is not None else {}, (symbol, "4h", 100),
+        lambda: exchange.fetch_ohlcv(symbol, "4h", limit=100)), FOUR_H_MS, now_ms)
     if not rows or int(rows[-1][0]) + FOUR_H_MS != key * FOUR_H_MS:
         return None
     try:
@@ -1905,7 +1969,7 @@ def _raise_market_error_if_needed(exc, enabled):
 
 def _market_retry_delay_seconds(exc, *, poll, attempt, now=None):
     """Honor Binance's explicit ban expiry; otherwise use bounded backoff."""
-    now = now or datetime.now(timezone.utc)
+    now = now or _utc_now()
     match = BAN_UNTIL_RE.search(str(exc))
     if match:
         retry_at = int(match.group(1)) / 1000
@@ -2030,13 +2094,16 @@ def _ticker_observed_at(tickers, symbol):
 
 
 def _build_universe(exchange, settings, now, now_ms, *, fail_on_market_error=False,
-                    on_progress=None, retry_reads=False):
+                    on_progress=None, retry_reads=False, candle_reader=None):
     deadline = now.replace(minute=0, second=0, microsecond=0) + timedelta(
         seconds=settings.execution.confirm_delay_sec_max)
     read_kwargs = {"retry": retry_reads, "deadline": deadline, "monitor": on_progress}
     markets = _read_entry_data(exchange.load_markets, phase="universe_markets", **read_kwargs)
     tickers = _read_entry_data(exchange.fetch_tickers, phase="universe_tickers", **read_kwargs)
     candidates = filter_tradable_crypto_universe(markets, tickers, settings, now=now)
+    prefetched = (candle_reader.read_many([(symbol, "1h", 60) for symbol, _ in candidates],
+                  _public_read_deadline(now, settings), monitor=on_progress)
+                  if candle_reader is not None else {})
     one_hour: dict[str, pd.DataFrame] = {}
     current_hour: dict[str, dict] = {}
     activity: dict[str, dict] = {}
@@ -2045,7 +2112,8 @@ def _build_universe(exchange, settings, now, now_ms, *, fail_on_market_error=Fal
             on_progress()
         try:
             rows = _read_entry_data(
-                lambda: exchange.fetch_ohlcv(symbol, "1h", limit=60),
+                lambda: prefetched_read(prefetched, (symbol, "1h", 60),
+                    lambda: exchange.fetch_ohlcv(symbol, "1h", limit=60)),
                 phase="universe_hourly", symbol=symbol, **read_kwargs,
             )
         except ccxt.BaseError as exc:
@@ -2372,7 +2440,7 @@ def _reconcile_pending_entries(execution, state, checkpoint):
 def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
            intrabar_entries=False, market_cache: IntrabarMarketCache | None = None,
            position_monitor=None, closed_market_cache: ClosedMarketCache | None = None,
-           checkpoint=None):
+           checkpoint=None, candle_reader=None):
     now_ms = int(now.timestamp() * 1000)
     fee_rate = settings.fees.taker_bps / 10_000
     slip_rate = settings.fees.slippage_bps / 10_000
@@ -2454,14 +2522,23 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             exchange, track, settings, now_ms, fail_on_market_error=True,
         )
     else:
+        batch_kwargs = {"candle_reader": candle_reader} if candle_reader is not None else {}
         markets, hotlist, one_hour, current_hour, tickers = _build_universe(
             exchange, settings, now, now_ms, fail_on_market_error=intrabar_entries,
             on_progress=position_monitor, retry_reads=is_demo,
+            **batch_kwargs,
         )
         top_symbols = [row["symbol"] for row in hotlist]
         track = sorted(set(top_symbols) | set(state.portfolio.positions) | set(resume_symbols))
         four_hour: dict[str, pd.DataFrame] = {}
         regimes: dict[str, pd.DataFrame] = {}
+        prefetched = {}
+        if candle_reader is not None and is_demo:
+            requests = [(symbol, "4h", 100) for symbol in track
+                        if not closed_market_cache or not closed_market_cache.four_hour.get(symbol)
+                        or closed_market_cache.four_hour[symbol][0] != now_ms // FOUR_H_MS]
+            prefetched = candle_reader.read_many(requests, _public_read_deadline(now, settings),
+                                                  monitor=position_monitor)
         for symbol in track:
             if position_monitor is not None:
                 position_monitor()
@@ -2479,7 +2556,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
                     pass
             try:
                 if is_demo:
-                    frame4 = _cached_four_hour(exchange, symbol, now_ms, closed_market_cache)
+                    kwargs = {"prefetched": prefetched} if candle_reader is not None else {}
+                    frame4 = _cached_four_hour(exchange, symbol, now_ms, closed_market_cache, **kwargs)
                 else:
                     rows4 = exchange.fetch_ohlcv(symbol, "4h", limit=100)
                     closed4 = _closed(rows4, FOUR_H_MS, now_ms)
@@ -2504,7 +2582,18 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
         state.exit_management_by_symbol[HOTLIST_CACHE_KEY] = {"refreshed_at": now.isoformat()}
 
     top_symbols = [row["symbol"] for row in hotlist]
-    decision_ms = (int(datetime.now(timezone.utc).timestamp() * 1000) if is_demo else now_ms)
+    if candle_reader is not None and is_demo and closed_market_cache is not None:
+        span = settings.symbol_regime.ema_slow_bars
+        key = (now_ms // DAY_MS, span)
+        requests = [(symbol, "1d", max(span + 1, 100)) for symbol in top_symbols
+                    if not closed_market_cache.daily_direction.get(symbol)
+                    or closed_market_cache.daily_direction[symbol][0] != key]
+        prefetched = candle_reader.read_many(requests, _public_read_deadline(now, settings),
+                                              monitor=position_monitor)
+        for symbol, _, _ in requests:
+            _cached_daily_direction_gate(exchange, symbol, now, span, closed_market_cache,
+                                          prefetched=prefetched)
+    decision_ms = (int(_utc_now().timestamp() * 1000) if is_demo else now_ms)
     max_quote_age_ms = (DEMO_POSITION_QUOTE_MAX_AGE_MS if is_demo
                         else LIVE_TICKER_MAX_AGE_MS)
     current_prices = {
@@ -3113,6 +3202,13 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
      regime_value, reason, daily_gate, context, flags, funding_rate) = candidate
     max_delay = timedelta(seconds=settings.execution.confirm_delay_sec_max)
     market_risk_state = market_risk.state.value
+    if is_demo:
+        try:
+            _require_entry_clock()
+        except ExchangeClockError:
+            state.events.append({"event": "entry_signal_blocked", "at": _utc_now().isoformat(),
+                                 "symbol": symbol, "reason": "exchange_clock_stale_or_unavailable"})
+            return None
     market_risk_multiplier = (settings.market_risk.elevated_size_multiplier
                               if market_risk.state is MarketRiskState.RISK_ELEVATED else 1.0)
     if (state.execution_mode == "lead_usdm"
@@ -3454,10 +3550,12 @@ def main() -> int:
     is_exchange_execution = mode.name in {"demo_usdm", "lead_usdm"}
     is_demo = is_exchange_execution
 
-    exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    exchange = ccxt.binanceusdm({"enableRateLimit": True, "timeout": 5000})
     configure_system_proxy(exchange)
     account_exchange = None
     execution = None
+    clock = None
+    candle_reader = None
     try:
         state = MultiPaperState.load(state_path, initial_equity=args.equity)
         if state_path_existed and state.execution_mode != mode.name:
@@ -3483,8 +3581,9 @@ def main() -> int:
                 account_exchange = create_demo_usdm(settings.runtime)
                 execution = DemoExecutionService(account_exchange, settings)
             try:
+                clock = _initialize_exchange_clock(account_exchange, state)
                 state.exchange_snapshot = _initialize_demo(execution)
-            except ccxt.BaseError as exc:
+            except (ccxt.BaseError, ExchangeClockError) as exc:
                 state.events.append({"event": "account_startup_failed", "at": _utc_now().isoformat(),
                                      "phase": "account_initialization", "endpoint": mode.name,
                                      "error": type(exc).__name__, "order_may_have_been_sent": False})
@@ -3497,7 +3596,7 @@ def main() -> int:
                 entries_reconciled = _reconcile_pending_entries(execution, state, checkpoint)
             except mr_scan.ScanCheckpointError:
                 entries_reconciled = False
-            if entries_reconciled and not _demo_sync_stopped(execution, state, datetime.now(timezone.utc)):
+            if entries_reconciled and not _demo_sync_stopped(execution, state, _utc_now()):
                 checkpoint.try_save()
                 raise RuntimeError(f"{mode.name} positions do not match the local ledger; refusing to start")
             if not state_path_existed:
@@ -3509,7 +3608,7 @@ def main() -> int:
         )
         if state.strategy_variant != candidate_variant:
             state.events.append({"event": "strategy_variant_changed",
-                                 "at": datetime.now(timezone.utc).isoformat(),
+                                 "at": _utc_now().isoformat(),
                                  "previous": state.strategy_variant,
                                  "current": candidate_variant})
             state.strategy_variant = candidate_variant
@@ -3522,6 +3621,7 @@ def main() -> int:
                     RUNNER_BUILD_ID, TIME_FILTER_BUILD_ID, state_path)
         market_cache = IntrabarMarketCache() if args.intrabar_entries else None
         closed_market_cache = ClosedMarketCache() if is_exchange_execution else None
+        candle_reader = CandleBatchReader(exchange, _utc_now) if is_exchange_execution else None
         retry_after = _persisted_market_retry_after(state) if args.intrabar_entries else None
         market_failure_attempt = 0
         last_position_monitor_at = 0.0
@@ -3535,7 +3635,7 @@ def main() -> int:
                     < DEMO_POSITION_MONITOR_POLL_SECONDS):
                 return False
             last_position_monitor_at = monotonic_now
-            monitor_at = datetime.now(timezone.utc)
+            monitor_at = _utc_now()
             try:
                 dirty = _manage_demo_positions(
                     exchange, execution, state, settings, monitor_at,
@@ -3570,12 +3670,15 @@ def main() -> int:
                                  _execution_label(execution, state), type(exc).__name__)
                 dirty = True
             if dirty:
-                state.record_equity(datetime.now(timezone.utc))
+                state.record_equity(_utc_now())
                 checkpoint.try_save()
             return dirty
 
         while True:
-            now = datetime.now(timezone.utc)
+            if clock is not None:
+                _refresh_exchange_clock(clock, account_exchange, state)
+                _wait_for_closed_hour()
+            now = _utc_now()
             if checkpoint.failed:
                 monitor_demo_positions(force=True)
                 if not checkpoint.try_save():
@@ -3599,7 +3702,8 @@ def main() -> int:
                 _cycle(exchange, execution, state, settings, now, is_demo, args.max_positions,
                        intrabar_entries=args.intrabar_entries, market_cache=market_cache,
                        position_monitor=monitor_demo_positions if is_demo else None,
-                       closed_market_cache=closed_market_cache, checkpoint=checkpoint)
+                       closed_market_cache=closed_market_cache, checkpoint=checkpoint,
+                       candle_reader=candle_reader)
                 monitor_demo_positions()
                 market_failure_attempt = 0
                 retry_after = None
@@ -3615,7 +3719,7 @@ def main() -> int:
                                          "order_may_have_been_sent": bool(mr_scan.unresolved_attempts(state))})
                 if args.intrabar_entries:
                     market_failure_attempt += 1
-                    failed_at = datetime.now(timezone.utc)
+                    failed_at = _utc_now()
                     retry_delay = _market_retry_delay_seconds(
                         exc, poll=args.poll, attempt=market_failure_attempt, now=failed_at,
                     )
@@ -3633,7 +3737,7 @@ def main() -> int:
                                    getattr(exc, "mr_endpoint", "unidentified"), type(exc).__name__)
             except mr_scan.ScanCheckpointError:
                 logger.error("MR entry checkpoint failed; entries paused until storage recovers")
-            if is_demo and not checkpoint.failed:
+            if is_demo and not checkpoint.failed and _background_reads_allowed(_utc_now()):
                 _reconcile_demo_funding(execution, state, _utc_now(),
                                        position_monitor=monitor_demo_positions)
             state.record_equity(now)
@@ -3647,9 +3751,13 @@ def main() -> int:
                                               cycle_started_at=now)
                 _wait_with_monitor(poll_delay, monitor_demo_positions if is_demo else None)
             else:
-                remaining = max(1.0, (retry_after - datetime.now(timezone.utc)).total_seconds())
+                remaining = max(1.0, (retry_after - _utc_now()).total_seconds())
                 time.sleep(min(float(args.poll), remaining))
     finally:
+        if candle_reader is not None:
+            candle_reader.close()
+        if clock is not None and active_clock() is clock:
+            activate_clock(None)
         exchange.close()
         if account_exchange is not None:
             account_exchange.close()
