@@ -54,7 +54,7 @@ from bot.exchange.binance_usdm import (create_demo_usdm, create_lead_usdm,
 from bot.exchange.network import configure_system_proxy
 from bot.exchange.clock import ExchangeClock, ExchangeClockError, active_clock, activate_clock
 from bot.exchange.public_candles import CandleBatchReader, prefetched_read
-from bot.entry_quality import EntrySignalContext, execution_quote
+from bot.entry_quality import EntrySignalContext, entry_liquidity_observation, execution_quote
 from bot.execution import (DemoExecutionService, EntryPreflightRejected,
                            LeadPortfolioExecutionService)
 from bot.indicators import atr, validate_ohlcv
@@ -534,9 +534,10 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
         except ccxt.BaseError as exc:
             if required and propagate_read_errors:
                 raise
-            return None, f"entry_quote_unavailable:{type(exc).__name__}"
-        return execution_quote(book, context.side, _utc_now(),
-                               max_age_sec=settings.execution.entry_quote_max_age_sec)
+            return None, f"entry_quote_unavailable:{type(exc).__name__}", None
+        quote_data, error = execution_quote(book, context.side, _utc_now(),
+                                            max_age_sec=settings.execution.entry_quote_max_age_sec)
+        return quote_data, error, book
 
     def before_submit(intent, planned_stop):
         try:
@@ -552,13 +553,13 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
                 reject("lead_account_not_synchronized")
         # Public quote is optional attribution evidence. Fetch Demo last so the
         # executable reference does not wait behind an additional network call.
-        audit["public_quote"], public_error = quote(exchange)
+        audit["public_quote"], public_error, _ = quote(exchange)
         audit["public_quote_error"] = public_error
         if _utc_now() > deadline:
             reject("entry_signal_expired")
         if scan_row is not None:
             scan_row.update(phase="entry_quote", endpoint="demo")
-        demo_quote, quote_error = quote(execution.exchange, required=True)
+        demo_quote, quote_error, execution_book = quote(execution.exchange, required=True)
         audit["demo_quote"] = demo_quote
         if quote_error:
             reject(quote_error)
@@ -638,6 +639,16 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
             audit.update({"existing_portfolio_stop_risk": quantity_limits["exposure"].stop_risk,
                           "new_planned_risk": approval.details["estimated_risk"],
                           "max_portfolio_stop_risk": state.current_equity * settings.lead_risk.max_portfolio_stop_risk_pct})
+        if state.execution_mode == "lead_usdm":
+            try:
+                audit["entry_liquidity"] = entry_liquidity_observation(
+                    execution_book, context.side, qty, slippage_limit=settings.risk.max_slippage_pct,
+                    step_size=step, minimum_quantity=minimum,
+                )
+            except Exception as exc:
+                # Keep diagnostic failures out of the order approval path.
+                audit["entry_liquidity"] = {"observe_only": True, "status": "unavailable",
+                                            "reason": type(exc).__name__}
         _record_preflight_decision(state, audit, None, _utc_now())
         return refreshed, stop
 
@@ -667,6 +678,9 @@ def _record_entry_execution_fill(state, position, result, audit):
                                      - datetime.fromisoformat(public["quoted_at"])).total_seconds())
                                if public else None),
     }
+    if "entry_liquidity" in audit:
+        event["entry_liquidity"] = {**audit["entry_liquidity"],
+                                    "actual_slippage_pct": direction * (position.entry_price / demo_price - 1)}
     state.events.append(event)
 
 

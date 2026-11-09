@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from bot.config import load_settings
-from bot.entry_quality import EntrySignalContext, execution_quote
+from bot.entry_quality import EntrySignalContext, entry_liquidity_observation, execution_quote
 from bot.exchange.binance_usdm import FAPI_URLS
 from bot.execution import DemoExecutionService, EntryPreflightRejected
 from bot.live.multi_paper import MultiPaperState
@@ -86,6 +86,7 @@ def test_fresh_executable_quote_rechecks_size_and_only_observes_atr_caps(monkeyp
     assert audit["adverse_quote_atr"] == pytest.approx(0.2)
     assert all(item["would_block"] for item in audit["atr_threshold_observations"])
     assert audit["observe_only"] is True
+    assert "entry_liquidity" not in audit
 
 
 def test_lead_quote_guard_refreshes_account_and_uses_active_stops(monkeypatch):
@@ -106,6 +107,65 @@ def test_lead_quote_guard_refreshes_account_and_uses_active_stops(monkeypatch):
     assert audit["existing_portfolio_stop_risk"] + audit["new_planned_risk"] <= 40
     assert refreshed.notional <= 600 and stop == 96.6
     assert state.portfolio.positions["OLD"].stop_price == 90
+
+
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+def test_liquidity_observation_walks_both_sides_and_floors_suggested_size(side):
+    book = {
+        "asks": [[100, 2], [100.1, 4], [100.2, 100]],
+        "bids": [[99.9, 3], [99.85, 2], [99.7, 100]],
+    }
+    result = entry_liquidity_observation(book, side, 5, slippage_limit=0.0015,
+                                         step_size=1, minimum_quantity=1)
+
+    assert result["status"] == "estimated"
+    ask, bid = (result["entry"], result["reverse"]) if side is Side.LONG else (result["reverse"], result["entry"])
+    assert ask["planned_vwap"] == pytest.approx(100.06)
+    assert bid["planned_vwap"] == pytest.approx(99.88)
+    assert ask["planned_slippage_pct"] == pytest.approx(0.0006)
+    assert bid["planned_slippage_pct"] == pytest.approx((99.9 - 99.88) / 99.9)
+    assert ask["quantity_within_limit"] == 6
+    assert bid["quantity_within_limit"] == 5
+    assert result["spread_pct"] == pytest.approx(0.1 / 99.95)
+    assert result["suggested_quantity"] == 2 and result["suggested_action"] == "reduce"
+
+
+@pytest.mark.parametrize("depth", ["too_thin", "invalid_tail", "unexpected_error"])
+def test_lead_liquidity_observation_cannot_change_order_intent(monkeypatch, depth):
+    book = _book()
+    book["asks"] = [[98.2, 0.15]]
+    book["bids"] = [[98.1, 0.15]]
+    if depth == "invalid_tail":
+        book["bids"].append([98.11, 0.1])
+    if depth == "unexpected_error":
+        def broken_observation(*args, **kwargs):
+            raise RuntimeError("diagnostic failed")
+        monkeypatch.setattr(runner, "entry_liquidity_observation", broken_observation)
+    guard, _, audit, intent, state, _, _, client = _guard(monkeypatch, book=book)
+    state.execution_mode = "lead_usdm"
+    state.execution_status = "synchronized"
+    state.exchange_snapshot = {"at": NOW.isoformat(), "equity": 1000, "positions": {}}
+    state.protective_stop_audit = {"status": "verified", "mismatch_count": 0, "position_count": 0}
+    monkeypatch.setattr(runner, "_demo_sync_stopped", lambda *args: True)
+    monkeypatch.setattr(runner, "_audit_demo_protective_stops", lambda *args: True)
+
+    refreshed, stop = guard(intent, intent.stop_price)
+
+    assert client.calls == 2  # The same public and execution quote requests.
+    assert audit["decision"] == "ALLOW" and refreshed.quantity == 6.1 and stop == 96.6
+    observation = audit["entry_liquidity"]
+    assert observation["observe_only"] is True
+    if depth == "too_thin":
+        assert observation["entry"]["planned_vwap"] is None
+        assert observation["suggested_quantity"] == 0 and observation["suggested_action"] == "skip"
+        position = Position(SYMBOL, Side.LONG, refreshed.quantity, 98.3, stop, NOW,
+                            intent.reason, Regime.MID.value, "MEAN_REVERSION")
+        runner._record_entry_execution_fill(state, position, {"fill": {}}, audit)
+        result = MultiPaperState.from_dict(state.to_dict()).events[-1]["entry_liquidity"]
+        assert result["actual_slippage_pct"] == pytest.approx(98.3 / 98.2 - 1)
+        assert result["suggested_action"] == "skip"
+    else:
+        assert observation["status"] == "unavailable"
 
 
 @pytest.mark.parametrize("age,reason", [(15.001, "entry_quote_stale"), (-0.001, "entry_quote_from_future")])
