@@ -649,7 +649,7 @@ def test_startup_closes_exchange_confirmed_stale_position_with_reduce_only_inten
     assert runner._close_startup_stale_positions(now, {symbol: {"last": 101.0}}) is False
 
 
-def test_startup_does_not_close_tp1_break_even_runner_for_time_alone():
+def test_startup_does_not_close_confirmed_2r_trailing_runner_for_time_alone():
     symbol = "AAA/USDT:USDT"
     now = datetime(2026, 1, 6, 12, tzinfo=timezone.utc)
     opened = now - timedelta(hours=25)
@@ -657,7 +657,8 @@ def test_startup_does_not_close_tp1_break_even_runner_for_time_alone():
     position = Position(symbol, Side.LONG, 0.2, 100.0, 95.0, opened, "entry", Regime.LOW.value)
     state.portfolio.positions[symbol] = position
     state.exit_management_by_symbol[symbol] = {
-        "tp1_taken": True, "breakeven_moved": True, "protective_stop": 100.0,
+        "trailing_started": True, "trailing_trigger_r": 2.0,
+        "protective_stop": 102.0,
     }
     state.exchange_snapshot = {"positions": {symbol: {"side": "long", "quantity": 0.2,
                                                           "entry_price": 100.0}}}

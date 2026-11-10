@@ -1166,6 +1166,89 @@ def test_local_candidate_runner_ratchets_stop_without_mutating_frozen_position()
     assert state.events[-1]["reason"] == "protective_stop"
 
 
+@pytest.mark.parametrize("best_low,exempt", [(97.0, False), (96.0, True)])
+def test_local_24h_exit_only_waives_after_2r_trailing(best_low, exempt):
+    settings, state, symbol, one_hour, now = _short_exit_fixture()
+    state.portfolio.positions[symbol] = replace(
+        state.portfolio.positions[symbol], opened_at=now - timedelta(hours=25),
+    )
+    one_hour.loc[one_hour.index[-1], ["open", "high", "low", "close"]] = [
+        100.0, 100.0, best_low, 98.0,
+    ]
+
+    runner._evaluate_exits(state, None, False, {symbol: one_hour}, {}, settings,
+                           0.0, 0.0, now)
+
+    if exempt:
+        assert symbol in state.portfolio.positions
+        assert state.exit_management_by_symbol[symbol]["trailing_started"] is True
+        assert any(event.get("event") == "max_hold_24h_waived_trailing"
+                   for event in state.events)
+    else:
+        assert symbol not in state.portfolio.positions
+        close = next(event for event in state.events
+                     if event.get("event") == "paper_fill" and event.get("action") == "CLOSE")
+        assert close["reason"] == "max_hold_24h"
+
+
+@pytest.mark.parametrize("quote,stop_update_succeeds,exempt", [
+    (99.0, True, False),
+    (96.0, True, True),
+    (96.0, False, False),
+])
+def test_demo_24h_exit_requires_2r_and_protected_trailing_stop(
+    monkeypatch, quote, stop_update_succeeds, exempt,
+):
+    settings, state, symbol, _frame, fixture_now = _short_exit_fixture(is_demo=True)
+    now = fixture_now + timedelta(hours=25)
+    state.portfolio.positions[symbol] = replace(
+        state.portfolio.positions[symbol], opened_at=now - timedelta(hours=25),
+    )
+    state.exchange_snapshot = {"at": now.isoformat()}
+    state.protective_stop_audit["at"] = now.isoformat()
+    close_calls = []
+
+    class Exchange:
+        markets = {symbol: {}}
+
+        @staticmethod
+        def fetch_ticker(_symbol):
+            return {"last": quote, "timestamp": int(now.timestamp() * 1000)}
+
+    class Execution:
+        exchange = SimpleNamespace(price_to_precision=lambda _symbol, price: str(price))
+
+        @staticmethod
+        def audit_active_protective_stops(_positions, _orders):
+            return []
+
+        @staticmethod
+        def replace_stop(_position, *, stop, stop_price):
+            if not stop_update_succeeds:
+                raise RuntimeError("replacement failed")
+            return {"id": "updated-stop", "stop_price": float(stop_price), "amount": 1.0}
+
+    def record_close(_is_demo, _execution, current_state, current_symbol, price, reason,
+                     at, _fee, _slip):
+        close_calls.append(reason)
+        current_state.portfolio.positions.pop(current_symbol, None)
+
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    monkeypatch.setattr(runner, "_close_position", record_close)
+    runner._manage_demo_positions(Exchange(), Execution(), state, settings, now, 0.0, 0.0)
+
+    if exempt:
+        assert symbol in state.portfolio.positions
+        assert state.exit_management_by_symbol[symbol]["trailing_started"] is True
+        assert state.exchange_orders_by_symbol[symbol]["stop"]["stop_price"] == pytest.approx(98.0)
+        assert not close_calls
+        assert any(event.get("event") == "max_hold_24h_waived_trailing"
+                   for event in state.events)
+    else:
+        assert symbol not in state.portfolio.positions
+        assert close_calls == ["max_hold_24h"]
+
+
 def test_demo_candidate_runner_uses_exchange_stop_and_does_not_repeat_replacement():
     settings, state, symbol, _one_hour, _fixture_now = _short_exit_fixture(is_demo=True)
     now = datetime.now(timezone.utc)

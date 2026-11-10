@@ -60,6 +60,7 @@ from bot.execution import (DemoExecutionService, EntryPreflightRejected,
                            LeadPortfolioExecutionService)
 from bot.indicators import atr, validate_ohlcv
 from bot.live.multi_paper import MultiPaperState
+from bot.live.paper import effective_max_hold_hours, runner_tail_is_exempt
 from bot.live import mr_scan
 from bot.market_risk import (MarketRiskAssessment, MarketRiskState,
                              fetch_market_risk_status)
@@ -310,6 +311,66 @@ def _execution_label(execution, state=None):
     if mode == "lead_usdm":
         return "Lead Portfolio"
     return "local Paper" if mode == "local_paper" else "Demo"
+
+
+def _record_max_hold_waiver(state, symbol, position, meta, held_hours, now, regular_limit):
+    if (held_hours < regular_limit or not meta.get("trailing_started")
+            or meta.get("max_hold_waiver_logged")):
+        return False
+    state.events.append({
+        "event": "max_hold_24h_waived_trailing", "at": now.isoformat(),
+        "symbol": symbol, "side": position.side.value, "held_hours": held_hours,
+        "trailing_trigger_r": meta.get("trailing_trigger_r", 2.0),
+        "protective_stop": meta.get("protective_stop", position.stop_price),
+    })
+    meta["max_hold_waiver_logged"] = True
+    return True
+
+
+def _apply_max_hold_exit(is_demo, execution, state, symbol, position, price, now,
+                         settings, fee_rate, slip_rate):
+    opened_at = _aware_datetime(position.opened_at)
+    if opened_at is None:
+        return False
+    held_hours = max(0.0, (now - opened_at).total_seconds() / 3600)
+    meta = state.exit_management_by_symbol.get(symbol) or {}
+    regular_limit = float(settings.exits.max_hold_bars)
+    exempt = runner_tail_is_exempt(
+        position.side, position.entry_price, position.stop_price, meta, settings.exits,
+    )
+    _record_max_hold_waiver(state, symbol, position, meta, held_hours, now, regular_limit)
+    max_hold_hours = effective_max_hold_hours(
+        position.side, position.entry_price, position.stop_price, meta, settings.exits,
+    )
+    if max_hold_hours is None or max_hold_hours <= 0 or held_hours < max_hold_hours:
+        return False
+    reason = "max_hold_runner" if exempt else "max_hold_24h"
+    _close_position(is_demo, execution, state, symbol, price, reason, now, fee_rate, slip_rate)
+    return True
+
+
+def _mark_trailing_started(state, symbol, position, meta, progress_r, active_stop,
+                           proposed_stop, trigger_r, now):
+    if progress_r < trigger_r:
+        return False
+    protected = (
+        active_stop >= proposed_stop and active_stop > position.entry_price
+        if position.side is Side.LONG
+        else active_stop <= proposed_stop and active_stop < position.entry_price
+    )
+    if not protected:
+        return False
+    if not meta.get("trailing_started"):
+        meta["trailing_started"] = True
+        meta["trailing_started_at"] = now.isoformat()
+        meta["trailing_trigger_r"] = float(trigger_r)
+        state.events.append({
+            "event": "trailing_stop_started", "at": now.isoformat(),
+            "symbol": symbol, "side": position.side.value,
+            "progress_r": progress_r, "protective_stop": active_stop,
+            "trailing_stop": proposed_stop, "trigger_r": float(trigger_r),
+        })
+    return True
 
 
 def _target_margin_per_symbol(state, settings):
@@ -777,7 +838,12 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
                       "planned_stop": stop,
                       "top_quote_covers_quantity": demo_quote["quantity"] >= qty})
         if quantity_limits:
-            audit.update({"existing_portfolio_stop_risk": quantity_limits["exposure"].stop_risk,
+            exposure = quantity_limits["exposure"]
+            audit.update({"existing_portfolio_stop_risk": exposure.stop_risk,
+                          "existing_portfolio_capital_risk": exposure.capital_risk,
+                          "existing_portfolio_giveback_risk": exposure.giveback_risk,
+                          "existing_portfolio_weighted_giveback_risk": exposure.weighted_giveback_risk,
+                          "portfolio_giveback_risk_weight": settings.lead_risk.giveback_risk_weight,
                           "new_planned_risk": approval.details["estimated_risk"],
                           "max_portfolio_stop_risk": state.current_equity * settings.lead_risk.max_portfolio_stop_risk_pct})
         if state.execution_mode == "lead_usdm":
@@ -1952,21 +2018,6 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
         return True
 
     dirty = False
-    decision_at = _utc_now()
-    max_hold_hours = float(settings.exits.max_hold_bars)
-    for symbol, position in list(state.portfolio.positions.items()):
-        opened_at = _aware_datetime(position.opened_at)
-        if opened_at is None:
-            continue
-        held_hours = (decision_at - opened_at).total_seconds() / 3600
-        if held_hours >= max_hold_hours:
-            _close_position(True, execution, state, symbol, None, "max_hold_24h",
-                            decision_at, fee_rate, slip_rate)
-            if symbol not in state.portfolio.positions:
-                dirty = True
-                logger.info("{} max-hold exit {} held_hours={:.3f}",
-                            _execution_label(execution, state), symbol, held_hours)
-
     if not state.portfolio.positions:
         return dirty
     if not exchange.markets:
@@ -2026,6 +2077,9 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
         dirty = True  # Persist each valid excursion sample and the latest freshness result.
         if price is None or not _position_sample_is_eligible(position, observed_at):
             state.exit_management_by_symbol[symbol] = meta
+            if _apply_max_hold_exit(True, execution, state, symbol, position, None,
+                                    checked_at, settings, fee_rate, slip_rate):
+                dirty = True
             continue
 
         _update_demo_excursions(meta, position, price=price, observed_at=observed_at)
@@ -2047,6 +2101,9 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
         tracked_order = (state.exchange_orders_by_symbol.get(symbol) or {}).get("stop")
         if entry_atr <= 0 or initial_risk <= 0 or not tracked_order:
             state.exit_management_by_symbol[symbol] = meta
+            if _apply_max_hold_exit(True, execution, state, symbol, position, price,
+                                    checked_at, settings, fee_rate, slip_rate):
+                dirty = True
             continue
         tracked_stop = float(tracked_order.get("stop_price", position.stop_price))
         recorded_stop = float(meta.get("protective_stop", position.stop_price))
@@ -2102,15 +2159,28 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
             proposed_stop = float(execution.exchange.price_to_precision(symbol, proposed_stop))
         except (ccxt.BaseError, TypeError, ValueError, OverflowError):
             state.exit_management_by_symbol[symbol] = meta
+            if _apply_max_hold_exit(True, execution, state, symbol, position, price,
+                                    checked_at, settings, fee_rate, slip_rate):
+                dirty = True
             continue
         improved = (proposed_stop > current_stop if position.side is Side.LONG
                     else proposed_stop < current_stop)
         if not improved:
+            if _mark_trailing_started(
+                    state, symbol, position, meta, progress_r, current_stop, proposed_stop,
+                    settings.mr_candidate_exit.trailing_trigger_r, checked_at):
+                dirty = True
             state.exit_management_by_symbol[symbol] = meta
+            if _apply_max_hold_exit(True, execution, state, symbol, position, price,
+                                    checked_at, settings, fee_rate, slip_rate):
+                dirty = True
             continue
         if ((position.side is Side.LONG and proposed_stop >= price)
                 or (position.side is Side.SHORT and proposed_stop <= price)):
             state.exit_management_by_symbol[symbol] = meta
+            if _apply_max_hold_exit(True, execution, state, symbol, position, price,
+                                    checked_at, settings, fee_rate, slip_rate):
+                dirty = True
             continue
 
         first_breakeven_move = _stop_is_less_protective(position.side, current_stop, locked_stop)
@@ -2120,10 +2190,16 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
                     and (checked_at - last_update).total_seconds()
                     < DEMO_STOP_UPDATE_MIN_INTERVAL_SECONDS):
                 state.exit_management_by_symbol[symbol] = meta
+                if _apply_max_hold_exit(True, execution, state, symbol, position, price,
+                                        checked_at, settings, fee_rate, slip_rate):
+                    dirty = True
                 continue
 
         if state.protective_stop_audit.get("status") != "verified":
             state.exit_management_by_symbol[symbol] = meta
+            if _apply_max_hold_exit(True, execution, state, symbol, position, price,
+                                    checked_at, settings, fee_rate, slip_rate):
+                dirty = True
             continue
         try:
             updated = execution.replace_stop(position, stop=tracked_order,
@@ -2133,12 +2209,19 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
             logger.warning("{} stop move failed for {}: {}",
                            _execution_label(execution, state), symbol, type(exc).__name__)
             state.exit_management_by_symbol[symbol] = meta
+            if _apply_max_hold_exit(True, execution, state, symbol, position, price,
+                                    checked_at, settings, fee_rate, slip_rate):
+                dirty = True
             continue
 
         state.exchange_orders_by_symbol.setdefault(symbol, {})["stop"] = updated
         actual_stop = float(updated.get("stop_price", proposed_stop))
         meta["protective_stop"] = actual_stop
         meta["last_fast_stop_update_at"] = checked_at.isoformat()
+        if _mark_trailing_started(
+                state, symbol, position, meta, progress_r, actual_stop, proposed_stop,
+                settings.mr_candidate_exit.trailing_trigger_r, checked_at):
+            dirty = True
         stop_reason = "breakeven_or_trailing"
         state.events.append({
             "event": "protective_stop_updated", "action": "REPLACE",
@@ -2152,6 +2235,9 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
                     _execution_label(execution, state), symbol, tracked_stop, actual_stop, updated.get("id"))
         _invalidate_demo_stop_audit(state)
         state.exit_management_by_symbol[symbol] = meta
+        if _apply_max_hold_exit(True, execution, state, symbol, position, price,
+                                checked_at, settings, fee_rate, slip_rate):
+            dirty = True
 
     return dirty
 
@@ -3375,14 +3461,6 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
                             now, fee_rate, slip_rate)
             continue
 
-        # 7. max hold for local Paper; Demo uses the independent fast monitor.
-        if not is_demo and position.opened_at is not None:
-            held_hours = (now - position.opened_at).total_seconds() / 3600
-            if held_hours >= exits.max_hold_bars:
-                _close_position(is_demo, execution, state, symbol, current_close, "max_hold_24h",
-                                now, fee_rate, slip_rate)
-                continue
-
         if is_demo:
             state.exit_management_by_symbol[symbol] = meta
             continue
@@ -3401,10 +3479,17 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
                                  trigger_r=settings.mr_candidate_exit.trailing_trigger_r,
                                  atr_mult=settings.exit_management.trailing_atr_mult,
                                  stop_atr_mult=settings.signals.stop_atr_mult)
+        _mark_trailing_started(
+            state, symbol, position, meta, progress_r, new_stop, new_stop,
+            settings.mr_candidate_exit.trailing_trigger_r, now,
+        )
         if abs(new_stop - current_stop) > 1e-12:
             meta["protective_stop"] = new_stop
 
         state.exit_management_by_symbol[symbol] = meta
+        if _apply_max_hold_exit(False, execution, state, symbol, position, current_close,
+                                now, settings, fee_rate, slip_rate):
+            continue
 
 
 def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regimes,
@@ -3551,6 +3636,7 @@ def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
         "structure_low": swing_low,
         "structure_high": swing_high,
         "initial_risk": initial_risk,
+        "trailing_started": False,
         "best_price": (opened.entry_price if is_demo and observed_price is None
                        else close if observed_price is None else observed_price),
         "worst_price": (opened.entry_price if is_demo and observed_price is None

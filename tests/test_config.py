@@ -27,9 +27,9 @@ def test_smoke_and_settings_import():
     assert settings.pyramiding.enabled is False
     assert loaded.exits.no_progress_bars == 6
     assert loaded.exits.max_hold_bars == 24
-    assert loaded.exits.exempt_max_hold_after_tp1 is True
-    assert loaded.exits.require_breakeven_for_exempt is True
     assert loaded.exits.runner_max_hold_bars == 0
+    assert loaded.lead_risk.max_portfolio_stop_risk_pct == 0.04
+    assert loaded.lead_risk.giveback_risk_weight == 0.15
     assert not hasattr(loaded.exit_proposal_v1, "no_progress_bars")
     assert loaded.trend_strategy.risk_per_trade_pct == 0.005
     assert loaded.trend_strategy.pullback_ttl_minutes == 45
@@ -105,6 +105,7 @@ def test_config_path_sources(monkeypatch, tmp_path):
     lambda data: data["sizing"].update(leverage=4),
     lambda data: data["sizing"].update(max_directional_notional_pct=2.0),
     lambda data: data["market_risk"].update(elevated_size_multiplier=1.5),
+    lambda data: data["lead_risk"].update(giveback_risk_weight=1.01),
     lambda data: data["low_position_watch"].update(range_position_min_pct=50),
     lambda data: data["symbol_regime"].update(trend_adx_min=15, range_adx_max=20),
     lambda data: data["symbol_regime"].update(ema_fast_bars=50, ema_slow_bars=20),

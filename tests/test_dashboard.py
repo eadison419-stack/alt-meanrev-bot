@@ -14,6 +14,9 @@ def test_dashboard_frontend_treats_lead_portfolio_as_an_exchange_account():
     html = html_path.read_text(encoding="utf-8")
     assert "function isExchangeMode(mode){return mode==='demo_usdm'||mode==='lead_usdm'}" in html
     assert "function accountModeLabel(mode){return mode==='lead_usdm'?'Binance Lead Portfolio'" in html
+    assert "${tp.trailing_exemption_r??2}R" in html
+    assert "不限时（2R追踪止损）" in html
+    assert "x.trailing_started?'2R追踪已启动'" in html
 
 
 def sample_state():

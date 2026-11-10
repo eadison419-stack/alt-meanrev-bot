@@ -150,8 +150,6 @@ class Exits(Section):
     no_progress_min_atr: Positive
     no_progress_action: Literal["close"]
     max_hold_bars: Count
-    exempt_max_hold_after_tp1: bool
-    require_breakeven_for_exempt: bool
     runner_max_hold_bars: NonNegativeCount
     startup_stale_exit: bool
 
@@ -228,6 +226,7 @@ class LeadRisk(Section):
     max_leverage: Annotated[int, Field(ge=3, le=10)]
     max_symbol_notional_pct: Fraction
     max_portfolio_stop_risk_pct: Fraction
+    giveback_risk_weight: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
     daily_drawdown_halt_pct: Fraction
     liquidation_stop_distance_multiple: Annotated[float, Field(ge=2, allow_inf_nan=False)]
     min_stop_liquidation_gap_pct: Annotated[float, Field(ge=0.01, le=1, allow_inf_nan=False)]

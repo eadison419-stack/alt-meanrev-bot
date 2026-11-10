@@ -112,20 +112,8 @@ def proposal_structure_signal_reason(
 
 def runner_tail_is_exempt(side: Side | str, entry_price: float, position_stop: float | None,
                           exit_state: dict[str, Any], exits) -> bool:
-    """Whether a TP1 runner has a confirmed break-even-or-better protective stop."""
-    if not exits.exempt_max_hold_after_tp1 or not exit_state.get("tp1_taken"):
-        return False
-    if not exits.require_breakeven_for_exempt:
-        return True
-    if not exit_state.get("breakeven_moved"):
-        return False
-    stop = exit_state.get("protective_stop")
-    if stop is None:
-        stop = position_stop
-    if stop is None or not math.isfinite(float(stop)):
-        return False
-    side = Side(side)
-    return float(stop) >= entry_price if side is Side.LONG else float(stop) <= entry_price
+    """Whether a persisted, protected 2R trailing stop waives the 24h cap."""
+    return bool(exit_state.get("trailing_started"))
 
 
 def effective_max_hold_hours(side: Side | str, entry_price: float, position_stop: float | None,
@@ -1787,6 +1775,17 @@ class PaperTrader:
                             self._event("protective_stop_updated", side=side.value,
                                         stop_price=active_exit["protective_stop"],
                                         best_price=active_exit["best_price"], favorable_r=favorable / risk)
+                    active_stop = active_exit.get("protective_stop")
+                    trailing_protected = (
+                        active_stop is not None
+                        and (float(active_stop) > position.entry_price if side is Side.LONG
+                             else float(active_stop) < position.entry_price)
+                    )
+                    if (favorable >= policy.trailing_trigger_r * risk and trailing_protected
+                            and (self.execution is None
+                                 or self.account.execution_status == "synchronized")):
+                        active_exit["trailing_started"] = True
+                        active_exit.setdefault("trailing_trigger_r", float(policy.trailing_trigger_r))
         risk_state_before = (
             self.account.portfolio.trading_date,
             self.account.portfolio.day_start_equity,
@@ -1809,17 +1808,23 @@ class PaperTrader:
         max_hold_hours = effective_max_hold_hours(
             position.side, position.entry_price, position.stop_price, exit_state, self.settings.exits,
         )
-        if max_hold_hours is None or max_hold_hours <= 0:
-            return False
         pending = self.account.pending
         if pending and (pending.get("action") == Action.CLOSE.value or pending.get("close_first")):
             return False
         now = _dt(now)
         opened_at = _dt(position.opened_at)
         held_hours = max(0.0, (now - opened_at).total_seconds() / 3600)
-        if held_hours < max_hold_hours:
+        regular_limit = float(self.settings.exits.max_hold_bars)
+        if (exit_state.get("trailing_started") and regular_limit > 0
+                and held_hours >= regular_limit and not exit_state.get("max_hold_waiver_logged")):
+            self._event("max_hold_24h_waived_trailing", held_hours=held_hours,
+                        trailing_trigger_r=exit_state.get("trailing_trigger_r", 2.0),
+                        protective_stop=exit_state.get("protective_stop", position.stop_price))
+            exit_state["max_hold_waiver_logged"] = True
+        if max_hold_hours is None or max_hold_hours <= 0 or held_hours < max_hold_hours:
             return False
-        if self._close(current_price, now, "max_hold_24h"):
+        reason = "max_hold_runner" if exit_state.get("trailing_started") else "max_hold_24h"
+        if self._close(current_price, now, reason):
             self.account.last_processed_close = pd.Timestamp(now).floor("h").isoformat()
             logger.warning("MAX_HOLD_EXIT symbol={} held_hours={} limit_hours={}",
                            self.account.symbol, round(held_hours, 3), max_hold_hours)

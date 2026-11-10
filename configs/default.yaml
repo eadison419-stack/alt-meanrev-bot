@@ -104,8 +104,6 @@ exits:
   no_progress_min_atr: 0.4
   no_progress_action: close
   max_hold_bars: 24
-  exempt_max_hold_after_tp1: true
-  require_breakeven_for_exempt: true
   runner_max_hold_bars: 0
   startup_stale_exit: true
 
@@ -153,6 +151,7 @@ lead_risk:
   max_leverage: 10
   max_symbol_notional_pct: 0.60
   max_portfolio_stop_risk_pct: 0.04
+  giveback_risk_weight: 0.15
   daily_drawdown_halt_pct: 0.10
   liquidation_stop_distance_multiple: 2.0
   min_stop_liquidation_gap_pct: 0.01

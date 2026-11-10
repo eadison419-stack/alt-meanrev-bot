@@ -139,7 +139,11 @@ def test_replay_account_uses_mark_to_active_stop_and_actual_funding_sign():
     state.exchange_snapshot = execution.sync_snapshot()
     state.protective_stop_audit = {"status": "verified", "position_count": 1, "mismatch_count": 0}
     exposure = lead_entry_exposure(state, settings, now)
-    assert exposure.long_notional == 150 and exposure.stop_risk == pytest.approx(55.19)
+    assert exposure.long_notional == 150
+    assert exposure.capital_risk == pytest.approx(5.39)
+    assert exposure.giveback_risk == pytest.approx(50.0)
+    assert exposure.weighted_giveback_risk == pytest.approx(7.5)
+    assert exposure.stop_risk == pytest.approx(12.89)
     assert execution.funding_fee(symbol, opened, now) == pytest.approx(-.0105)
     assert profile_bars(public.frames[symbol]["contract_1h"], 3600000)["valid"]
 

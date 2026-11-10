@@ -1014,11 +1014,13 @@ def test_existing_protective_stop_has_priority_over_time_exit():
     [
         ({"tp1_taken": False, "breakeven_moved": False, "protective_stop": 95.0}, True),
         ({"tp1_taken": True, "breakeven_moved": False, "protective_stop": 95.0}, True),
-        ({"tp1_taken": True, "breakeven_moved": True, "protective_stop": 100.0}, False),
-        ({"tp1_taken": True, "breakeven_moved": True, "protective_stop": 101.0}, False),
+        ({"tp1_taken": True, "breakeven_moved": True, "protective_stop": 100.0}, True),
+        ({"tp1_taken": True, "breakeven_moved": True, "protective_stop": 101.0}, True),
+        ({"trailing_started": True, "trailing_trigger_r": 2.0,
+          "protective_stop": 101.0}, False),
     ],
 )
-def test_max_hold_applies_only_to_non_runner_or_unprotected_tp1_tail(
+def test_max_hold_exempts_only_persisted_2r_trailing_positions(
     monkeypatch, exit_state, expected_close,
 ):
     settings = load_settings(env_file=None)
@@ -1038,7 +1040,7 @@ def test_max_hold_applies_only_to_non_runner_or_unprotected_tp1_tail(
     assert close_calls == (["max_hold_24h"] if expected_close else [])
 
 
-def test_tp1_break_even_runner_has_no_runner_time_limit():
+def test_2r_trailing_runner_has_no_runner_time_limit():
     settings = load_settings(env_file=None)
     opened_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     account = PaperAccount(symbol="ADA/USDT:USDT")
@@ -1046,8 +1048,8 @@ def test_tp1_break_even_runner_has_no_runner_time_limit():
                         opened_at, "entry", Regime.LOW.value)
     account.portfolio.positions[account.symbol] = position
     account.active_exit = {
-        "tp1_taken": True, "breakeven_moved": True,
-        "protective_stop": 100.0, "no_progress_count": 4,
+        "trailing_started": True, "trailing_trigger_r": 2.0,
+        "protective_stop": 102.0, "no_progress_count": 4,
     }
     trader = PaperTrader(account, settings)
 

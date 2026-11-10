@@ -115,7 +115,7 @@ def test_initial_entry_zero_quantity_persists_xmr_like_risk_reason(settings, mon
     state = _state()
     old = "OLD/USDT:USDT"
     state.portfolio.positions[old] = Position(old, Side.LONG, 1, 100, 90, NOW, "test", "MID")
-    state.exchange_snapshot["positions"][old] = {"side": "long", "quantity": 1, "mark_price": 150}
+    state.exchange_snapshot["positions"][old] = {"side": "long", "quantity": 1, "mark_price": 400}
     state.exchange_orders_by_symbol[old] = {"stop": {"id": "stop", "amount": 1, "stop_price": 95}}
     state.protective_stop_audit["position_count"] = 1
     monkeypatch.setattr(runner, "_utc_now", lambda: NOW)
@@ -131,7 +131,9 @@ def test_initial_entry_zero_quantity_persists_xmr_like_risk_reason(settings, mon
     event = state.events[-1]
     assert event["event"] == "entry_risk_rejected" and event["phase"] == "quantity"
     assert event["reason"] == "portfolio_stop_risk_limit"
-    assert event["details"]["existing_portfolio_stop_risk"] > 55
+    assert event["details"]["existing_portfolio_stop_risk"] > 40
+    assert event["details"]["existing_portfolio_giveback_risk"] == pytest.approx(300)
+    assert event["details"]["portfolio_giveback_risk_weight"] == pytest.approx(.15)
     assert event["details"]["max_portfolio_stop_risk"] == 40
 
 
@@ -166,8 +168,28 @@ def test_mark_to_active_stop_risk_includes_adopted_profit_positions_without_offs
     _add_position(state, "B", Side.SHORT, 80, 85)
     exposure = lead_entry_exposure(state, settings, NOW)
     assert exposure.long_notional == 120 and exposure.short_notional == 80
-    assert exposure.stop_risk == pytest.approx(15.39)
+    assert exposure.capital_risk == pytest.approx(0.79)
+    assert exposure.giveback_risk == pytest.approx(15.0)
+    assert exposure.weighted_giveback_risk == pytest.approx(2.25)
+    assert exposure.stop_risk == pytest.approx(3.04)
     assert state.portfolio.positions["A"].stop_price == 90
+
+
+@pytest.mark.parametrize("side,mark,stop", [
+    (Side.LONG, 98, 95),
+    (Side.SHORT, 102, 105),
+])
+def test_lead_capital_risk_keeps_loss_from_entry_while_giveback_is_zero(settings, side, mark, stop):
+    state = _state()
+    _add_position(state, "A", side, mark, stop)
+    exposure = lead_entry_exposure(state, settings, NOW)
+    expected = abs(100 - stop) + (100 + stop) * (
+        settings.fees.taker_bps / 10_000 + settings.risk.max_slippage_pct
+    )
+    assert exposure.capital_risk == pytest.approx(expected)
+    assert exposure.giveback_risk == 0
+    assert exposure.weighted_giveback_risk == 0
+    assert exposure.stop_risk == pytest.approx(expected)
 
 
 @pytest.mark.parametrize("fault", ["missing_mark", "stop_crossed", "stale", "pending", "unverified", "foreign"])

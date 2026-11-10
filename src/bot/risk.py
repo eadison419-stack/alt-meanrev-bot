@@ -63,16 +63,30 @@ class RiskDecision:
 
 @dataclass(frozen=True)
 class EntryExposure:
-    """Fresh marked exposure and remaining loss to verified active stops."""
+    """Fresh marked exposure and its effective portfolio stop-risk components."""
 
     long_notional: float
     short_notional: float
     stop_risk: float
+    capital_risk: float | None = None
+    giveback_risk: float = 0.0
+    weighted_giveback_risk: float | None = None
 
     def __post_init__(self):
+        capital_risk = self.stop_risk if self.capital_risk is None else self.capital_risk
+        weighted_giveback_risk = (
+            max(0.0, self.stop_risk - capital_risk)
+            if self.weighted_giveback_risk is None else self.weighted_giveback_risk
+        )
         if any(not math.isfinite(v) or v < 0 for v in (
-                self.long_notional, self.short_notional, self.stop_risk)):
+                self.long_notional, self.short_notional, self.stop_risk,
+                capital_risk, self.giveback_risk, weighted_giveback_risk)):
             raise ValueError("entry exposure must be finite and non-negative")
+        if not math.isclose(self.stop_risk, capital_risk + weighted_giveback_risk,
+                            rel_tol=1e-9, abs_tol=1e-8):
+            raise ValueError("entry exposure risk components do not match stop risk")
+        object.__setattr__(self, "capital_risk", capital_risk)
+        object.__setattr__(self, "weighted_giveback_risk", weighted_giveback_risk)
 
     @property
     def gross_notional(self):
@@ -213,6 +227,10 @@ def calculate_order_quantity(
             risk_budget = min(risk_budget, max(Decimal(0), Decimal(str(equity))
                 * Decimal(str(portfolio_risk_cap_pct)) - Decimal(str(exposure.stop_risk))))
             record(existing_portfolio_stop_risk=exposure.stop_risk,
+                   existing_portfolio_capital_risk=exposure.capital_risk,
+                   existing_portfolio_giveback_risk=exposure.giveback_risk,
+                   existing_portfolio_weighted_giveback_risk=exposure.weighted_giveback_risk,
+                   portfolio_giveback_risk_weight=settings.lead_risk.giveback_risk_weight,
                    max_portfolio_stop_risk=equity * portfolio_risk_cap_pct,
                    remaining_portfolio_stop_risk=max(0.0, equity * portfolio_risk_cap_pct - exposure.stop_risk),
                    existing_directional_notional=current_directional,
@@ -364,6 +382,10 @@ def assess_entry(
         if exposure.stop_risk + estimated_risk > equity * portfolio_risk_cap_pct + 1e-10:
             return RiskDecision(False, "portfolio_stop_risk_cap", details={
                 "existing_stop_risk": exposure.stop_risk, "new_stop_risk": estimated_risk,
+                "existing_capital_risk": exposure.capital_risk,
+                "existing_giveback_risk": exposure.giveback_risk,
+                "existing_weighted_giveback_risk": exposure.weighted_giveback_risk,
+                "giveback_risk_weight": settings.lead_risk.giveback_risk_weight,
                 "max_risk": equity * portfolio_risk_cap_pct,
             })
     gross_cap_pct = settings.sizing.max_gross_notional_pct * risk_multiplier

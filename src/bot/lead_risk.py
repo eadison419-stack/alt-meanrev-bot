@@ -47,7 +47,8 @@ def lead_entry_exposure(state, settings, now):
             or audit.get("position_count") != len(live)):
         raise ValueError("lead_risk_stops_unverified")
     notionals = {Side.LONG: 0.0, Side.SHORT: 0.0}
-    stop_risk = 0.0
+    capital_risk = 0.0
+    giveback_risk = 0.0
     cost = settings.fees.taker_bps / 10_000 + settings.risk.max_slippage_pct
     for symbol, position in state.portfolio.positions.items():
         row = live[symbol]
@@ -65,9 +66,20 @@ def lead_entry_exposure(state, settings, now):
         if distance <= 0:
             raise ValueError("lead_risk_stop_crossed")
         notionals[position.side] += quantity * mark
-        # Existing entry costs are sunk. Profits from another position cannot offset risk.
-        stop_risk += quantity * (distance + stop_price * cost)
-    return EntryExposure(notionals[Side.LONG], notionals[Side.SHORT], stop_risk)
+        entry = _positive(position.entry_price)
+        principal_distance = max(0.0, direction * (entry - stop_price))
+        # Principal risk stays anchored to entry; floating profit only contributes
+        # the amount that could be given back before reaching entry or the stop.
+        capital_risk += quantity * (principal_distance + (entry + stop_price) * cost)
+        giveback_per_unit = (max(0.0, mark - max(entry, stop_price))
+                             if position.side is Side.LONG
+                             else max(0.0, min(entry, stop_price) - mark))
+        giveback_risk += quantity * giveback_per_unit
+    weighted_giveback_risk = giveback_risk * settings.lead_risk.giveback_risk_weight
+    stop_risk = capital_risk + weighted_giveback_risk
+    return EntryExposure(notionals[Side.LONG], notionals[Side.SHORT], stop_risk,
+                         capital_risk=capital_risk, giveback_risk=giveback_risk,
+                         weighted_giveback_risk=weighted_giveback_risk)
 
 
 def parse_brackets(response, market_id):

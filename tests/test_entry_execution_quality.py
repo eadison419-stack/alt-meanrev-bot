@@ -103,7 +103,10 @@ def test_lead_quote_guard_refreshes_account_and_uses_active_stops(monkeypatch):
     monkeypatch.setattr(runner, "_audit_demo_protective_stops", lambda *args: calls.append("stops") or True)
     refreshed, stop = guard(intent, intent.stop_price)
     assert calls == ["account", "stops"]
-    assert audit["existing_portfolio_stop_risk"] == pytest.approx(29.9804)
+    assert audit["existing_portfolio_capital_risk"] == pytest.approx(10.1804)
+    assert audit["existing_portfolio_giveback_risk"] == pytest.approx(20.0)
+    assert audit["existing_portfolio_weighted_giveback_risk"] == pytest.approx(3.0)
+    assert audit["existing_portfolio_stop_risk"] == pytest.approx(13.1804)
     assert audit["existing_portfolio_stop_risk"] + audit["new_planned_risk"] <= 40
     assert refreshed.notional <= 600 and stop == 96.6
     assert state.portfolio.positions["OLD"].stop_price == 90
@@ -114,7 +117,7 @@ def test_final_preflight_rejection_keeps_risk_budgets_and_client_identity(monkey
     state.execution_mode = "lead_usdm"
     state.execution_status = "synchronized"
     state.exchange_snapshot = {"at": NOW.isoformat(), "equity": 1000, "positions": {
-        "OLD": {"side": "long", "quantity": 1, "mark_price": 150}}}
+        "OLD": {"side": "long", "quantity": 1, "mark_price": 400}}}
     state.portfolio.positions["OLD"] = Position("OLD", Side.LONG, 1, 100, 90, NOW, "old", "MID")
     state.exchange_orders_by_symbol["OLD"] = {"stop": {"id": "s", "amount": 1, "stop_price": 95}}
     state.protective_stop_audit = {"status": "verified", "mismatch_count": 0, "position_count": 1}
@@ -127,7 +130,7 @@ def test_final_preflight_rejection_keeps_risk_budgets_and_client_identity(monkey
     assert event["event"] == "entry_preflight_decision" and event["decision"] == "BLOCK"
     assert event["clientOrderId"] == "mrb_same_attempt"
     assert event["planned_quantity"] == 0 and event["planned_stop"] > 0
-    assert event["quantity_risk"]["existing_portfolio_stop_risk"] > 55
+    assert event["quantity_risk"]["existing_portfolio_stop_risk"] > 40
     assert event["quantity_risk"]["max_portfolio_stop_risk"] == 40
 
 
