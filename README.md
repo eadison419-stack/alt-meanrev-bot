@@ -167,3 +167,11 @@ Dashboard 使用独立账本和 8767 端口：
 ```
 
 省略 `--window` 运行计划内的全部场景，`--scenario` 可单独选择对应的成本方案。为每次输出指定新目录，保存输入摘要和 SHA256、逐笔交易、权益曲线和对账差额。快照来源为无凭据的生产公共接口，原有市场 SQLite 仅读取。该入口仅供离线研究。
+
+### 三期候选研究
+
+`scripts.research_phase3` 在相同的冻结快照上逐个运行日线历史前置、结构止损上限、ATR/IMPULSE 偏离、反转实体、到 EMA50 的风险空间和方向资金费假设。只做离线比较，不改生产配置。报告、适用边界和结果链接见 [STRATEGY_PHASE3_RESEARCH.md](STRATEGY_PHASE3_RESEARCH.md)。输出目录必须是新目录。
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.research_phase3 --snapshot data/research/public-20261110-v1 --plan data/research/audit-20261110-v1/evaluation_plan.json --output-dir data/research/phase3-next --hypotheses atr_deviation_0p8 impulse_counter_deviation_1p2 structure_stop_2p5 --windows validation test --include-cost-stress
+```

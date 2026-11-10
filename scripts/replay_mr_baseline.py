@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -22,10 +23,12 @@ from bot.backtest.research_data import (
     HOUR_MS, aggregate_closed_bars, digest_file, load_manifest, load_stream, profile_bars, utc,
     write_json_once,
 )
+from bot import risk as risk_module
 from bot.config import PROJECT_ROOT, load_settings
 from bot.data.klines import hot_activity_metrics, rank_hot_candidates
 from bot.exchange.clock import activate_clock, active_clock
 from bot.execution import EntryPreflightRejected
+from bot.indicators import atr
 from bot.lead_risk import settings_for_execution
 from bot.live.multi_paper import MultiPaperState
 from bot.market_risk import MarketRiskState, classify_market_risk
@@ -39,6 +42,36 @@ HOUR = pd.Timedelta(1, unit="h")
 FOUR_HOURS = pd.Timedelta(4, unit="h")
 RAW_SIGNAL_FLAGS = TimeFilterFlags(True, True, False, False)
 QUOTE_MODEL = "hour-boundary contract open; one tick per side; synthetic depth; configured fill slippage"
+
+
+@dataclass(frozen=True)
+class ResearchHypothesis:
+    name: str = "baseline"
+    prefilter_daily_history: bool = False
+    stop_hard_cap_atr: float | None = None
+    deviation_rule: str = "fixed_1pct"
+    reversal_body_midpoint: bool = False
+    minimum_ema_space_r: float = 0.0
+    funding_adverse_threshold: float | None = None
+
+
+HYPOTHESES = {
+    "baseline": ResearchHypothesis(),
+    "daily_history_prefilter": ResearchHypothesis(
+        name="daily_history_prefilter", prefilter_daily_history=True),
+    "structure_stop_2p5": ResearchHypothesis(
+        name="structure_stop_2p5", stop_hard_cap_atr=2.5),
+    "atr_deviation_0p8": ResearchHypothesis(
+        name="atr_deviation_0p8", deviation_rule="atr_0p8_floor_1pct"),
+    "impulse_counter_deviation_1p2": ResearchHypothesis(
+        name="impulse_counter_deviation_1p2", deviation_rule="impulse_counter_1p2_floor_2pct"),
+    "reversal_body_midpoint": ResearchHypothesis(
+        name="reversal_body_midpoint", reversal_body_midpoint=True),
+    "ema_space_1r": ResearchHypothesis(
+        name="ema_space_1r", minimum_ema_space_r=1.0),
+    "directional_funding_0p08": ResearchHypothesis(
+        name="directional_funding_0p08", funding_adverse_threshold=0.0008),
+}
 
 
 class ReplayClock:
@@ -258,8 +291,17 @@ class ReplayExecution:
         return updated
 
 
-def _rank(public, one, settings, at):
+def _daily_history_is_rankable(daily, at, span):
+    expected_close = at.floor("D")
+    closed_count = daily.index.searchsorted(expected_close - pd.Timedelta(1, unit="D"), side="right")
+    latest_closed = (daily.index[closed_count - 1] + pd.Timedelta(1, unit="D")
+                     if closed_count else None)
+    return closed_count >= span + 1 and latest_closed == expected_close
+
+
+def _rank(public, one, settings, at, *, prefilter_daily_history=False):
     candidates, tickers, activity = [], {}, {}
+    daily_history_rejected = 0
     excluded = {"BTCUSDT", "ETHUSDT", *settings.universe.exclude_symbols}
     for symbol, frame in one.items():
         market = public.markets[symbol]
@@ -273,6 +315,12 @@ def _rank(public, one, settings, at):
         quote = float(quote_volume[end - 24:end].sum())
         if quote < settings.universe.min_quote_volume_24h:
             continue
+        if prefilter_daily_history:
+            daily = public.frames[symbol]["daily"]
+            if not _daily_history_is_rankable(
+                    daily, at, settings.symbol_regime.ema_slow_bars):
+                daily_history_rejected += 1
+                continue
         candidates.append((symbol, quote))
         tickers[symbol] = {"quoteVolume": quote, "count": int(trade_count[end - 24:end].sum())}
         # Reuse the exact production activity score over the same 25 closed bars.
@@ -280,7 +328,11 @@ def _rank(public, one, settings, at):
         rows = [[now_ms - (25 - i) * HOUR_MS, *values]
                 for i, values in enumerate(prices[end - 25:end])]
         activity[symbol] = hot_activity_metrics(rows, now_ms=now_ms)
-    return rank_hot_candidates(candidates, tickers, activity, limit=20)
+    ranked = rank_hot_candidates(candidates, tickers, activity, limit=20)
+    return ranked, {"rankable_before_prefilter": len(candidates) + daily_history_rejected,
+                    "rankable_after_prefilter": len(candidates),
+                    "daily_history_rejected": daily_history_rejected,
+                    "top20_count": len(ranked)}
 
 
 class _ClosedRegimes(dict):
@@ -294,9 +346,76 @@ class _ClosedRegimes(dict):
         return super().get(symbol, default)
 
 
-def _has_raw_signal(candle, ema, settings):
-    return deviation_entry_signal_at_ema(ema, candle["open"], candle["close"], settings,
-        RAW_SIGNAL_FLAGS, deviation_pct=runner.DEV_PCT).action is Action.OPEN
+def _entry_deviation_thresholds(frame4, settings, regimes, symbol, hypothesis):
+    rule = hypothesis.deviation_rule
+    if rule == "fixed_1pct":
+        return {Side.LONG: runner.DEV_PCT, Side.SHORT: runner.DEV_PCT}
+    close = float(frame4["close"].iloc[-1])
+    atr_value = float(atr(frame4, settings.lookback.atr_len).iloc[-1])
+    if close <= 0 or not math.isfinite(atr_value) or atr_value <= 0:
+        return {Side.LONG: math.inf, Side.SHORT: math.inf}
+    atr_pct = atr_value / close
+    if rule == "atr_0p8_floor_1pct":
+        threshold = max(0.01, 0.8 * atr_pct)
+        return {Side.LONG: threshold, Side.SHORT: threshold}
+    if rule == "impulse_counter_1p2_floor_2pct":
+        threshold = max(0.02, 1.2 * atr_pct)
+        regimes_for_symbol = regimes.get(symbol)
+        current = (regimes_for_symbol.iloc[-1]["regime"]
+                   if regimes_for_symbol is not None and len(regimes_for_symbol) else None)
+        current = current.value if isinstance(current, Regime) else str(current)
+        return {
+            Side.LONG: threshold if current == Regime.IMPULSE_DOWN.value else runner.DEV_PCT,
+            Side.SHORT: threshold if current == Regime.IMPULSE_UP.value else runner.DEV_PCT,
+        }
+    raise ValueError(f"unknown entry deviation rule: {rule}")
+
+
+def _raw_signal_side(candle, ema, settings, thresholds=None):
+    thresholds = thresholds or {Side.LONG: runner.DEV_PCT, Side.SHORT: runner.DEV_PCT}
+    for side, allowed in ((Side.LONG, (True, False)), (Side.SHORT, (False, True))):
+        flags = TimeFilterFlags(allowed[0], allowed[1], False, False)
+        signal = deviation_entry_signal_at_ema(
+            ema, candle["open"], candle["close"], settings, flags,
+            deviation_pct=thresholds[side],
+        )
+        if signal.action is Action.OPEN:
+            return side
+    return None
+
+
+def _has_raw_signal(candle, ema, settings, thresholds=None):
+    return _raw_signal_side(candle, ema, settings, thresholds) is not None
+
+
+def _reversal_body_midpoint_pass(frame1, side):
+    if frame1 is None or len(frame1) < 2:
+        return False
+    previous = frame1.iloc[-2]
+    midpoint = (float(previous["open"]) + float(previous["close"])) / 2
+    current_close = float(frame1.iloc[-1]["close"])
+    return current_close > midpoint if side is Side.LONG else current_close < midpoint
+
+
+def _ema_space_r(side, close, stop, ema):
+    risk = abs(float(close) - float(stop))
+    if risk <= 0 or not all(math.isfinite(float(value)) for value in (close, stop, ema)):
+        return float("-inf")
+    direction = 1 if side is Side.LONG else -1
+    return direction * (float(ema) - float(close)) / risk
+
+
+def _funding_gate_for_side(rate, side, threshold):
+    if rate is None:
+        return "funding_rate_missing"
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError, OverflowError):
+        return "funding_rate_missing"
+    if not math.isfinite(rate):
+        return "funding_rate_missing"
+    adverse = rate >= threshold if side is Side.LONG else rate <= -threshold
+    return "funding_rate_blocked" if adverse else None
 
 
 def _with_entry_regime(candidate, regimes):
@@ -325,33 +444,46 @@ def _check_protective_stops(state, execution, public, one, clock, fee, slip, *, 
                                    "protective_stop_exchange_algo", clock.now(), fee, slip)
 
 
-def replay(frames, metadata, settings, *, start, end, initial_equity=1000, mode="lead_usdm", progress=print):
+def replay(frames, metadata, settings, *, start, end, initial_equity=1000, mode="lead_usdm",
+           hypothesis="baseline", progress=print):
     """The timing and fills are modeled; all strategy decisions call the Runner."""
     start, end = utc(start), utc(end)
     if end <= start or start != start.floor("h") or end != end.floor("h"):
         raise ValueError("ordered hourly replay bounds are required")
+    if hypothesis not in HYPOTHESES:
+        raise ValueError(f"unknown research hypothesis: {hypothesis}")
+    variant = HYPOTHESES[hypothesis]
     clock = ReplayClock(start)
     clock.window_end = end
     previous_clock = active_clock()
     activate_clock(clock)
     try:
-        return _replay(frames, metadata, settings, start, end, initial_equity, mode, clock, progress)
+        return _replay(frames, metadata, settings, start, end, initial_equity, mode, clock,
+                       progress, variant)
     finally:
         activate_clock(previous_clock)
 
 
-def _replay(frames, metadata, settings, start, end, initial_equity, mode, clock, progress):
+def _replay(frames, metadata, settings, start, end, initial_equity, mode, clock, progress, hypothesis):
     state = MultiPaperState(initial_equity=initial_equity, cash=initial_equity,
                             execution_mode=mode, execution_status="synchronized")
     public = ReplayPublic(frames, metadata, clock)
     execution = ReplayExecution(public, state, settings, initial_equity)
     settings = settings_for_execution(settings, mode)
+    if hypothesis.stop_hard_cap_atr is not None:
+        settings = settings.model_copy(update={"stops": settings.stops.model_copy(update={
+            "hard_cap_atr": hypothesis.stop_hard_cap_atr,
+        })})
+    if hypothesis.funding_adverse_threshold is not None:
+        settings = settings.model_copy(update={"risk": settings.risk.model_copy(update={
+            "funding_abs_block": hypothesis.funding_adverse_threshold,
+        })})
     execution.settings = settings
     fee, slip = settings.fees.taker_bps / 10000, settings.fees.slippage_bps / 10000
     cache = runner.ClosedMarketCache()
     regimes, four_key = {}, None
     reentry_events, event_cursor = [], 0
-    equity, risk_states = {}, Counter()
+    equity, risk_states, ranking_stats, research_filter_rejections = {}, Counter(), Counter(), Counter()
     symbols = sorted(frames)
     for number, at in enumerate(pd.date_range(start, end, freq="h")):
         clock.at = at + pd.Timedelta(1, unit="s") if at < end else at
@@ -379,7 +511,9 @@ def _replay(frames, metadata, settings, start, end, initial_equity, mode, clock,
         runner._manage_demo_positions(public, execution, state, settings, clock.now(), fee, slip)
         runner._evaluate_exits(state, execution, True, one, regimes, settings, fee, slip, clock.now())
         runner._manage_demo_positions(public, execution, state, settings, clock.now(), fee, slip)
-        hotlist = _rank(public, one, settings, at)
+        hotlist, rank_stats = _rank(public, one, settings, at,
+                                    prefilter_daily_history=hypothesis.prefilter_daily_history)
+        ranking_stats.update(rank_stats)
         state.watchlist = [{**row, "rank": i + 1} for i, row in enumerate(hotlist)]
         risk_states[market_risk.state.value] += 1
         # Only this small subset is required to reconstruct the entry loss lock.
@@ -390,23 +524,57 @@ def _replay(frames, metadata, settings, start, end, initial_equity, mode, clock,
         reentry = runner._structure_reentry_states(reentry_events, symbols)
         if market_risk.state is not MarketRiskState.PAUSE_NEW:
             candidates = []
+            candidate_thresholds = {}
             for row in hotlist:
                 symbol = row["symbol"]
                 if symbol in state.portfolio.positions:
                     continue
-                if not _has_raw_signal(one[symbol].iloc[-1], ema[symbol], settings):
+                thresholds = _entry_deviation_thresholds(four[symbol], settings, regimes,
+                                                          symbol, hypothesis)
+                if not _has_raw_signal(one[symbol].iloc[-1], ema[symbol], settings, thresholds):
                     # Runner checks breakout confirmations even when there is no new signal.
                     if any(reentry[(symbol, side)][2] for side in (Side.LONG, Side.SHORT)):
                         runner._record_structure_reentry_confirmations(state, symbol, one[symbol], clock.now(), reentry)
                     continue
-                candidate = runner._entry_candidate(public, state, True, symbol, one, four,
-                    {}, settings, clock.now(), reentry, closed_market_cache=cache)
+                raw_side = _raw_signal_side(one[symbol].iloc[-1], ema[symbol], settings, thresholds)
+                if raw_side is None:
+                    continue
+                if (hypothesis.reversal_body_midpoint
+                        and not _reversal_body_midpoint_pass(one[symbol], raw_side)):
+                    research_filter_rejections["reversal_body_midpoint"] += 1
+                    continue
+                previous_deviation = runner.DEV_PCT
+                runner.DEV_PCT = thresholds[raw_side]
+                try:
+                    candidate = runner._entry_candidate(public, state, True, symbol, one, four,
+                        {}, settings, clock.now(), reentry, closed_market_cache=cache)
+                finally:
+                    runner.DEV_PCT = previous_deviation
                 if candidate is not None:
+                    if _ema_space_r(raw_side, candidate[3], candidate[4], ema[symbol]) < hypothesis.minimum_ema_space_r:
+                        research_filter_rejections["ema_space_below_minimum"] += 1
+                        continue
                     candidates.append(_with_entry_regime(candidate, regimes))
+                    candidate_thresholds[symbol] = thresholds[candidate[2]]
             for candidate in sorted(candidates, key=lambda row: -row[1]):
-                runner._submit_entry_candidate(public, state, execution, True, public.markets,
-                    (*candidate, None), settings, settings.sizing.max_symbols, fee, slip,
-                    clock.now(), market_risk)
+                previous_deviation = runner.DEV_PCT
+                runner.DEV_PCT = candidate_thresholds[candidate[0]]
+                previous_runner_funding_gate = runner.funding_rate_rejection_reason
+                previous_risk_funding_gate = risk_module.funding_rate_rejection_reason
+                if hypothesis.funding_adverse_threshold is not None:
+                    side = candidate[2]
+                    threshold = hypothesis.funding_adverse_threshold
+                    gate = lambda rate, _settings: _funding_gate_for_side(rate, side, threshold)
+                    runner.funding_rate_rejection_reason = gate
+                    risk_module.funding_rate_rejection_reason = gate
+                try:
+                    runner._submit_entry_candidate(public, state, execution, True, public.markets,
+                        (*candidate, None), settings, settings.sizing.max_symbols, fee, slip,
+                        clock.now(), market_risk)
+                finally:
+                    runner.DEV_PCT = previous_deviation
+                    runner.funding_rate_rejection_reason = previous_runner_funding_gate
+                    risk_module.funding_rate_rejection_reason = previous_risk_funding_gate
         state.exchange_snapshot = execution.sync_snapshot()
         equity[at] = state.current_equity
         if number % 240 == 0:
@@ -434,7 +602,17 @@ def _replay(frames, metadata, settings, start, end, initial_equity, mode, clock,
     residual = state.current_equity - initial_equity - sum(trade.net_pnl for trade in trades)
     if not math.isclose(residual, 0, abs_tol=1e-7):
         raise ValueError("research wallet and trade PnL do not reconcile")
-    return {"metrics": metrics, "reconciliation_residual": residual,
+    return {"hypothesis": hypothesis.name, "hypothesis_parameters": {
+                "prefilter_daily_history": hypothesis.prefilter_daily_history,
+                "stop_hard_cap_atr": hypothesis.stop_hard_cap_atr,
+                "deviation_rule": hypothesis.deviation_rule,
+                "reversal_body_midpoint": hypothesis.reversal_body_midpoint,
+                "minimum_ema_space_r": hypothesis.minimum_ema_space_r,
+                "funding_adverse_threshold": hypothesis.funding_adverse_threshold,
+            },
+            "ranking_metrics": dict(ranking_stats),
+            "research_filter_rejections": dict(research_filter_rejections),
+            "metrics": metrics, "reconciliation_residual": residual,
             "quote_model": QUOTE_MODEL, "fixed_leverage_model": 3,
             "market_risk_hours": dict(risk_states),
             "rejections": dict(Counter(e.get("reason") for e in state.events
@@ -462,6 +640,8 @@ def main():
                         help="run one of the already frozen windows")
     parser.add_argument("--scenario", choices=["baseline", "fee_1p5_slip_2", "fee_2_slip_3"],
                         help="run one planned cost scenario in the selected window")
+    parser.add_argument("--hypothesis", choices=sorted(HYPOTHESES), default="baseline",
+                        help="run one explicitly defined offline research variant")
     args = parser.parse_args()
     manifest = load_manifest(args.snapshot)
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
@@ -503,7 +683,7 @@ def main():
         "plan_sha256": digest_file(args.plan), "manifest_sha256": digest_file(args.snapshot / "manifest.json"),
         "source_sha256": {name: digest_file(PROJECT_ROOT / name) for name in sources},
         "initial_equity": args.initial_equity, "mode": args.mode, "jobs": jobs,
-        "promotion_allowed": False, "quote_model": QUOTE_MODEL,
+        "hypothesis": args.hypothesis, "promotion_allowed": False, "quote_model": QUOTE_MODEL,
     })
     logger.remove()
     logger.add(lambda message: None, level="CRITICAL")
@@ -517,6 +697,7 @@ def main():
         print("starting " + label, flush=True)
         result = replay(frames, metadata, configured, start=window["start"], end=window["end_exclusive"],
             initial_equity=args.initial_equity, mode=args.mode,
+            hypothesis=args.hypothesis,
             progress=lambda message: print(message, flush=True))
         write_json_once(args.output_dir / (label + ".json"), result)
         summaries.append({"window": window, "scenario": scenario,
