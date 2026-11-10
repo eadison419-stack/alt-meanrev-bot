@@ -87,4 +87,3 @@ def test_directional_funding_gate_blocks_only_adverse_extreme_rates():
     assert _funding_gate_for_side(-0.004, Side.LONG, threshold) is None
     assert _funding_gate_for_side(0.004, Side.SHORT, threshold) is None
     assert _funding_gate_for_side(float("nan"), Side.LONG, threshold) == "funding_rate_missing"
-
