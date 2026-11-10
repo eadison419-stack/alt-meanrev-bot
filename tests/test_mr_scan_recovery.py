@@ -505,19 +505,23 @@ def test_confirmed_zero_fill_rejection_is_terminal(recovery_env, tmp_path):
     assert not state.portfolio.positions
 
 
-def test_pending_symbol_does_not_disable_management_of_known_positions(recovery_env):
+def test_pending_symbol_does_not_disable_management_of_known_positions(recovery_env, monkeypatch):
     state, client, service = recovery_env
     from bot.portfolio import Position
     state.portfolio.positions[SECOND] = Position(SECOND, Side.LONG, 1, 100, 96, NOW, "test", "MID")
     state.exchange_orders_by_symbol[SECOND] = {"stop": {"id": "known-stop", "stop_price": 96}}
-    service.sync_snapshot = lambda: {"at": NOW.isoformat(), "positions": {FIRST: client.live, SECOND: client.live}}
+    monkeypatch.setattr(runner, "_utc_now", lambda: NOW)
+    service.sync_snapshot = lambda: {"at": NOW.isoformat(), "equity": 10000,
+                                     "positions": {FIRST: client.live, SECOND: client.live}}
     service.cancel_orphaned_bot_stops = lambda *a: pytest.fail("unresolved protective stops cleaned up")
     assert runner._demo_sync_stopped(service, state, NOW)
     assert state.execution_status == "synchronized"
     assert mr_scan.unresolved_attempts(state)  # Separate new-entry gate remains closed.
     # An unrelated foreign position still stops account synchronization.
-    service.sync_snapshot = lambda: {"positions": {FIRST: client.live, SECOND: client.live, "FOREIGN": client.live}}
+    service.sync_snapshot = lambda: {"at": NOW.isoformat(), "equity": 10000,
+                                     "positions": {FIRST: client.live, SECOND: client.live, "FOREIGN": client.live}}
     assert not runner._demo_sync_stopped(service, state, NOW)
+    assert state.inconsistencies == ["exchange and local position symbols differ"]
 
 
 def test_old_ledgers_load_without_scan_fields_and_preserve_exit_progress():

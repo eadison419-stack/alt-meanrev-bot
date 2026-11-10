@@ -17,6 +17,7 @@ from bot.regime import Regime
 from bot.risk import (EntryExposure, OrderIntent, assess_entry, calculate_adaptive_stop,
                       calculate_order_quantity)
 from bot.signals import Action, Side
+from bot.time_filter import TimeFilterFlags
 from scripts import run_mr_candidate_paper as runner
 
 
@@ -87,6 +88,51 @@ def test_risk_recheck_rejects_excess_combined_loss(settings):
         exposure=EntryExposure(0, 0, 30), portfolio_risk_cap_pct=0.04,
         per_symbol_notional_usdt=600)
     assert result.reason == "portfolio_stop_risk_cap"
+
+
+@pytest.mark.parametrize("exposure,step,minimum,reason", [
+    (EntryExposure(0, 0, 55), .1, .1, "portfolio_stop_risk_limit"),
+    (EntryExposure(900, 0, 0), .1, .1, "directional_notional_limit"),
+    (EntryExposure(900, 900, 0), .1, .1, "gross_notional_limit"),
+    (EntryExposure(0, 0, 0), 10, 0, "quantity_step_limit"),
+    (EntryExposure(0, 0, 0), .1, 10, "minimum_order_quantity"),
+    (EntryExposure(0, 0, 30), .1, .1, None),
+])
+def test_quantity_audit_explains_limits_without_changing_result(settings, exposure, step, minimum, reason):
+    kwargs = dict(step_size=step, minimum_quantity=minimum, stop_price=98, side=Side.LONG,
+                  target_notional_usdt=600, exposure=exposure, portfolio_risk_cap_pct=.04)
+    audit = {}
+    before = calculate_order_quantity(1000, 100, PortfolioState(), settings, **kwargs)
+    after = calculate_order_quantity(1000, 100, PortfolioState(), settings, audit=audit, **kwargs)
+    assert after == before
+    assert audit["reason"] == reason
+    assert audit["existing_portfolio_stop_risk"] == exposure.stop_risk
+    assert audit["max_portfolio_stop_risk"] == 40
+    assert audit["remaining_portfolio_stop_risk"] == max(0, 40 - exposure.stop_risk)
+
+
+def test_initial_entry_zero_quantity_persists_xmr_like_risk_reason(settings, monkeypatch):
+    state = _state()
+    old = "OLD/USDT:USDT"
+    state.portfolio.positions[old] = Position(old, Side.LONG, 1, 100, 90, NOW, "test", "MID")
+    state.exchange_snapshot["positions"][old] = {"side": "long", "quantity": 1, "mark_price": 150}
+    state.exchange_orders_by_symbol[old] = {"stop": {"id": "stop", "amount": 1, "stop_price": 95}}
+    state.protective_stop_audit["position_count"] = 1
+    monkeypatch.setattr(runner, "_utc_now", lambda: NOW)
+    context = EntrySignalContext(SYMBOL, Side.LONG, NOW, NOW, NOW, 98, 99, 101, 1, 97, 103)
+    candidate = (SYMBOL, .02, Side.LONG, 99, 97, 1, 97, 103, "MID", "test", None,
+                 context, TimeFilterFlags(True, True, False, False), 0)
+    execution = SimpleNamespace(lead_market_ids={"TESTUSDT"})
+    public = SimpleNamespace(fetch_funding_rate=lambda _: {"fundingRate": 0})
+    assert runner._submit_entry_candidate(public, state, execution, True,
+        {SYMBOL: {"id": "TESTUSDT", "precision": {"amount": .1}}}, candidate,
+        settings, 5, 0, 0, NOW, MarketRiskAssessment(MarketRiskState.NORMAL, "normal", NOW,
+                                                   "BTC/USDT:USDT", "4h", {})) is None
+    event = state.events[-1]
+    assert event["event"] == "entry_risk_rejected" and event["phase"] == "quantity"
+    assert event["reason"] == "portfolio_stop_risk_limit"
+    assert event["details"]["existing_portfolio_stop_risk"] > 55
+    assert event["details"]["max_portfolio_stop_risk"] == 40
 
 
 def test_daily_threshold_preserves_baseline_and_existing_latch(settings):

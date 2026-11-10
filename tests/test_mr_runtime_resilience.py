@@ -107,13 +107,15 @@ def _mock_main(monkeypatch, tmp_path, state):
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(runner, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(runner, "load_settings", lambda: settings)
-    client = SimpleNamespace(close=lambda: None)
+    client = SimpleNamespace(close=lambda: None,
+                             configure_close_recovery=lambda orders, checkpoint: None)
     monkeypatch.setattr(runner.ccxt, "binanceusdm", lambda *a: client)
     monkeypatch.setattr(runner, "configure_system_proxy", lambda *a: None)
     monkeypatch.setattr(runner, "create_demo_usdm", lambda *a: client)
     monkeypatch.setattr(runner, "DemoExecutionService", lambda *a: client)
     monkeypatch.setattr(runner.MultiPaperState, "load", lambda *a, **kw: state)
-    monkeypatch.setattr(runner, "_initialize_demo", lambda *a: {"equity": 5000})
+    monkeypatch.setattr(runner, "_initialize_demo", lambda *a:
+                        {"at": runner._utc_now().isoformat(), "equity": 5000, "positions": {}})
     monkeypatch.setattr(runner, "_initialize_exchange_clock", lambda *a: None)
     monkeypatch.setattr(runner, "_reconcile_pending_entries", lambda *a: True)
     monkeypatch.setattr(runner, "_demo_sync_stopped", lambda *a: True)

@@ -154,6 +154,7 @@ def calculate_order_quantity(
     exposure: EntryExposure | None = None,
     side: Side | None = None,
     portfolio_risk_cap_pct: float | None = None,
+    audit: dict | None = None,
 ) -> float:
     """Size to target margin, then cap quantity by stop risk when a stop is supplied."""
     values = (equity, mark_price, step_size, minimum_quantity, size_multiplier)
@@ -180,7 +181,15 @@ def calculate_order_quantity(
     gross_cap = Decimal(str(equity)) * Decimal(str(cap_pct))
     current_gross = Decimal(str(exposure.gross_notional if exposure else portfolio.gross_notional))
     remaining_gross = max(Decimal(0), gross_cap - current_gross)
+    def record(reason=None, **details):
+        if audit is not None:
+            audit.update(reason=reason, **details)
+    record(equity=equity, price=mark_price, stop_price=stop_price,
+           target_notional=float(target_notional), existing_gross_notional=float(current_gross),
+           max_gross_notional=float(gross_cap), remaining_gross_notional=float(remaining_gross),
+           step_size=step_size, minimum_quantity=minimum_quantity, planned_quantity=0.0)
     if stop_price is None and remaining_gross < target_notional:
+        record("gross_notional_limit")
         return 0.0
     raw_quantity = target_notional / Decimal(str(mark_price))
     if stop_price is not None:
@@ -191,6 +200,7 @@ def calculate_order_quantity(
         risk_per_unit = (abs(Decimal(str(mark_price)) - Decimal(str(stop_price)))
                          + (Decimal(str(mark_price)) + Decimal(str(stop_price))) * cost_rate)
         risk_budget = Decimal(str(equity)) * Decimal(str(settings.risk.max_single_trade_risk_pct))
+        record(single_trade_risk_budget=float(risk_budget), risk_per_unit=float(risk_per_unit))
         if exposure is not None:
             if side is None or portfolio_risk_cap_pct is None:
                 raise ValueError("marked exposure requires a side and portfolio risk cap")
@@ -202,16 +212,28 @@ def calculate_order_quantity(
             raw_quantity = min(raw_quantity, directional_remaining / Decimal(str(mark_price)))
             risk_budget = min(risk_budget, max(Decimal(0), Decimal(str(equity))
                 * Decimal(str(portfolio_risk_cap_pct)) - Decimal(str(exposure.stop_risk))))
+            record(existing_portfolio_stop_risk=exposure.stop_risk,
+                   max_portfolio_stop_risk=equity * portfolio_risk_cap_pct,
+                   remaining_portfolio_stop_risk=max(0.0, equity * portfolio_risk_cap_pct - exposure.stop_risk),
+                   existing_directional_notional=current_directional,
+                   remaining_directional_notional=float(directional_remaining))
+        record(effective_risk_budget=float(risk_budget))
         if risk_per_unit <= 0 or risk_budget <= 0:
+            record("portfolio_stop_risk_limit" if exposure is not None and risk_budget <= 0
+                   else "single_trade_risk_limit")
             return 0.0
         raw_quantity = min(raw_quantity, risk_budget / risk_per_unit)
         raw_quantity = min(raw_quantity, remaining_gross / Decimal(str(mark_price)))
         if raw_quantity <= 0:
+            record("gross_notional_limit" if remaining_gross <= 0 else "directional_notional_limit")
             return 0.0
     step = Decimal(str(step_size))
     quantity = (raw_quantity / step).to_integral_value(rounding=ROUND_FLOOR) * step
     if quantity < Decimal(str(minimum_quantity)):
+        record("minimum_order_quantity", unrounded_quantity=float(raw_quantity))
         return 0.0
+    record("quantity_step_limit" if quantity <= 0 else None,
+           planned_quantity=float(quantity), unrounded_quantity=float(raw_quantity))
     return float(quantity)
 
 

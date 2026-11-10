@@ -64,6 +64,17 @@ class DemoExecutionService:
         self.lead_market_ids: set[str] = set()
         self.auto_one_way = auto_one_way
         self._last_fill_audit_at = 0.0
+        self._close_orders = {}
+        self._close_checkpoint = None
+
+    def configure_close_recovery(self, orders_by_symbol, checkpoint):
+        """Use the runner's existing durable order ledger for uncertain closes."""
+        self._close_orders = orders_by_symbol
+        self._close_checkpoint = checkpoint
+
+    def _save_close_attempt(self):
+        if self._close_checkpoint is not None:
+            self._close_checkpoint()
 
     def _verify_urls(self):
         self._url_verifier(self.exchange)
@@ -203,7 +214,8 @@ class DemoExecutionService:
             raise RuntimeError("new position failed liquidation/protection verification and was reduceOnly closed; reconcile fills before further entries") from safety_error
 
     def _market_fill(self, symbol: str, side: str, quantity: float, *, reduce_only: bool,
-                     client_order_id: str | None = None) -> dict[str, Any]:
+                     client_order_id: str | None = None, lookup_only=False,
+                     allow_unfilled=False) -> dict[str, Any]:
         self._verify_urls()
         if quantity <= 0 or not math.isfinite(quantity):
             raise ValueError("exchange order quantity must be finite and positive")
@@ -211,15 +223,23 @@ class DemoExecutionService:
         params = {"clientOrderId": client_id, "newOrderRespType": "RESULT"}
         if reduce_only:
             params["reduceOnly"] = True
-        try:
-            order = self.exchange.create_order(symbol, "market", side, quantity, None, params)
-        except (OrderNotFound, RequestTimeout):
-            order = self._lookup_submitted_market_order(symbol, side, quantity, reduce_only, client_id)
+        if lookup_only:
+            order = self._lookup_submitted_market_order(
+                symbol, side, quantity, reduce_only, client_id, allow_unfilled=allow_unfilled,
+            )
+        else:
+            try:
+                order = self.exchange.create_order(symbol, "market", side, quantity, None, params)
+            except (OrderNotFound, RequestTimeout):
+                order = self._lookup_submitted_market_order(symbol, side, quantity, reduce_only, client_id)
         order_id = order.get("id") or (order.get("info") or {}).get("orderId")
         if not order_id:
             raise RuntimeError("USDⓈ-M exchange returned no orderId; reconciliation required")
         filled = _number(order.get("filled"), _number((order.get("info") or {}).get("executedQty")))
         average = _number(order.get("average"), _number((order.get("info") or {}).get("avgPrice")))
+        if allow_unfilled and filled == 0 and order.get("status") == "canceled":
+            return {"id": str(order_id), "clientOrderId": client_id,
+                    "filled": 0, "average": 0, "status": "canceled", "side": side}
         if not filled or not average:
             try:
                 order = self.exchange.fetch_order(order_id, symbol)
@@ -261,7 +281,7 @@ class DemoExecutionService:
                 **fill_data, "info": order.get("info", {})}
 
     def _lookup_submitted_market_order(self, symbol, side, quantity, reduce_only, client_id,
-                                       *, expected_order_id=None):
+                                       *, expected_order_id=None, allow_unfilled=False):
         """Allow short read propagation after submit; never send the market order again."""
         market_id = self.exchange.market(symbol)["id"]
         params = {"symbol": market_id, "origClientOrderId": client_id}
@@ -285,6 +305,9 @@ class DemoExecutionService:
             if status in {"FILLED", "CANCELED", "EXPIRED"} and 0 < filled <= quantity and average > 0:
                 return {"id": order_id, "filled": filled, "average": average, "status": "closed", "info": row}
             if status in {"CANCELED", "EXPIRED", "REJECTED"} and filled == 0:
+                if allow_unfilled:
+                    return {"id": order_id, "filled": 0, "average": 0,
+                            "status": "canceled", "info": row}
                 break
         raise OrderNotFound("submitted market fill not confirmed by client order id; reconciliation required")
 
@@ -389,11 +412,34 @@ class DemoExecutionService:
             raise ValueError("position reconstruction time must be timezone-aware")
         market_id = self.exchange.market(symbol)["id"]
         start_ms = int((at.timestamp() - 90 * 24 * 60 * 60) * 1000)
-        rows = self.exchange.fapiPrivateGetUserTrades({
-            "symbol": market_id, "startTime": start_ms, "limit": 1000,
-        })
-        if not isinstance(rows, list) or len(rows) >= 1000:
-            raise RuntimeError("manual position trade history is incomplete or reached the API limit")
+        end_ms = int(at.timestamp() * 1000)
+        rows_by_id = {}
+        window_start = start_ms
+        while window_start <= end_ms:
+            window_end = min(end_ms, window_start + 7 * 24 * 60 * 60 * 1000 - 1)
+            batch = self.exchange.fapiPrivateGetUserTrades({
+                "symbol": market_id, "startTime": window_start,
+                "endTime": window_end, "limit": 1000,
+            })
+            if not isinstance(batch, list) or len(batch) >= 1000:
+                raise RuntimeError("manual position trade history is incomplete or reached the API limit")
+            for row in batch:
+                try:
+                    trade_id, timestamp = int(row["id"]), int(row["time"])
+                except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError("manual position trade history contains an invalid row") from exc
+                if not window_start <= timestamp <= window_end:
+                    raise RuntimeError("manual position trade history is outside the requested window")
+                previous = rows_by_id.get(trade_id)
+                if previous is not None:
+                    if previous != row:
+                        raise RuntimeError("manual position trade history contains conflicting duplicates")
+                    continue
+                rows_by_id[trade_id] = row
+                if len(rows_by_id) >= 1000:
+                    raise RuntimeError("manual position trade history reached the total safety limit")
+            window_start = window_end + 1
+        rows = list(rows_by_id.values())
         trades = []
         seen_ids = set()
         for row in rows:
@@ -1205,26 +1251,67 @@ class DemoExecutionService:
     def close(self, position, *, stop: dict[str, Any] | None = None,
               reason: str | None = None) -> dict[str, Any]:
         symbol = position.symbol
+        orders = self._close_orders.setdefault(symbol, {})
+        attempt = orders.get("close_attempt")
+        if attempt and (attempt["side"] != position.side.value
+                        or attempt["opened_at"] != position.opened_at.isoformat()):
+            raise RuntimeError("close attempt belongs to a different position")
         live_position = self._position(symbol)
         if live_position is None:
+            if attempt and attempt["status"] != "prepared" and not attempt.get("fill"):
+                attempt["fill"] = self._market_fill(
+                    symbol, "sell" if position.side is Side.LONG else "buy",
+                    attempt["quantity"], reduce_only=True,
+                    client_order_id=attempt["clientOrderId"], lookup_only=True,
+                    allow_unfilled=True,
+                )
+                self._save_close_attempt()
+            self.cancel_saved_stop_if_open(symbol, stop)
+            if self._close_checkpoint is None:
+                self._close_orders.pop(symbol, None)
+            if (attempt and attempt.get("fill", {}).get("filled", 0) > 0
+                    and math.isclose(attempt["fill"]["filled"], position.quantity, rel_tol=1e-8)):
+                return {"fill": attempt["fill"], "position": None, "host": self.host}
             return {"already_flat": True, "position": None, "host": self.host}
         if live_position["side"] != position.side.value:
             raise RuntimeError("exchange side differs from local position; account is inconsistent")
-        if stop:
-            self._cancel_stop(symbol, stop)
-        else:
-            self._cancel_untracked_bot_stops(symbol)
-        try:
-            fill = self._market_fill(symbol, "sell" if position.side is Side.LONG else "buy",
-                                      live_position["quantity"], reduce_only=True)
-        except Exception:
-            if stop and stop.get("stop_price"):
-                restored = self._place_stop(symbol, position.side.value, live_position["quantity"], float(stop["stop_price"]))
-                stop.update(restored)
-            raise
+        if attempt is None:
+            attempt = {"clientOrderId": f"{BOT_ORDER_PREFIX}_{uuid4().hex[:28]}",
+                       "quantity": live_position["quantity"], "side": position.side.value,
+                       "opened_at": position.opened_at.isoformat(),
+                       "reason": reason, "status": "prepared"}
+            orders["close_attempt"] = attempt
+        lookup_only = attempt["status"] != "prepared"
+        if not attempt.get("fill"):
+            attempt["status"] = "submitted"
+            # Persist the identity before sending. A failed save sends no order;
+            # a restart after a successful save only queries this same identity.
+            try:
+                self._save_close_attempt()
+            except Exception:
+                if not lookup_only:
+                    attempt["status"] = "prepared"
+                raise
+            try:
+                attempt["fill"] = self._market_fill(
+                    symbol, "sell" if position.side is Side.LONG else "buy",
+                    attempt["quantity"], reduce_only=True,
+                    client_order_id=attempt["clientOrderId"], lookup_only=lookup_only,
+                )
+            except Exception:
+                if self._position(symbol) is None:
+                    return self.close(position, stop=stop, reason=reason)
+                raise
+            self._save_close_attempt()
+        fill = attempt["fill"]
         remaining = self._position(symbol)
         if remaining is not None:
             raise RuntimeError("reduceOnly close was sent but exchange position is still open")
+        self.cancel_saved_stop_if_open(symbol, stop)
+        if self._close_checkpoint is None:
+            self._close_orders.pop(symbol, None)
+        if not math.isclose(fill["filled"], position.quantity, rel_tol=1e-8):
+            return {"already_flat": True, "position": None, "host": self.host}
         logger.info("{} CLOSE symbol={} side={} amount={} orderId={} host={} source={} reason={} average={}",
                     self.label, symbol, position.side.value, fill["filled"], fill["id"], self.host, position.source,
                     reason or "strategy_close", fill["average"])

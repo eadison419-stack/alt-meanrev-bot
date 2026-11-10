@@ -44,6 +44,115 @@ class FakeClient:
         self.closed = True
 
 
+@pytest.fixture
+def protected_close(monkeypatch):
+    from datetime import datetime, timezone
+    from bot.portfolio import Position
+    position = Position("ADA/USDT:USDT", Side.LONG, 2, 100, 95,
+                        datetime(2026, 11, 10, tzinfo=timezone.utc), "test", "MID")
+    service = DemoExecutionService(OrderSpy(), SimpleNamespace())
+    live = [{"side": "long", "quantity": 2}]
+    calls = []
+    ledger = {position.symbol: {"stop": {"id": "protected", "stop_price": 95}}}
+    service.configure_close_recovery(ledger, lambda: calls.append("save"))
+    monkeypatch.setattr(service, "_position", lambda _: live[0])
+    def cleanup(*args):
+        assert live[0] is None
+        calls.append("cancel")
+    monkeypatch.setattr(service, "cancel_saved_stop_if_open", cleanup)
+    def fill(*args, **kwargs):
+        calls.append(("fill", kwargs))
+        live[0] = None
+        return {"id": "closed", "filled": 2, "average": 101}
+    monkeypatch.setattr(service, "_market_fill", fill)
+    return service, position, live, ledger, calls
+
+
+def test_close_keeps_stop_until_reduce_only_fill_and_flat_confirmation(protected_close):
+    service, position, _, ledger, calls = protected_close
+    result = service.close(position, stop=ledger[position.symbol]["stop"], reason="test_close")
+    assert result["fill"]["filled"] == 2
+    assert calls[0] == "save" and calls[-1] == "cancel"
+    kwargs = calls[1][1]
+    assert kwargs["reduce_only"] and not kwargs["lookup_only"]
+    assert kwargs["client_order_id"] == ledger[position.symbol]["close_attempt"]["clientOrderId"]
+
+
+def test_unknown_close_is_durable_and_recovery_only_queries_same_id(protected_close, monkeypatch):
+    import json
+    from ccxt import RequestTimeout
+    service, position, live, ledger, calls = protected_close
+    def unknown(*args, **kwargs):
+        calls.append(("unknown", kwargs))
+        raise RequestTimeout("test")
+    monkeypatch.setattr(service, "_market_fill", unknown)
+    with pytest.raises(RequestTimeout):
+        service.close(position, stop=ledger[position.symbol]["stop"])
+    attempt = ledger[position.symbol]["close_attempt"].copy()
+    assert attempt["status"] == "submitted" and "cancel" not in calls
+    # Simulate process restart using the serialized order ledger.
+    ledger = json.loads(json.dumps(ledger))
+    recovered = DemoExecutionService(OrderSpy(), SimpleNamespace())
+    recovered.configure_close_recovery(ledger, lambda: None)
+    monkeypatch.setattr(recovered, "_position", lambda _: live[0])
+    def reconcile(*args, **kwargs):
+        assert kwargs["lookup_only"] and kwargs["client_order_id"] == attempt["clientOrderId"]
+        live[0] = None
+        return {"id": "closed", "filled": 2, "average": 101}
+    monkeypatch.setattr(recovered, "_market_fill", reconcile)
+    monkeypatch.setattr(recovered, "cancel_saved_stop_if_open", lambda *args: calls.append("cancel"))
+    recovered.close(position, stop=ledger[position.symbol]["stop"])
+    assert calls[-1] == "cancel"
+
+
+@pytest.mark.parametrize("failure", ["save", "reduce_rejected", "partial", "cleanup"])
+def test_failed_close_never_removes_protection_from_remaining_position(protected_close, monkeypatch, failure):
+    service, position, live, ledger, calls = protected_close
+    def fail(*args, **kwargs):
+        raise RuntimeError("test failure")
+    if failure == "save":
+        service._close_checkpoint = fail
+    elif failure == "cleanup":
+        monkeypatch.setattr(service, "cancel_saved_stop_if_open", fail)
+    else:
+        def fill(*args, **kwargs):
+            calls.append("submit")
+            if failure == "reduce_rejected":
+                raise RuntimeError("reduce rejected")
+            live[0] = {"side": "long", "quantity": 1}
+            return {"id": "partial", "filled": 1, "average": 101}
+        monkeypatch.setattr(service, "_market_fill", fill)
+    with pytest.raises(RuntimeError):
+        service.close(position, stop=ledger[position.symbol]["stop"])
+    assert "cancel" not in calls
+    assert ledger[position.symbol]["stop"]["id"] == "protected"
+    if failure == "save":
+        assert "submit" not in calls
+    elif failure == "partial":
+        with pytest.raises(RuntimeError):
+            service.close(position, stop=ledger[position.symbol]["stop"])
+        assert calls.count("submit") == 1
+
+
+def test_stop_races_close_rejection_and_unknown_response_stays_pending(protected_close, monkeypatch):
+    from ccxt import OrderNotFound
+    service, position, live, ledger, calls = protected_close
+    def fill(*args, **kwargs):
+        live[0] = None
+        assert "cancel" not in calls
+        raise OrderNotFound("not propagated")
+    monkeypatch.setattr(service, "_market_fill", fill)
+    with pytest.raises(OrderNotFound):
+        service.close(position, stop=ledger[position.symbol]["stop"])
+    assert "cancel" not in calls
+    def terminal(*args, **kwargs):
+        assert kwargs["lookup_only"] and kwargs["allow_unfilled"]
+        return {"id": "rejected", "filled": 0, "average": 0, "status": "canceled"}
+    monkeypatch.setattr(service, "_market_fill", terminal)
+    assert service.close(position, stop=ledger[position.symbol]["stop"])["already_flat"]
+    assert calls[-1] == "cancel"
+
+
 def test_demo_client_urls_are_pinned_after_ccxt_demo_mode_and_verified():
     exchange = FakeClient()
     lock_demo_urls(exchange)
@@ -671,7 +780,7 @@ def test_manual_position_reconstruction_replays_adds_and_partial_closes():
 
         def fapiPrivateGetUserTrades(self, params):
             assert params["symbol"] == "ADAUSDT" and params["limit"] == 1000
-            return rows
+            return [row for row in rows if params["startTime"] <= row["time"] <= params["endTime"]]
 
     service = DemoExecutionService(TradeClient(), SimpleNamespace())
     service._market_rules = lambda _symbol: (0.01, 0.01, 0.0)
@@ -696,10 +805,11 @@ def test_manual_position_reconstruction_rejects_unsupported_commission_currency(
         def market(self, _symbol):
             return {"id": "ADAUSDT"}
 
-        def fapiPrivateGetUserTrades(self, _params):
-            return [{"id": 1, "symbol": "ADAUSDT", "time": 1_791_000_000_000,
+        def fapiPrivateGetUserTrades(self, params):
+            rows = [{"id": 1, "symbol": "ADAUSDT", "time": 1_791_000_000_000,
                      "side": "BUY", "positionSide": "BOTH", "qty": "1", "price": "100",
                      "commission": "0.001", "commissionAsset": "BNB"}]
+            return [row for row in rows if params["startTime"] <= row["time"] <= params["endTime"]]
 
     service = DemoExecutionService(TradeClient(), SimpleNamespace())
     with pytest.raises(RuntimeError, match="unsupported or invalid"):
@@ -707,6 +817,61 @@ def test_manual_position_reconstruction_rejects_unsupported_commission_currency(
             "ADA/USDT:USDT", {"side": "long", "quantity": 1, "entry_price": 100},
             at=datetime(2026, 10, 4, tzinfo=timezone.utc),
         )
+
+
+@pytest.mark.parametrize("case", ["boundaries", "duplicate", "reversal", "wrong_average",
+                                   "missing_window", "conflicting_duplicate", "api_limit", "total_limit",
+                                   "outside_window"])
+def test_manual_history_windows_are_complete_bounded_and_fail_closed(case):
+    from datetime import datetime, timedelta, timezone
+    current = datetime(2026, 11, 10, tzinfo=timezone.utc)
+    start = int((current - timedelta(days=90)).timestamp() * 1000)
+    week = 7 * 24 * 60 * 60 * 1000
+    def trade(trade_id, timestamp, side="BUY", qty="1", price="100"):
+        return {"id": trade_id, "time": timestamp, "symbol": "ADAUSDT", "side": side,
+                "qty": qty, "price": price, "commission": ".1", "commissionAsset": "USDT"}
+    rows = [trade(1, start + week - 1), trade(2, start + week)]
+    expected = {"side": "long", "quantity": 2, "entry_price": 100}
+    if case == "duplicate":
+        rows.append(dict(rows[0]))
+    elif case == "conflicting_duplicate":
+        rows.append({**rows[0], "price": "101"})
+    elif case == "reversal":
+        rows = [trade(1, start + week - 1, qty="2"),
+                trade(2, start + week, "SELL", "3", "110")]
+        expected = {"side": "short", "quantity": 1, "entry_price": 110}
+    elif case == "wrong_average":
+        expected["entry_price"] = 101
+    elif case == "total_limit":
+        rows = [trade(i + 1, start + (i // 500) * week + i) for i in range(1000)]
+    requests = []
+    class Client(OrderSpy):
+        def market(self, _symbol):
+            return {"id": "ADAUSDT"}
+        def fapiPrivateGetUserTrades(self, params):
+            requests.append(params)
+            assert params["endTime"] - params["startTime"] < week
+            if case == "missing_window" and len(requests) == 3:
+                return None
+            if case == "outside_window" and len(requests) == 2:
+                return [rows[0]]
+            if case == "api_limit":
+                return [rows[0]] * 1000
+            return [row for row in rows if params["startTime"] <= row["time"] <= params["endTime"]]
+    service = DemoExecutionService(Client(), SimpleNamespace())
+    service._market_rules = lambda _: (.01, .01, 0)
+    if case in {"wrong_average", "missing_window", "conflicting_duplicate", "api_limit", "total_limit",
+                "outside_window"}:
+        with pytest.raises(RuntimeError):
+            service.reconstruct_open_position("ADA/USDT:USDT", expected, at=current)
+    else:
+        result = service.reconstruct_open_position("ADA/USDT:USDT", expected, at=current)
+        assert result["side"] == expected["side"]
+        assert result["entry_fee"] == pytest.approx(.1 / 3 if case == "reversal" else .2)
+        assert len(requests) == 13
+        assert requests[0]["startTime"] == start
+        assert requests[-1]["endTime"] == int(current.timestamp() * 1000)
+        assert all(a["endTime"] + 1 == b["startTime"] for a, b in zip(requests, requests[1:]))
 
 
 @pytest.mark.parametrize(("existing_stop", "strategy_stop", "expected_stop", "external"), [

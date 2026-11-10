@@ -34,6 +34,171 @@ UNAVAILABLE_PNL_VALUES = [
 ]
 
 
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+@pytest.mark.parametrize("seconds,count", [(-1, 0), (0, 1), (1, 1)])
+def test_excursion_ticks_start_at_the_actual_fill(side, seconds, count):
+    opened = datetime(2026, 11, 10, 5, 0, 5, tzinfo=timezone.utc)
+    position = Position("TEST", side, 1, 100, 98 if side is Side.LONG else 102,
+                        opened, "test", "MID")
+    meta = {}
+    runner._update_demo_excursions(meta, position, price=80,
+                                   observed_at=opened + timedelta(seconds=seconds))
+    assert meta["telemetry_sample_count"] == count
+    assert meta["telemetry_best_price"] == (80 if count and side is Side.SHORT else 100)
+    assert meta["telemetry_worst_price"] == (80 if count and side is Side.LONG else 100)
+
+
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+def test_excursion_bars_exclude_first_partial_hour_and_unclosed_hour(side):
+    opened = datetime(2026, 11, 10, 5, 0, 5, tzinfo=timezone.utc)
+    position = Position("TEST", side, 1, 100, 98 if side is Side.LONG else 102,
+                        opened, "test", "MID")
+    def frame(hour):
+        return pd.DataFrame({"high": [120], "low": [80]},
+                            index=pd.DatetimeIndex([opened.replace(hour=hour, second=0)]))
+    meta = {}
+    runner._update_demo_excursions(meta, position, frame=frame(5), as_of=opened + timedelta(hours=2))
+    runner._update_demo_excursions(meta, position, frame=frame(6), as_of=opened.replace(hour=6, minute=59))
+    assert meta["telemetry_bar_count"] == 0
+    runner._update_demo_excursions(meta, position, frame=frame(6), as_of=opened.replace(hour=7))
+    assert meta["telemetry_bar_count"] == 1
+    assert meta["telemetry_best_price"] == (120 if side is Side.LONG else 80)
+
+
+def test_hourly_management_does_not_import_pre_fill_extreme():
+    settings, state, symbol, frame, now = _short_exit_fixture(is_demo=True)
+    position = state.portfolio.positions[symbol]
+    state.portfolio.positions[symbol] = replace(position, opened_at=frame.index[-1].to_pydatetime()
+                                               + timedelta(seconds=5))
+    runner._evaluate_exits(state, None, True, {symbol: frame}, {}, settings, 0, 0, now)
+    assert state.exit_management_by_symbol[symbol]["best_price"] == 100
+    assert state.exit_management_by_symbol[symbol]["worst_price"] == 101
+
+
+def test_manual_metadata_cannot_seed_excursions_from_a_pre_fill_quote():
+    _, state, symbol, _, _ = _short_exit_fixture(is_demo=True)
+    opened = state.portfolio.positions[symbol]
+    runner._initialize_entry_metadata(state, symbol, opened, True, 80, 102, 1, 90, 110,
+                                     observed_price=80,
+                                     observed_at=opened.opened_at - timedelta(seconds=1))
+    meta = state.exit_management_by_symbol[symbol]
+    assert meta["best_price"] == meta["worst_price"] == 100
+    assert meta["telemetry_best_price"] == meta["telemetry_worst_price"] == 100
+    assert not meta["telemetry_history_complete"]
+
+
+def test_daily_halt_sync_without_signal_survives_rebound_restart_and_midnight(tmp_path, monkeypatch):
+    from bot.lead_risk import settings_for_execution
+    settings = settings_for_execution(load_settings(env_file=None), "lead_usdm")
+    now = datetime(2026, 11, 10, 15, 58, tzinfo=timezone.utc)
+    state = MultiPaperState(execution_mode="lead_usdm")
+    execution = object.__new__(runner.DemoExecutionService)
+    execution.settings = settings
+    execution.cancel_orphaned_bot_stops = lambda _live: []
+    execution.sync_snapshot = lambda: {"at": now.isoformat(), "equity": equity, "positions": {}}
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    monkeypatch.setattr(runner, "_reconcile_demo_unverified_closes", lambda *args: None)
+    equity = 1000
+    assert runner._demo_sync_stopped(execution, state, now)
+    equity = 890
+    assert runner._demo_sync_stopped(execution, state, now)
+    assert state.portfolio.daily_halted
+    equity = 995
+    assert runner._demo_sync_stopped(execution, state, now)
+    path = tmp_path / "state.json"
+    state.save(path)
+    state = MultiPaperState.load(path)
+    assert state.portfolio.daily_halted and state.portfolio.day_start_equity == 1000
+    now += timedelta(minutes=3)  # Shanghai midnight, not UTC midnight.
+    assert runner._demo_sync_stopped(execution, state, now)
+    assert not state.portfolio.daily_halted and state.portfolio.day_start_equity == 995
+
+
+@pytest.mark.parametrize("age", [61, -31])
+def test_invalid_account_snapshot_cannot_reset_daily_baseline(age):
+    settings = load_settings(env_file=None)
+    now = datetime(2026, 11, 10, 16, tzinfo=timezone.utc)
+    state = MultiPaperState()
+    state.portfolio.observe_equity(1000, now - timedelta(hours=1), settings)
+    state.portfolio.daily_halted = True
+    with pytest.raises(ValueError):
+        runner._observe_account_equity(state,
+            {"at": (now - timedelta(seconds=age)).isoformat(), "equity": 1200}, settings, now)
+    assert state.portfolio.daily_halted and state.portfolio.day_start_equity == 1000
+
+
+def test_daily_halt_stays_latched_when_state_save_fails(monkeypatch, tmp_path):
+    state = MultiPaperState()
+    settings = load_settings(env_file=None)
+    now = datetime(2026, 11, 10, 5, tzinfo=timezone.utc)
+    runner._observe_account_equity(state, {"at": now.isoformat(), "equity": 1000}, settings, now)
+    runner._observe_account_equity(state, {"at": now.isoformat(), "equity": 900}, settings, now)
+    checkpoint = runner._RunnerCheckpoint(state, tmp_path / "state.json")
+    def fail(*args):
+        raise OSError("test storage failure")
+    monkeypatch.setattr(state, "save", fail)
+    assert not checkpoint.try_save() and checkpoint.failed
+    runner._observe_account_equity(state, {"at": now.isoformat(), "equity": 1000}, settings, now)
+    assert state.portfolio.daily_halted and state.portfolio.day_start_equity == 1000
+
+
+def test_position_monitor_ignores_fresh_quote_older_than_fill(monkeypatch):
+    settings, state, symbol, _, _ = _short_exit_fixture(is_demo=True)
+    now = datetime(2026, 11, 10, 5, 0, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    state.portfolio.positions[symbol] = replace(state.portfolio.positions[symbol], opened_at=now)
+    state.exchange_snapshot = {"at": now.isoformat()}
+    state.protective_stop_audit["at"] = now.isoformat()
+    public = SimpleNamespace(markets={symbol: {}}, fetch_ticker=lambda _:
+        {"last": 80, "timestamp": int((now - timedelta(seconds=1)).timestamp() * 1000)})
+    execution = SimpleNamespace()
+    runner._manage_demo_positions(public, execution, state, settings, now, 0, 0)
+    assert state.exit_management_by_symbol[symbol]["best_price"] == 100
+    assert state.exchange_orders_by_symbol[symbol]["stop"]["stop_price"] == 102
+
+
+def test_recovered_strategy_close_uses_confirmed_fill_and_original_reason():
+    _, state, symbol, _, now = _short_exit_fixture(is_demo=True)
+    state.exchange_orders_by_symbol[symbol]["close_attempt"] = {"reason": "max_hold_24h"}
+    class Execution:
+        def sync_snapshot(self):
+            return {"positions": {}}
+        def close(self, *args, **kwargs):
+            return {"fill": {"id": "close-order", "filled": 1, "average": 98,
+                             "fee_cost": .05, "realized_pnl": 2,
+                             "closed_at": now.isoformat()}}
+    assert runner._demo_sync_stopped(Execution(), state, now)
+    event = next(event for event in state.events if event.get("action") == "CLOSE")
+    assert event["reason"] == "max_hold_24h"
+    assert event["quantity"] == 1 and event["price"] == 98 and event["orderId"] == "close-order"
+    assert symbol not in state.portfolio.positions
+
+
+def test_manual_adoption_runs_real_ticker_timestamp_helper(monkeypatch):
+    settings, state, symbol, frame1, now = _short_exit_fixture(is_demo=True)
+    state.execution_mode = "lead_usdm"
+    state.portfolio.positions.clear()
+    state.exit_management_by_symbol.clear()
+    _, frame4 = _frames()
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    monkeypatch.setattr(runner, "_adoption_closed_frame",
+                        lambda _exchange, _symbol, _opened, timeframe, *args:
+                        frame1 if timeframe == "1h" else frame4)
+    monkeypatch.setattr(runner, "classify_regimes", lambda *args:
+                        pd.DataFrame({"regime": [Regime.MID]}))
+    exchange = SimpleNamespace(markets={symbol: {}}, market=lambda _: {"id": "APRUSDT"},
+        fetch_ticker=lambda _: {"last": 100, "timestamp": int(now.timestamp() * 1000)})
+    execution = SimpleNamespace(settings=settings, exchange=exchange, adopt_manual_positions=True,
+        lead_market_ids={"APRUSDT"}, reconstruct_open_position=lambda *args, **kwargs:
+        {"side": "short", "quantity": 1, "entry_price": 100,
+         "opened_at": now - timedelta(hours=2), "entry_fee": .1},
+        adopt_manual_position_stop=lambda *args, **kwargs:
+        {"id": "verified", "stop_price": 102, "amount": 1})
+    runner._adopt_lead_manual_position(execution, state, symbol, {}, now)
+    assert state.portfolio.positions[symbol].reason == "manual_position_adopted"
+    assert state.entry_costs[symbol]["entry_fee"] == .1
+
+
 class _FundingExchange:
     @staticmethod
     def fetch_funding_rate(_symbol):

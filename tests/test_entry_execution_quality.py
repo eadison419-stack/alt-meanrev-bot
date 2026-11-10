@@ -109,6 +109,28 @@ def test_lead_quote_guard_refreshes_account_and_uses_active_stops(monkeypatch):
     assert state.portfolio.positions["OLD"].stop_price == 90
 
 
+def test_final_preflight_rejection_keeps_risk_budgets_and_client_identity(monkeypatch):
+    guard, _, audit, intent, state, _, _, _ = _guard(monkeypatch)
+    state.execution_mode = "lead_usdm"
+    state.execution_status = "synchronized"
+    state.exchange_snapshot = {"at": NOW.isoformat(), "equity": 1000, "positions": {
+        "OLD": {"side": "long", "quantity": 1, "mark_price": 150}}}
+    state.portfolio.positions["OLD"] = Position("OLD", Side.LONG, 1, 100, 90, NOW, "old", "MID")
+    state.exchange_orders_by_symbol["OLD"] = {"stop": {"id": "s", "amount": 1, "stop_price": 95}}
+    state.protective_stop_audit = {"status": "verified", "mismatch_count": 0, "position_count": 1}
+    monkeypatch.setattr(runner, "_demo_sync_stopped", lambda *args: True)
+    monkeypatch.setattr(runner, "_audit_demo_protective_stops", lambda *args: True)
+    audit["clientOrderId"] = "mrb_same_attempt"
+    with pytest.raises(EntryPreflightRejected, match="portfolio_stop_risk_limit"):
+        guard(intent, intent.stop_price)
+    event = state.events[-1]
+    assert event["event"] == "entry_preflight_decision" and event["decision"] == "BLOCK"
+    assert event["clientOrderId"] == "mrb_same_attempt"
+    assert event["planned_quantity"] == 0 and event["planned_stop"] > 0
+    assert event["quantity_risk"]["existing_portfolio_stop_risk"] > 55
+    assert event["quantity_risk"]["max_portfolio_stop_risk"] == 40
+
+
 @pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
 def test_liquidity_observation_walks_both_sides_and_floors_suggested_size(side):
     book = {

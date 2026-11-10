@@ -471,6 +471,9 @@ def _open_local_position(state, symbol, side, price, stop, qty, leverage,
     margin = qty * entry_fill / leverage
     entry_fee = qty * entry_fill * fee_rate
     if state.cash < margin + entry_fee:
+        _record_entry_rejection(state, symbol, side, "available_cash_insufficient", "local_execution", at,
+                                details={"available_cash": state.cash, "required_margin": margin,
+                                         "entry_fee": entry_fee, "planned_quantity": qty})
         return None
     state.cash -= margin + entry_fee
     state.isolated_margin_by_symbol[symbol] = {"initial_margin": margin, "leverage": leverage}
@@ -505,6 +508,19 @@ def _record_preflight_decision(state, audit, reason, checked_at):
         _set_symbol_status(state, audit["symbol"], action="BLOCK", side=Side(audit["side"]),
                            reason=reason, at=checked_at)
     logger.info("MR entry preflight {}", json.dumps(audit, ensure_ascii=False, sort_keys=True))
+
+
+def _record_entry_rejection(state, symbol, side, reason, phase, at, *,
+                            bar_close_at=None, details=None, scan_row=None):
+    event = {"event": "entry_risk_rejected", "at": at.isoformat(),
+             "symbol": symbol, "side": side.value, "reason": reason, "phase": phase,
+             "bar_close_at": bar_close_at.isoformat() if bar_close_at is not None else None,
+             "equity": state.current_equity, "source": MEAN_REVERSION,
+             "details": details or {}}
+    state.events.append(event)
+    if scan_row is not None:
+        scan_row["reason"] = reason
+    _set_symbol_status(state, symbol, action="BLOCK", side=side, reason=reason, at=at)
 
 
 def _entry_preflight(exchange, execution, state, settings, market, context, flags,
@@ -616,15 +632,18 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
             quantity_limits, approval_limits = _entry_capital_limits(state, settings, context.side, checked_at)
         except (KeyError, TypeError, ValueError, OverflowError):
             reject("lead_entry_risk_inputs_unavailable")
+        quantity_audit = {}
         qty = calculate_order_quantity(
             state.current_equity, price, state.portfolio, settings,
             step_size=step, minimum_quantity=minimum, size_multiplier=multiplier,
             stop_price=stop, gross_notional_cap_pct=gross_cap,
             target_margin_usdt=target_margin,
-            **quantity_limits,
+            audit=quantity_audit, **quantity_limits,
         )
+        audit.update(planned_price=price, planned_quantity=qty, planned_stop=stop,
+                     quantity_risk=quantity_audit)
         if qty <= 0:
-            reject("entry_quantity_unavailable")
+            reject(quantity_audit.get("reason") or "entry_quantity_unavailable")
         refreshed = replace(intent, price=price, quantity=qty, stop_price=stop)
         approval = assess_entry(
             refreshed, state.portfolio, state.current_equity, funding_rate, checked_at, settings,
@@ -632,6 +651,7 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
             per_symbol_margin_usdt=target_margin,
             **approval_limits,
         )
+        audit["risk_approval"] = {"reason": approval.reason, "details": approval.details}
         if not approval.allowed:
             reject(approval.reason)
         audit.update({"planned_price": price, "planned_quantity": qty,
@@ -964,7 +984,20 @@ def _demo_trade_observations(state, position, *, closed_at, reconciled_at=None):
     return observations
 
 
-def _update_demo_excursions(meta, position, *, frame=None, price=None, observed_at=None):
+def _position_sample_is_eligible(position, observed_at):
+    opened_at = _aware_datetime(position.opened_at)
+    sampled_at = _aware_datetime(observed_at)
+    return opened_at is not None and sampled_at is not None and sampled_at >= opened_at
+
+
+def _position_bar_is_eligible(position, frame, as_of):
+    bar_open = _aware_datetime(frame.index[-1].to_pydatetime())
+    return (bar_open is not None and _position_sample_is_eligible(position, bar_open)
+            and bar_open + timedelta(hours=1) <= as_of)
+
+
+def _update_demo_excursions(meta, position, *, frame=None, price=None, observed_at=None,
+                            as_of=None):
     entry = float(position.entry_price)
     opened_at = _aware_datetime(position.opened_at)
     if not meta.get("telemetry_enabled"):
@@ -985,7 +1018,7 @@ def _update_demo_excursions(meta, position, *, frame=None, price=None, observed_
         meta.setdefault("telemetry_bar_count", 0)
         meta.setdefault("telemetry_sample_count", 0)
 
-    if price is not None and observed_at is not None:
+    if price is not None and _position_sample_is_eligible(position, observed_at):
         price = float(price)
         if math.isfinite(price) and price > 0:
             if position.side is Side.LONG:
@@ -1008,7 +1041,7 @@ def _update_demo_excursions(meta, position, *, frame=None, price=None, observed_
     if frame is None:
         return
     bar_open = _aware_datetime(frame.index[-1].to_pydatetime())
-    if opened_at is None or bar_open is None or bar_open < opened_at:
+    if not _position_bar_is_eligible(position, frame, as_of or _utc_now()):
         return
     previous_bar = _aware_datetime(meta.get("telemetry_last_bar_open"))
     if previous_bar is not None and bar_open <= previous_bar:
@@ -1255,7 +1288,15 @@ def _close_position(is_demo, execution, state, symbol, price, reason, at, fee_ra
         return None
     if is_demo:
         stop = state.exchange_orders_by_symbol.get(symbol, {}).get("stop")
-        result = execution.close(position, stop=stop, reason=reason)
+        try:
+            result = execution.close(position, stop=stop, reason=reason)
+        except Exception as exc:
+            state.execution_status = "close_reconciliation_required"
+            state.inconsistencies = [f"close reconciliation required for {symbol}"]
+            state.events.append({"event": "position_close_pending", "symbol": symbol,
+                                 "at": at.isoformat(), "reason": reason,
+                                 "error": type(exc).__name__})
+            raise
         if result.get("already_flat"):
             _demo_sync_stopped(execution, state, at)
             return position
@@ -1308,8 +1349,34 @@ def _close_position(is_demo, execution, state, symbol, price, reason, at, fee_ra
     return net
 
 
+def _observe_account_equity(state, snapshot, settings, at):
+    observed_at = _aware_datetime(snapshot.get("at"))
+    equity = float(snapshot.get("equity", 0))
+    if (observed_at is None or not -30 <= (at - observed_at).total_seconds() <= 60
+            or not math.isfinite(equity) or equity <= 0):
+        raise ValueError("fresh positive account equity is required")
+    portfolio = state.portfolio
+    previous = (portfolio.trading_date, portfolio.daily_halted)
+    portfolio.observe_equity(equity, observed_at, settings)
+    if previous != (portfolio.trading_date, portfolio.daily_halted):
+        state.events.append({
+            "event": "daily_risk_halt_triggered" if portfolio.daily_halted else "daily_risk_day_started",
+            "at": observed_at.isoformat(), "trading_date": portfolio.trading_date.isoformat(),
+            "equity": equity, "day_start_equity": portfolio.day_start_equity,
+            "drawdown": (portfolio.day_start_equity - equity) / portfolio.day_start_equity,
+            "threshold": settings.risk.daily_drawdown_halt_pct,
+        })
+
+
 def _demo_sync_stopped(execution, state, at):
     snapshot = execution.sync_snapshot()
+    if isinstance(execution, DemoExecutionService):
+        try:
+            _observe_account_equity(state, snapshot, execution.settings, _utc_now())
+        except (TypeError, ValueError, OverflowError):
+            state.execution_status = "inconsistent"
+            state.inconsistencies = ["account equity snapshot is stale or invalid"]
+            return False
     state.exchange_snapshot = snapshot
     live = set(snapshot["positions"])
     for symbol in list(state.portfolio.positions):
@@ -1317,6 +1384,17 @@ def _demo_sync_stopped(execution, state, at):
             position = state.portfolio.positions[symbol]
             order_data = state.exchange_orders_by_symbol.get(symbol, {})
             stop = order_data.get("stop") if isinstance(order_data, dict) else None
+            strategy_fill = None
+            if order_data.get("close_attempt"):
+                try:
+                    result = execution.close(position, stop=stop,
+                                             reason=order_data["close_attempt"].get("reason"))
+                    strategy_fill = result.get("fill")
+                except Exception as exc:
+                    state.execution_status = "close_reconciliation_required"
+                    state.inconsistencies = [f"close reconciliation required for {symbol}"]
+                    logger.warning("Flat close reconciliation pending for {}: {}", symbol, type(exc).__name__)
+                    return False
             stop_fill = None
             resolver = getattr(execution, "resolve_protective_stop_algo_fill", None)
             if callable(resolver):
@@ -1326,7 +1404,7 @@ def _demo_sync_stopped(execution, state, at):
                     logger.warning("Cannot verify {} stop fill for {}: {}",
                                    _execution_label(execution, state), symbol, type(exc).__name__)
             external_fill = None
-            if stop_fill is None:
+            if stop_fill is None and strategy_fill is None:
                 external_fill = _resolve_exchange_flat_close_fill(execution, state, position, at)
             try:
                 cleanup = getattr(execution, "cancel_saved_stop_if_open", None)
@@ -1345,7 +1423,7 @@ def _demo_sync_stopped(execution, state, at):
                              _execution_label(execution, state), symbol, type(exc).__name__)
                 return False
 
-            verified_fill = stop_fill or external_fill
+            verified_fill = stop_fill or strategy_fill or external_fill
             verified_closed_at = _verified_fill_timestamp(verified_fill) if verified_fill else None
             closed_at = verified_closed_at or at
             gross = fees = funding = net = None
@@ -1361,7 +1439,9 @@ def _demo_sync_stopped(execution, state, at):
             state.exchange_orders_by_symbol.pop(symbol, None)
             state.exit_management_by_symbol.pop(symbol, None)
             state.entry_costs.pop(symbol, None)
+            close_attempt = order_data.get("close_attempt") or {}
             reason = ("protective_stop_exchange_algo" if stop_fill else
+                      close_attempt["reason"] if (strategy_fill or external_fill) and close_attempt.get("reason") else
                       "external_close_exchange_trades_verified" if external_fill else
                       "exchange_flat_unverified")
             state.portfolio.last_exit_at[symbol] = closed_at
@@ -1370,12 +1450,14 @@ def _demo_sync_stopped(execution, state, at):
             _invalidate_demo_stop_audit(state)
             close_event = {"event": "paper_fill", "action": "CLOSE", "symbol": symbol,
                            "side": position.side.value, "at": closed_at.isoformat(), "reason": reason,
-                           "quantity": verified_fill.get("quantity") if verified_fill else position.quantity,
+                           "quantity": (verified_fill.get("quantity", verified_fill.get("filled"))
+                                        if verified_fill else position.quantity),
                            "price": verified_fill.get("average") if verified_fill else None,
                            "gross_pnl": gross, "funding_paid": funding, "net_pnl": net,
                            "pnl_recorded": net is not None, "source": MEAN_REVERSION,
                            "execution_source": _execution_source(state),
                            "orderId": (stop_fill.get("order_id") if stop_fill else
+                                       strategy_fill.get("id") if strategy_fill else
                                        external_fill.get("order_ids", [None])[0]
                                        if external_fill and len(external_fill.get("order_ids", [])) == 1
                                        else None),
@@ -1385,7 +1467,7 @@ def _demo_sync_stopped(execution, state, at):
                 close_event["fees"] = fees
             if external_fill:
                 close_event["external_order_ids"] = list(external_fill.get("order_ids") or [])
-            else:
+            elif strategy_fill is None:
                 close_event["external_close_lookup_at"] = at.isoformat()
             state.events.append(close_event)
     local = set(state.portfolio.positions)
@@ -1497,6 +1579,20 @@ def _demo_sync_stopped(execution, state, at):
             meta["enabled"] = True
         else:
             meta["enabled"] = False
+    pending_closes = [symbol for symbol in local
+                      if state.exchange_orders_by_symbol.get(symbol, {}).get("close_attempt")]
+    if pending_closes:
+        state.execution_status = "close_reconciliation_required"
+        state.inconsistencies = [f"close reconciliation required for {symbol}" for symbol in pending_closes]
+        for symbol in pending_closes:
+            orders = state.exchange_orders_by_symbol[symbol]
+            attempt = orders["close_attempt"]
+            try:
+                execution.close(state.portfolio.positions[symbol], stop=orders.get("stop"),
+                                reason=attempt.get("reason"))
+            except Exception as exc:
+                logger.warning("Close reconciliation pending for {}: {}", symbol, type(exc).__name__)
+        return False  # Refresh the signed snapshot before recording any flat outcome.
     stop_regressions = _demo_stop_regression_mismatches(state)
     if stop_regressions:
         state.protective_stop_audit = {
@@ -1562,7 +1658,7 @@ def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at)
         settings.lookback.min_regime_bars_4h,
         settings.regime.atrpct_lookback,
         settings.lookback.range_bars_4h + 1,
-        settings.lookback.slow_lookback_4h + 1,
+        settings.regime.slow_lookback_4h + 1,
         settings.lookback.adx_len * 3,
     )
     frame4 = _adoption_closed_frame(
@@ -1592,7 +1688,7 @@ def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at)
     )
     if market_price is None:
         raise RuntimeError("fresh contract price is unavailable")
-    observed_at = _ticker_observed_at({symbol: ticker})
+    observed_at = _ticker_observed_at({symbol: ticker}, symbol)
     if observed_at is None or observed_at > _utc_now() + timedelta(seconds=30):
         raise RuntimeError("contract price timestamp is invalid")
 
@@ -1678,6 +1774,9 @@ def _audit_demo_protective_stops(execution, state, now):
             state.portfolio.positions, state.exchange_orders_by_symbol,
         ) or [])
         mismatches.extend(_demo_stop_regression_mismatches(state))
+        mismatches.extend(f"{symbol}: close reconciliation required"
+                          for symbol in state.portfolio.positions
+                          if state.exchange_orders_by_symbol.get(symbol, {}).get("close_attempt"))
         status = "mismatch" if mismatches else "verified"
     except Exception as exc:
         mismatches = [f"protective stop audit: {type(exc).__name__}"]
@@ -1806,15 +1905,15 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
                                _execution_label(execution, state), symbol, quote_status)
             dirty = True
         dirty = True  # Persist each valid excursion sample and the latest freshness result.
-        if price is None:
+        if price is None or not _position_sample_is_eligible(position, observed_at):
             state.exit_management_by_symbol[symbol] = meta
             continue
 
         _update_demo_excursions(meta, position, price=price, observed_at=observed_at)
         state.mark_prices[symbol] = price
         entry = float(position.entry_price)
-        best_price = float(meta.get("best_price", price))
-        worst_price = float(meta.get("worst_price", price))
+        best_price = float(meta.get("best_price", entry))
+        worst_price = float(meta.get("worst_price", entry))
         if position.side is Side.LONG:
             best_price = max(best_price, price)
             worst_price = min(worst_price, price)
@@ -2996,7 +3095,7 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
             logger.info("Regime fade check skipped {}", event)
             continue
         if is_demo:
-            _update_demo_excursions(meta, position, frame=frame)
+            _update_demo_excursions(meta, position, frame=frame, as_of=now)
         tracked_order = state.exchange_orders_by_symbol.get(symbol, {}).get("stop") if is_demo else None
         if is_demo and tracked_order and tracked_order.get("stop_price") is not None:
             tracked_stop = float(tracked_order["stop_price"])
@@ -3044,10 +3143,11 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
                 continue
 
         # 2. update best/worst
-        best_price = float(meta.get("best_price", current_high if side is Side.LONG else current_low))
-        worst_price = float(meta.get("worst_price", current_low if side is Side.LONG else current_high))
-        best_price = max(best_price, current_high) if side is Side.LONG else min(best_price, current_low)
-        worst_price = min(worst_price, current_low) if side is Side.LONG else max(worst_price, current_high)
+        best_price = float(meta.get("best_price", entry))
+        worst_price = float(meta.get("worst_price", entry))
+        if _position_bar_is_eligible(position, frame, now):
+            best_price = max(best_price, current_high) if side is Side.LONG else min(best_price, current_low)
+            worst_price = min(worst_price, current_low) if side is Side.LONG else max(worst_price, current_high)
         meta["best_price"] = best_price
         meta["worst_price"] = worst_price
 
@@ -3244,7 +3344,20 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
     structure = swing_low if sig.side is Side.LONG else swing_high
     try:
         stop, _mult = calculate_adaptive_stop(sig.side, close, entry_atr, structure, settings)
-    except ValueError:
+    except ValueError as exc:
+        raw_distance = ((close - structure) if sig.side is Side.LONG else (structure - close))
+        raw_distance += settings.stops.structure_buffer_atr * entry_atr
+        stop_reason = str(exc) if str(exc) in {"stop_too_tight", "stop_too_wide"} else "entry_stop_invalid"
+        stop_details = {"price": close, "atr": entry_atr, "structure_price": structure,
+                        "raw_stop_distance": raw_distance,
+                        "raw_stop_atr": raw_distance / entry_atr if entry_atr > 0 else None}
+        stop_details = {key: value if value is None or math.isfinite(value) else None
+                        for key, value in stop_details.items()}
+        _record_entry_rejection(
+            state, symbol, sig.side, stop_reason, "signal_stop", now,
+            bar_close_at=bar_close_time, scan_row=scan_row,
+            details=stop_details,
+        )
         return None
     closed_ema = float(frame4["close"].ewm(span=span, adjust=False, min_periods=span).mean().iloc[-1])
     dev = close / closed_ema - 1.0
@@ -3290,6 +3403,9 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
 def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
                                entry_atr, swing_low, swing_high, *, observed_price=None,
                                observed_at=None, telemetry_history_complete=True):
+    if observed_price is not None and not _position_sample_is_eligible(opened, observed_at):
+        observed_price = observed_at = None
+        telemetry_history_complete = False
     initial_risk = (abs(opened.entry_price - opened.stop_price)
                     if is_demo else abs(close - stop))
     state.exit_management_by_symbol[symbol] = {
@@ -3329,30 +3445,31 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
      regime_value, reason, daily_gate, context, flags, funding_rate) = candidate
     max_delay = timedelta(seconds=settings.execution.confirm_delay_sec_max)
     market_risk_state = market_risk.state.value
+    def reject(reason, phase, details=None):
+        _record_entry_rejection(state, symbol, side, reason, phase, _utc_now(),
+                                bar_close_at=context.bar_close_at if context else None,
+                                details=details, scan_row=scan_row)
+        return None
     if is_demo:
         try:
             _require_entry_clock()
         except ExchangeClockError:
-            state.events.append({"event": "entry_signal_blocked", "at": _utc_now().isoformat(),
-                                 "symbol": symbol, "reason": "exchange_clock_stale_or_unavailable"})
-            return None
+            return reject("exchange_clock_stale_or_unavailable", "account_gate")
     market_risk_multiplier = (settings.market_risk.elevated_size_multiplier
                               if market_risk.state is MarketRiskState.RISK_ELEVATED else 1.0)
     if (state.execution_mode == "lead_usdm"
             and str((markets.get(symbol) or {}).get("id", "")).upper()
             not in getattr(execution, "lead_market_ids", set())):
-        return None
+        return reject("lead_symbol_not_allowed", "account_gate")
     if is_demo and len(state.portfolio.positions) >= max_pos:
-        return None
+        return reject("max_positions_reached", "account_gate", {"max_positions": max_pos})
     if position_monitor is not None:
         position_monitor()
     if is_demo:
         if state.execution_status != "synchronized" or mr_scan.unresolved_attempts(state):
-            return None
+            return reject("account_not_synchronized", "account_gate")
         if _utc_now() > context.bar_close_at + max_delay:
-            state.events.append({"event": "entry_bar_rejected", "symbol": symbol,
-                                 "at": _utc_now().isoformat(), "reason": "hourly_bar_stale"})
-            return None
+            return reject("hourly_bar_stale", "signal_expiry")
         funding_rate = _fetch_entry_funding_rate(exchange, symbol, fail_on_market_error=True)
         funding_reason = funding_rate_rejection_reason(funding_rate, settings)
         if funding_reason is not None:
@@ -3370,23 +3487,23 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
         # A preceding fill invalidates the snapshot/audit; refresh before sizing the next candidate.
         if (not _demo_sync_stopped(execution, state, _utc_now())
                 or not _audit_demo_protective_stops(execution, state, _utc_now())):
-            return None
+            return reject("account_not_synchronized", "account_gate")
     target_margin = _target_margin_per_symbol(state, settings)
     try:
         quantity_limits, approval_limits = _entry_capital_limits(state, settings, side, _utc_now())
     except (KeyError, TypeError, ValueError, OverflowError):
-        state.events.append({"event": "entry_signal_blocked", "symbol": symbol,
-                             "at": _utc_now().isoformat(), "reason": "lead_entry_risk_inputs_unavailable"})
-        return None
+        return reject("lead_entry_risk_inputs_unavailable", "quantity")
+    quantity_audit = {}
     qty = calculate_order_quantity(state.current_equity, close, state.portfolio, settings,
                                    step_size=step_size, minimum_quantity=minimum_quantity,
                                    size_multiplier=market_risk_multiplier,
                                    stop_price=stop,
                                    gross_notional_cap_pct=(settings.sizing.max_gross_notional_pct
                                                            * market_risk_multiplier),
-                                   target_margin_usdt=target_margin, **quantity_limits)
+                                   target_margin_usdt=target_margin, audit=quantity_audit, **quantity_limits)
     if qty <= 0:
-        return None
+        return reject(quantity_audit.get("reason") or "entry_quantity_unavailable",
+                      "quantity", quantity_audit)
     intent = OrderIntent(symbol, side, Action.OPEN, qty, close, reason, Regime(regime_value),
                          stop, MEAN_REVERSION)
     approval = assess_entry(intent, state.portfolio, state.current_equity,
@@ -3396,7 +3513,8 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
                              market_risk_state=market_risk_state,
                              per_symbol_margin_usdt=target_margin, **approval_limits)
     if not approval.allowed:
-        return None
+        return reject(approval.reason, "risk_approval",
+                      {"quantity_risk": quantity_audit, "approval": approval.details})
     execution_kwargs = {}
     if is_demo:
         if scan_row is not None:
@@ -3707,9 +3825,11 @@ def main() -> int:
             else:
                 account_exchange = create_demo_usdm(settings.runtime)
                 execution = DemoExecutionService(account_exchange, settings)
+            execution.configure_close_recovery(state.exchange_orders_by_symbol, checkpoint)
             try:
                 clock = _initialize_exchange_clock(account_exchange, state)
                 state.exchange_snapshot = _initialize_demo(execution)
+                _observe_account_equity(state, state.exchange_snapshot, settings, _utc_now())
             except (ccxt.BaseError, ExchangeClockError) as exc:
                 state.events.append({"event": "account_startup_failed", "at": _utc_now().isoformat(),
                                      "phase": "account_initialization", "endpoint": mode.name,
