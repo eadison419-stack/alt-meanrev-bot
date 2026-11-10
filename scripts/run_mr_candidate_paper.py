@@ -352,6 +352,123 @@ def _filter_lead_candidates(hotlist, markets, execution):
     ]
 
 
+def _record_lead_whitelist_observation(state, execution, ranked_hotlist,
+                                      filtered_hotlist, markets, bar, now):
+    """Persist the ranking and Lead whitelist result once per closed 1H bar."""
+    bar_key = bar.isoformat()
+    metadata_key = "__lead_whitelist_shadow__"
+    metadata = state.exit_management_by_symbol.setdefault(metadata_key, {})
+    if metadata.get("bar") == bar_key:
+        return False
+    filtered_ranks = {row["symbol"]: row.get("rank") for row in filtered_hotlist}
+    ranked = []
+    for index, row in enumerate(ranked_hotlist, start=1):
+        symbol = row["symbol"]
+        market_id = str((markets.get(symbol) or {}).get("id", "")).upper()
+        ranked.append({
+            "rank": int(row.get("rank", index)),
+            "symbol": symbol,
+            "market_id": market_id,
+            "whitelisted": symbol in filtered_ranks,
+            "filtered_rank": filtered_ranks.get(symbol),
+        })
+    state.events.append({
+        "event": "lead_whitelist_ranking_shadow",
+        "at": now.isoformat(),
+        "bar": bar_key,
+        "source": MEAN_REVERSION,
+        "execution_mode": state.execution_mode,
+        "top_n": len(ranked),
+        "whitelist_size": len(getattr(execution, "lead_market_ids", ())),
+        "ranked_candidates": ranked,
+    })
+    metadata["bar"] = bar_key
+    return True
+
+
+def _atr_deviation_shadow_threshold(frame4, settings):
+    """Return (ATR, ATR%, candidate threshold), or null values if unavailable."""
+    if frame4 is None or frame4.empty:
+        return None, None, None
+    try:
+        atr_value = float(atr(frame4, settings.lookback.atr_len).iloc[-1])
+        close = float(frame4["close"].iloc[-1])
+    except (IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None, None, None
+    if not math.isfinite(atr_value) or atr_value <= 0 or not math.isfinite(close) or close <= 0:
+        return None, None, None
+    atr_pct = atr_value / close
+    return atr_value, atr_pct, max(DEV_PCT, 0.8 * atr_pct)
+
+
+def _record_atr_deviation_shadow(state, symbol, frame1, frame4, bar_close_time,
+                                 evaluated_at, closed_ema, close, flags, settings,
+                                 baseline_signal, stop, entry_atr, regime_value,
+                                 daily_gate, scan_row):
+    """Record an observe-only threshold comparison for an accepted Lead candidate."""
+    shadow_key = f"{symbol}|{bar_close_time.isoformat()}"
+    if scan_row is not None and scan_row.get("atr_deviation_shadow_key") == shadow_key:
+        return
+    atr4, atr_pct, threshold = _atr_deviation_shadow_threshold(frame4, settings)
+    if threshold is None:
+        shadow_signal = None
+        shadow_reason = "closed_4h_atr_unavailable"
+        shadow_available = False
+    else:
+        try:
+            shadow_signal = deviation_entry_signal_at_ema(
+                closed_ema, float(frame1.iloc[-1]["open"]), close, settings, flags,
+                deviation_pct=threshold,
+            )
+            shadow_reason = shadow_signal.reason
+            shadow_available = True
+        except Exception as exc:  # Observability must not affect the live candidate.
+            shadow_signal = None
+            shadow_reason = f"shadow_evaluation_error:{type(exc).__name__}"
+            shadow_available = False
+    shadow_allowed = shadow_signal is not None and shadow_signal.action is Action.OPEN
+    close4 = float(frame4["close"].iloc[-1])
+    event = {
+        "event": "atr_deviation_entry_shadow",
+        "at": evaluated_at.isoformat(),
+        "shadow_key": shadow_key,
+        "symbol": symbol,
+        "source": MEAN_REVERSION,
+        "execution_mode": state.execution_mode,
+        "runner_build_id": RUNNER_BUILD_ID,
+        "bar_open_at": frame1.index[-1].to_pydatetime().isoformat(),
+        "bar_close_at": bar_close_time.isoformat(),
+        "closed_4h_bar_open_at": frame4.index[-1].to_pydatetime().isoformat(),
+        "closed_4h_bar_close_at": (frame4.index[-1] + timedelta(hours=4)).isoformat(),
+        "entry_close": close,
+        "closed_4h_close": close4,
+        "closed_4h_atr": atr4,
+        "closed_4h_atr_pct": atr_pct,
+        "baseline_threshold_pct": DEV_PCT,
+        "shadow_threshold_rule": "max(0.01, 0.8 * closed_4h_atr_pct)",
+        "shadow_threshold_pct": threshold,
+        "deviation_pct": close / closed_ema - 1.0,
+        "baseline_decision": "ALLOW",
+        "baseline_side": baseline_signal.side.value,
+        "shadow_decision": ("UNAVAILABLE" if not shadow_available
+                            else "ALLOW" if shadow_allowed else "FILTER"),
+        "shadow_side": shadow_signal.side.value if shadow_allowed else None,
+        "shadow_reason": shadow_reason,
+        "time_filter_decision": "ALLOW",
+        "daily_gate": ({
+            "ready": daily_gate.get("ready"),
+            "direction": daily_gate.get("direction"),
+            "reason": daily_gate.get("reason"),
+        } if daily_gate is not None else None),
+        "stop_price": stop,
+        "entry_atr_1h": entry_atr,
+        "regime": regime_value,
+    }
+    state.events.append(event)
+    if scan_row is not None:
+        scan_row["atr_deviation_shadow_key"] = shadow_key
+
+
 # --- open / close helpers (demo + local, both sides) ---------------------------------
 
 def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, leverage,
@@ -373,6 +490,8 @@ def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, le
                 "clientOrderId": client_id, "status": "prepared", "reason": reason,
                 "regime": regime_value, "meta": recovery_meta,
             })
+            if scan_row.get("atr_deviation_shadow_key"):
+                attempt["atr_deviation_shadow_key"] = scan_row["atr_deviation_shadow_key"]
             if attempt["status"] != "prepared":
                 raise RuntimeError("entry attempt already submitted; reconciliation required")
             if entry_audit is not None:
@@ -2801,6 +2920,7 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             if position_monitor is not None:
                 position_monitor()
 
+    ranked_hotlist = hotlist
     if state.execution_mode == "lead_usdm":
         hotlist = _filter_lead_candidates(hotlist, markets, execution)
     state.watchlist = hotlist
@@ -2903,6 +3023,13 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
                                 or scan.get("status") not in {"completed", "expired"}))
                   or (not is_demo and new_exit_bar)))
     if entry_due:
+        if state.execution_mode == "lead_usdm":
+            try:
+                _record_lead_whitelist_observation(
+                    state, execution, ranked_hotlist, hotlist, markets, latest_bar, now,
+                )
+            except Exception as exc:  # Observability must not affect entry evaluation.
+                logger.warning("Lead whitelist shadow unavailable: {}", type(exc).__name__)
         market_ready_at = _utc_now() if is_demo else now
         try:
             _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols, one_hour,
@@ -3395,6 +3522,15 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         symbol, sig.side, bar_close_time, now, evaluated_at,
         float(candle["open"]), close, closed_ema, entry_atr, swing_low, swing_high,
     ) if is_demo else None
+    if state.execution_mode == "lead_usdm" and scan_row is not None:
+        try:
+            _record_atr_deviation_shadow(
+                state, symbol, frame1, frame4, bar_close_time, evaluated_at,
+                closed_ema, close, flags, settings, sig, stop, entry_atr,
+                regime_value, daily_gate, scan_row,
+            )
+        except Exception as exc:  # Observability must not affect the live candidate.
+            logger.warning("Lead ATR deviation shadow unavailable: {}", type(exc).__name__)
     return (symbol, strength, sig.side, close, stop, entry_atr,
                        swing_low, swing_high, regime_value, sig.reason, daily_gate,
                        context, flags)

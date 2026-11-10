@@ -91,7 +91,9 @@ def outcome(state, scan, symbol, status, at, save=None, **details):
 def attempt_outcome(state, attempt, status, at, **details):
     state.events.append({
         "event": "entry_attempt_outcome", "at": at.isoformat(),
-        **{key: attempt[key] for key in ("symbol", "side", "bar", "clientOrderId")},
+        **{key: attempt[key] for key in (
+            "symbol", "side", "bar", "clientOrderId", "atr_deviation_shadow_key",
+        ) if key in attempt},
         "status": status, "endpoint": "demo", **details,
     })
 

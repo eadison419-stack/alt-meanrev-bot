@@ -289,6 +289,181 @@ def test_lead_candidate_filter_keeps_only_portfolio_whitelisted_usdt_symbols():
         runner._filter_lead_candidates(hotlist, markets, SimpleNamespace(lead_market_ids=set()))
 
 
+def test_lead_whitelist_observation_records_ranking_and_deduplicates_per_bar():
+    state = MultiPaperState(execution_mode="lead_usdm")
+    execution = SimpleNamespace(lead_market_ids={"BTCUSDT"})
+    ranked = [{"symbol": "BTC/USDT:USDT", "rank": 1},
+              {"symbol": "ETH/USDT:USDT", "rank": 2}]
+    markets = {"BTC/USDT:USDT": {"id": "BTCUSDT"},
+               "ETH/USDT:USDT": {"id": "ETHUSDT"}}
+    bar = pd.Timestamp("2026-10-26T04:00:00Z")
+    now = datetime(2026, 10, 26, 5, tzinfo=timezone.utc)
+
+    assert runner._record_lead_whitelist_observation(
+        state, execution, ranked, [ranked[0]], markets, bar, now,
+    )
+    assert not runner._record_lead_whitelist_observation(
+        state, execution, ranked, [ranked[0]], markets, bar, now,
+    )
+
+    event, = [row for row in state.events
+              if row.get("event") == "lead_whitelist_ranking_shadow"]
+    assert event["whitelist_size"] == 1
+    assert event["ranked_candidates"] == [
+        {"rank": 1, "symbol": "BTC/USDT:USDT", "market_id": "BTCUSDT",
+         "whitelisted": True, "filtered_rank": 1},
+        {"rank": 2, "symbol": "ETH/USDT:USDT", "market_id": "ETHUSDT",
+         "whitelisted": False, "filtered_rank": None},
+    ]
+
+
+def test_atr_deviation_shadow_threshold_uses_floor_and_closed_4h_atr_percent():
+    settings = load_settings(env_file=None)
+    _one_hour, four_hour = _frames()
+
+    _atr_value, atr_pct, threshold = runner._atr_deviation_shadow_threshold(four_hour, settings)
+
+    assert atr_pct == pytest.approx(0.02)
+    assert threshold == pytest.approx(0.016)
+    four_hour.loc[:, "high"] = four_hour["close"] + 0.1
+    four_hour.loc[:, "low"] = four_hour["close"] - 0.1
+    _atr_value, atr_pct, threshold = runner._atr_deviation_shadow_threshold(four_hour, settings)
+    assert threshold == runner.DEV_PCT
+
+
+@pytest.mark.parametrize(("side", "open_price", "close_price", "expected_stop"), [
+    (Side.LONG, 98.0, 98.5, 96.5),
+    (Side.SHORT, 102.0, 101.5, 103.5),
+])
+def test_lead_atr_deviation_shadow_is_observational_and_deduplicated(
+        side, open_price, close_price, expected_stop, monkeypatch):
+    settings = load_settings(env_file=None)
+    state = MultiPaperState(execution_mode="lead_usdm")
+    symbol = "APR/USDT:USDT"
+    now = datetime(2026, 10, 26, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    one_hour, four_hour = _frames()
+    one_hour.loc[one_hour.index[-1], ["open", "high", "low", "close"]] = (
+        open_price, max(open_price, close_price) + 0.2,
+        min(open_price, close_price) - 0.2, close_price,
+    )
+    flags = TimeFilterFlags(True, True, False, False)
+
+    def fake_atr(frame, _period):
+        return pd.Series(1.0 if frame is one_hour else 2.0, index=frame.index)
+
+    monkeypatch.setattr(runner, "atr", fake_atr)
+    monkeypatch.setattr(runner, "evaluate_time_filter", lambda *args, **kwargs: flags)
+    monkeypatch.setattr(
+        runner, "_cached_daily_direction_gate",
+        lambda *_args, **_kwargs: {"ready": True, "direction": side.value, "reason": None},
+    )
+    monkeypatch.setattr(
+        runner, "calculate_adaptive_stop",
+        lambda candidate_side, price, *_args, **_kwargs: (
+            expected_stop, 1.0,
+        ),
+    )
+    scan_row = {"bar": one_hour.index[-1].isoformat()}
+
+    candidate = runner._entry_candidate(
+        object(), state, True, symbol, {symbol: one_hour}, {symbol: four_hour}, {},
+        settings, now, {}, scan_row=scan_row,
+    )
+    repeated_candidate = runner._entry_candidate(
+        object(), state, True, symbol, {symbol: one_hour}, {symbol: four_hour}, {},
+        settings, now, {}, scan_row=scan_row,
+    )
+
+    assert candidate[2] is side and candidate[4] == expected_stop
+    assert repeated_candidate[:11] == candidate[:11]
+    assert scan_row["atr_deviation_shadow_key"] == (
+        f"{symbol}|{(one_hour.index[-1] + timedelta(hours=1)).isoformat()}"
+    )
+    events = [row for row in state.events
+              if row.get("event") == "atr_deviation_entry_shadow"]
+    assert len(events) == 1
+    assert events[0]["baseline_decision"] == "ALLOW"
+    assert events[0]["baseline_side"] == side.value
+    assert events[0]["shadow_threshold_pct"] == pytest.approx(0.016)
+    assert events[0]["shadow_decision"] == "FILTER"
+    assert events[0]["shadow_key"] == scan_row["atr_deviation_shadow_key"]
+
+
+def test_atr_deviation_shadow_key_flows_into_lead_entry_attempt():
+    state = MultiPaperState(execution_mode="lead_usdm")
+    symbol = "APR/USDT:USDT"
+    now = datetime(2026, 10, 26, 5, tzinfo=timezone.utc)
+    scan_row = {"bar": "2026-10-26T04:00:00+00:00",
+                "atr_deviation_shadow_key": f"{symbol}|2026-10-26T05:00:00+00:00"}
+
+    class Execution:
+        @staticmethod
+        def open(_intent, *, stop_price, **kwargs):
+            kwargs["on_submit"](1.0, stop_price, now)
+            client_id = kwargs["client_order_id"]
+            return {
+                "stop": {"stop_price": stop_price},
+                "fill": {"timestamp": int(now.timestamp() * 1000),
+                         "price": 100.0, "fee_cost": 0.0,
+                         "clientOrderId": client_id},
+                "position": {"quantity": 1.0, "entry_price": 100.0},
+            }
+
+    runner._open_position(
+        True, Execution(), state, symbol, Side.LONG, 100.0, 98.0, 1.0, 3,
+        0.0, 0.0, "test_entry", Regime.MID.value, now,
+        scan_row=scan_row, checkpoint=lambda: None,
+    )
+
+    attempt, = state.mr_entry_attempts.values()
+    outcome = next(event for event in state.events
+                   if event.get("event") == "entry_attempt_outcome")
+    assert attempt["atr_deviation_shadow_key"] == scan_row["atr_deviation_shadow_key"]
+    assert outcome["atr_deviation_shadow_key"] == scan_row["atr_deviation_shadow_key"]
+
+
+def test_lead_atr_shadow_observer_failure_does_not_block_baseline_candidate(monkeypatch):
+    settings = load_settings(env_file=None)
+    state = MultiPaperState(execution_mode="lead_usdm")
+    symbol = "APR/USDT:USDT"
+    now = datetime(2026, 10, 26, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    one_hour, four_hour = _frames()
+    one_hour.loc[one_hour.index[-1], ["open", "high", "low", "close"]] = [
+        98.0, 98.7, 97.8, 98.5,
+    ]
+    flags = TimeFilterFlags(True, True, False, False)
+    monkeypatch.setattr(
+        runner, "atr",
+        lambda frame, _period: pd.Series(1.0, index=frame.index),
+    )
+    monkeypatch.setattr(runner, "evaluate_time_filter", lambda *args, **kwargs: flags)
+    monkeypatch.setattr(
+        runner, "_cached_daily_direction_gate",
+        lambda *_args, **_kwargs: {"ready": True, "direction": "long", "reason": None},
+    )
+    monkeypatch.setattr(
+        runner, "calculate_adaptive_stop", lambda *_args, **_kwargs: (96.5, 1.0),
+    )
+
+    def fail_observation(*_args, **_kwargs):
+        raise RuntimeError("shadow telemetry failure")
+
+    monkeypatch.setattr(runner, "_record_atr_deviation_shadow", fail_observation)
+    scan_row = {"bar": one_hour.index[-1].isoformat()}
+    candidate = runner._entry_candidate(
+        object(), state, True, symbol, {symbol: one_hour}, {symbol: four_hour}, {},
+        settings, now, {}, scan_row=scan_row,
+    )
+
+    assert candidate is not None and candidate[2] is Side.LONG
+    assert candidate[4] == 96.5
+    assert "atr_deviation_shadow_key" not in scan_row
+    assert not [event for event in state.events
+                if event.get("event") == "atr_deviation_entry_shadow"]
+
+
 def _cached_intrabar_fixture(now, symbol="BEAT/USDT:USDT"):
     state = MultiPaperState(initial_equity=5_000, cash=4_000)
     position = Position(symbol, Side.SHORT, 1.0, 100.0, 102.0,
