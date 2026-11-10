@@ -181,6 +181,30 @@ def test_demo_paper_fill_with_missing_costs_keeps_fees_unknown():
     assert orders["realized_pnl"] == 0
     assert orders["trades"][0]["fees"] is None
     assert orders["trades"][0]["realized_pnl"] is None
+    assert orders["trades"][0]["exit_reason"] == "外部平仓（成交价／盈亏待核验）"
+
+
+def test_verified_manual_exchange_close_has_localized_dashboard_reason():
+    symbol = "ADA/USDT:USDT"
+    state = {
+        "execution_mode": "lead_usdm",
+        "events": [
+            {"event": "paper_fill", "execution_source": "binance_usdm_lead", "action": "OPEN",
+             "at": "2026-10-02T01:00:00+00:00", "symbol": symbol, "side": "long",
+             "quantity": 2.0, "price": 100.0, "fee": 0.2},
+            {"event": "paper_fill", "execution_source": "binance_usdm_lead", "action": "CLOSE",
+             "at": "2026-10-02T01:30:00+00:00", "closed_at": "2026-10-02T01:29:59+00:00",
+             "symbol": symbol, "side": "long", "quantity": 2.0, "price": 105.0,
+             "reason": "external_close_exchange_trades_verified", "fees": 0.4,
+             "net_pnl": 9.6, "pnl_recorded": True},
+        ],
+    }
+
+    orders = build_order_snapshot(state, start_date="2026-10-02", end_date="2026-10-02")
+
+    assert orders["trades"][0]["exit_reason"] == "手动／外部平仓（交易所成交已核验）"
+    assert orders["trades"][0]["exit_price"] == 105.0
+    assert orders["trades"][0]["realized_pnl"] == 9.6
 
 
 def test_verified_bot_stop_reconciliation_is_included_in_demo_trade_statistics():

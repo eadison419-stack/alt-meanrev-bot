@@ -893,6 +893,97 @@ class DemoExecutionService:
             symbol, str(order_id), stop, expected_quantity,
         )
 
+    def resolve_exchange_flat_close_fill(self, symbol: str, side: Side,
+                                         opened_at: datetime, observed_flat_at: datetime,
+                                         expected_quantity: float) -> dict[str, Any] | None:
+        """Verify a full manual/external close from bounded USD-M user-trade history."""
+        if (opened_at.tzinfo is None or observed_flat_at.tzinfo is None
+                or observed_flat_at < opened_at or not math.isfinite(expected_quantity)
+                or expected_quantity <= 0):
+            return None
+        if (observed_flat_at - opened_at > timedelta(days=7)
+                or opened_at < _utc_now() - timedelta(days=90)):
+            return None
+        try:
+            self._verify_urls()
+            market_id = self.exchange.market(symbol)["id"]
+            start_ms = int(opened_at.timestamp() * 1000)
+            end_ms = int(observed_flat_at.timestamp() * 1000)
+            rows = self.exchange.fapiPrivateGetUserTrades({
+                "symbol": market_id, "startTime": start_ms, "endTime": end_ms,
+                "limit": 1000,
+            })
+            if not isinstance(rows, list) or len(rows) >= 1000:
+                return None
+            expected_side = "BUY" if side is Side.SHORT else "SELL"
+            closing_trades = []
+            trade_ids = set()
+            for row in rows:
+                if not isinstance(row, dict):
+                    return None
+                if (row.get("symbol") is not None
+                        and str(row["symbol"]).upper() != str(market_id).upper()):
+                    return None
+                timestamp = int(row.get("time") or 0)
+                if timestamp < start_ms or timestamp > end_ms:
+                    return None
+                if str(row.get("positionSide") or "BOTH").upper() != "BOTH":
+                    return None
+                trade_side = str(row.get("side") or "").upper()
+                if trade_side not in {"BUY", "SELL"}:
+                    buyer = row.get("buyer")
+                    if isinstance(buyer, bool):
+                        trade_side = "BUY" if buyer else "SELL"
+                    elif str(buyer).strip().lower() in {"true", "1"}:
+                        trade_side = "BUY"
+                    elif str(buyer).strip().lower() in {"false", "0"}:
+                        trade_side = "SELL"
+                    else:
+                        return None
+                if trade_side != expected_side:
+                    continue
+                try:
+                    trade_id = str(row["id"])
+                    order_id = str(row["orderId"])
+                    quantity = float(row["qty"])
+                    price = float(row["price"])
+                    commission = float(row["commission"])
+                    realized_pnl = float(row["realizedPnl"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    return None
+                if (not trade_id or not order_id or trade_id in trade_ids
+                        or row.get("commissionAsset") != "USDT"
+                        or not all(math.isfinite(value) for value in
+                                   (quantity, price, commission, realized_pnl))
+                        or quantity <= 0 or price <= 0):
+                    return None
+                trade_ids.add(trade_id)
+                closing_trades.append({
+                    "trade_id": trade_id, "order_id": order_id, "quantity": quantity,
+                    "price": price, "commission": commission,
+                    "realized_pnl": realized_pnl, "timestamp": timestamp,
+                })
+            if not closing_trades:
+                return None
+            quantity = math.fsum(row["quantity"] for row in closing_trades)
+            step, _, _ = self._market_rules(symbol)
+            tolerance = max(step * 1e-6, expected_quantity * 1e-8, 1e-12)
+            if abs(quantity - expected_quantity) > tolerance:
+                return None
+            notional = math.fsum(row["quantity"] * row["price"] for row in closing_trades)
+            if not math.isfinite(notional) or notional <= 0:
+                return None
+            timestamps = [row["timestamp"] for row in closing_trades]
+            order_ids = sorted({row["order_id"] for row in closing_trades})
+            return {
+                "order_ids": order_ids, "quantity": quantity, "average": notional / quantity,
+                "gross_pnl": math.fsum(row["realized_pnl"] for row in closing_trades),
+                "exit_fee": math.fsum(row["commission"] for row in closing_trades),
+                "closed_at": datetime.fromtimestamp(max(timestamps) / 1000, timezone.utc).isoformat(),
+            }
+        except Exception:
+            return None
+
     def _inspect_missing_entry_attempt(self, attempt: dict[str, Any],
                                         market_id: str) -> dict[str, Any]:
         """Confirm absence only while Binance still retains unfilled order history."""

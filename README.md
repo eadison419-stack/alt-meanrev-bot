@@ -56,6 +56,8 @@ USDⓈ-M Demo 需要单独录入 Demo 专用凭据并手动启动，入口为 `.
 
 `run-lead-watchdog.ps1` 可在一次 `LEAD` 确认后隐藏看护实盘 Runner：已有正确实例时直接接管，进程退出后按退避规则恢复。活进程的账户或心跳异常只写本地日志，不强杀。`-Status` 查看进程与账本健康，`-Stop` 只停止看护并保留 Runner；主动停止 Runner 前先停止看护。看护授权仅持续到该看护器退出或 Windows 重启，届时需重新启用。详见 [实盘看护说明](INSTALL_WINDOWS.md#lead-runner-看护器)。
 
+Lead 持仓在 Binance 界面手动平仓后，Runner 会用只读逐笔成交记录核验该仓位从开仓到发现空仓期间的反向成交。成交数量吻合且费用数据完整时，回填平仓时间、价格与净盈亏；记录不足或无法唯一核实时保留待核验状态，不猜测盈亏。该能力需在验证后部署的新 Runner 中生效。
+
 要在 Lead Runner 中接管账本外的手动持仓，可在看护器首次启用时使用 `.\run-lead-watchdog.ps1 -AdoptManualPositions`。看护器会在后续恢复时保持同一开关；已有看护器或 Runner 不会自动切换模式，切换前须按实盘操作流程停止并重新启用。
 
 ## Dashboard 与登录启动

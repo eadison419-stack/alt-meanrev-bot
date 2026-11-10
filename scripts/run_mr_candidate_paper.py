@@ -36,6 +36,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +94,7 @@ DEMO_POSITION_SYNC_MAX_AGE_SECONDS = 60
 DEMO_STOP_UPDATE_MIN_INTERVAL_SECONDS = 15
 DEMO_POSITION_MONITOR_POLL_SECONDS = 5
 PROTECTIVE_STOP_AUDIT_INTERVAL_SECONDS = 300
+EXTERNAL_CLOSE_FILL_RECHECK_SECONDS = 300
 ENTRY_BAR_MAX_DELAY = timedelta(minutes=10)
 STRUCTURE_REENTRY_FAILURES = 2
 BAN_UNTIL_RE = re.compile(r"banned until\s+(\d+)", re.IGNORECASE)
@@ -1060,6 +1062,103 @@ def _demo_close_values(execution, state, position, fill, closed_at):
     return gross, fees, funding, net
 
 
+def _resolve_exchange_flat_close_fill(execution, state, position, observed_flat_at):
+    resolver = getattr(execution, "resolve_exchange_flat_close_fill", None)
+    if not callable(resolver):
+        return None
+    try:
+        return resolver(position.symbol, position.side, position.opened_at,
+                        observed_flat_at, position.quantity)
+    except Exception as exc:
+        logger.warning("Cannot verify {} external close for {}: {}",
+                       _execution_label(execution, state), position.symbol,
+                       type(exc).__name__)
+        return None
+
+
+def _external_close_position(state, event):
+    symbol = event.get("symbol")
+    opened_at = _aware_datetime(event.get("opened_at"))
+    if not symbol or opened_at is None:
+        return None, None
+    open_event = next((candidate for candidate in reversed(state.events)
+                       if candidate.get("event") == "paper_fill"
+                       and candidate.get("action") == "OPEN"
+                       and candidate.get("symbol") == symbol
+                       and _aware_datetime(candidate.get("at")) == opened_at), None)
+    if open_event is None:
+        return None, None
+    try:
+        side = Side(open_event["side"])
+        quantity = _finite_pnl_value(event.get("quantity"))
+        opened_quantity = _finite_pnl_value(open_event.get("quantity"))
+        entry_price = _finite_pnl_value(open_event.get("price"))
+    except (KeyError, ValueError):
+        return None, None
+    if (quantity is None or opened_quantity is None or entry_price is None
+            or not math.isclose(quantity, opened_quantity, rel_tol=1e-8, abs_tol=1e-12)):
+        return None, None
+    return SimpleNamespace(symbol=symbol, side=side, quantity=quantity,
+                           entry_price=entry_price, opened_at=opened_at), open_event
+
+
+def _reconcile_demo_unverified_closes(execution, state, now):
+    """Backfill manual/external flat fills when bounded exchange evidence becomes available."""
+    resolver = getattr(execution, "resolve_exchange_flat_close_fill", None)
+    if not callable(resolver):
+        return False
+    changed = False
+    for event in list(state.events):
+        if (event.get("event") != "paper_fill" or event.get("action") != "CLOSE"
+                or event.get("reason") != "exchange_flat_unverified"
+                or event.get("execution_source") != _execution_source(state)):
+            continue
+        last_check = _aware_datetime(event.get("external_close_lookup_at"))
+        if (last_check is not None
+                and (now - last_check).total_seconds() < EXTERNAL_CLOSE_FILL_RECHECK_SECONDS):
+            continue
+        position, open_event = _external_close_position(state, event)
+        observed_flat_at = _aware_datetime(event.get("at"))
+        if position is None or observed_flat_at is None:
+            continue
+        event["external_close_lookup_at"] = now.isoformat()
+        fill = _resolve_exchange_flat_close_fill(execution, state, position, observed_flat_at)
+        closed_at = _verified_fill_timestamp(fill)
+        if fill is None or closed_at is None:
+            continue
+        entry_fee = _finite_pnl_value(open_event.get("fee"))
+        fee_state = SimpleNamespace(entry_costs={})
+        if entry_fee is not None:
+            fee_state.entry_costs[position.symbol] = {"entry_fee": entry_fee}
+        gross, fees, funding, net = _demo_close_values(
+            execution, fee_state, position, fill, closed_at,
+        )
+        order_ids = list(fill.get("order_ids") or [])
+        held_seconds = (closed_at - position.opened_at).total_seconds()
+        event.update({
+            "reason": "external_close_exchange_trades_verified",
+            "closed_at": closed_at.isoformat(), "exit_time_verified": True,
+            "held_hours": held_seconds / 3600 if held_seconds >= 0 else None,
+            "quantity": fill.get("quantity"), "price": fill.get("average"),
+            "gross_pnl": gross, "fees": fees, "funding_paid": funding,
+            "net_pnl": net, "pnl_recorded": net is not None,
+            "orderId": order_ids[0] if len(order_ids) == 1 else None,
+            "external_order_ids": order_ids,
+            "external_close_reconciled_at": now.isoformat(),
+        })
+        state.events.append({
+            "event": "external_close_fill_reconciled", "at": now.isoformat(),
+            "symbol": position.symbol, "opened_at": position.opened_at.isoformat(),
+            "closed_at": closed_at.isoformat(), "quantity": fill.get("quantity"),
+            "average": fill.get("average"), "gross_pnl": gross, "fees": fees,
+            "funding_paid": funding, "net_pnl": net, "pnl_recorded": net is not None,
+            "external_order_ids": order_ids,
+            "execution_source": _execution_source(state),
+        })
+        changed = True
+    return changed
+
+
 def _reconcile_demo_funding(execution, state, now, *, position_monitor=None):
     """Recheck late-posted funding without changing fills or account balances."""
     fetch = getattr(execution, "funding_history", None)
@@ -1226,6 +1325,9 @@ def _demo_sync_stopped(execution, state, at):
                 except Exception as exc:
                     logger.warning("Cannot verify {} stop fill for {}: {}",
                                    _execution_label(execution, state), symbol, type(exc).__name__)
+            external_fill = None
+            if stop_fill is None:
+                external_fill = _resolve_exchange_flat_close_fill(execution, state, position, at)
             try:
                 cleanup = getattr(execution, "cancel_saved_stop_if_open", None)
                 if callable(cleanup):
@@ -1243,12 +1345,13 @@ def _demo_sync_stopped(execution, state, at):
                              _execution_label(execution, state), symbol, type(exc).__name__)
                 return False
 
-            verified_closed_at = _verified_fill_timestamp(stop_fill) if stop_fill else None
+            verified_fill = stop_fill or external_fill
+            verified_closed_at = _verified_fill_timestamp(verified_fill) if verified_fill else None
             closed_at = verified_closed_at or at
             gross = fees = funding = net = None
-            if stop_fill:
+            if verified_fill:
                 gross, fees, funding, net = _demo_close_values(
-                    execution, state, position, stop_fill, closed_at,
+                    execution, state, position, verified_fill, closed_at,
                 )
             observations = _demo_trade_observations(
                 state, position, closed_at=verified_closed_at,
@@ -1258,23 +1361,32 @@ def _demo_sync_stopped(execution, state, at):
             state.exchange_orders_by_symbol.pop(symbol, None)
             state.exit_management_by_symbol.pop(symbol, None)
             state.entry_costs.pop(symbol, None)
-            reason = "protective_stop_exchange_algo" if stop_fill else "exchange_flat_unverified"
+            reason = ("protective_stop_exchange_algo" if stop_fill else
+                      "external_close_exchange_trades_verified" if external_fill else
+                      "exchange_flat_unverified")
             state.portfolio.last_exit_at[symbol] = closed_at
             state.portfolio.last_exit_category[symbol] = _mr_exit_category(reason, net)
             state.portfolio.last_exit_source[symbol] = MEAN_REVERSION
             _invalidate_demo_stop_audit(state)
             close_event = {"event": "paper_fill", "action": "CLOSE", "symbol": symbol,
                            "side": position.side.value, "at": closed_at.isoformat(), "reason": reason,
-                           "quantity": stop_fill.get("quantity") if stop_fill else position.quantity,
-                           "price": stop_fill.get("average") if stop_fill else None,
+                           "quantity": verified_fill.get("quantity") if verified_fill else position.quantity,
+                           "price": verified_fill.get("average") if verified_fill else None,
                            "gross_pnl": gross, "funding_paid": funding, "net_pnl": net,
                            "pnl_recorded": net is not None, "source": MEAN_REVERSION,
                            "execution_source": _execution_source(state),
-                           "orderId": stop_fill.get("order_id") if stop_fill else None,
+                           "orderId": (stop_fill.get("order_id") if stop_fill else
+                                       external_fill.get("order_ids", [None])[0]
+                                       if external_fill and len(external_fill.get("order_ids", [])) == 1
+                                       else None),
                            "algoId": stop_fill.get("algo_id") if stop_fill else None,
                            **observations}
             if fees is not None:
                 close_event["fees"] = fees
+            if external_fill:
+                close_event["external_order_ids"] = list(external_fill.get("order_ids") or [])
+            else:
+                close_event["external_close_lookup_at"] = at.isoformat()
             state.events.append(close_event)
     local = set(state.portfolio.positions)
     pending_symbols = {row["symbol"] for row in mr_scan.unresolved_attempts(state)}
@@ -1399,6 +1511,7 @@ def _demo_sync_stopped(execution, state, at):
     else:
         state.execution_status = "synchronized"
         state.inconsistencies = []
+    _reconcile_demo_unverified_closes(execution, state, at)
     return True
 
 

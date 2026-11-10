@@ -1178,6 +1178,101 @@ def test_demo_candidate_sync_records_verified_protective_stop_fill():
     assert event["pnl_recorded"] is True
 
 
+def test_demo_candidate_sync_records_verified_manual_exchange_close():
+    symbol = "APR/USDT:USDT"
+    opened_at = datetime(2026, 10, 26, 3, tzinfo=timezone.utc)
+    closed_at = opened_at + timedelta(hours=2)
+    position = Position(symbol, Side.LONG, 2.0, 100.0, 95.0, opened_at,
+                        "test_entry", Regime.LOW.value)
+    state = MultiPaperState(initial_equity=5_000, cash=5_000)
+    state.execution_mode = "demo_usdm"
+    state.portfolio.positions[symbol] = position
+    state.entry_costs[symbol] = {"entry_fee": 0.2}
+    state.exchange_orders_by_symbol[symbol] = {"stop": {"id": "algo-stop"}}
+
+    class Execution:
+        @staticmethod
+        def sync_snapshot():
+            return {"positions": {}}
+
+        @staticmethod
+        def resolve_exchange_flat_close_fill(requested_symbol, side, start, observed, quantity):
+            assert (requested_symbol, side, start, observed, quantity) == (
+                symbol, Side.LONG, opened_at, closed_at, 2.0,
+            )
+            return {"order_ids": ["manual-close-1"], "quantity": 2.0,
+                    "average": 105.0, "gross_pnl": 10.0, "exit_fee": 0.21,
+                    "closed_at": closed_at.isoformat()}
+
+        @staticmethod
+        def cancel_saved_stop_if_open(requested_symbol, stop):
+            assert (requested_symbol, stop["id"]) == (symbol, "algo-stop")
+
+        @staticmethod
+        def funding_fee(_symbol, start, end):
+            assert (start, end) == (opened_at, closed_at)
+            return 0.1
+
+    assert runner._demo_sync_stopped(Execution(), state, closed_at)
+    event = state.events[-1]
+    assert event["reason"] == "external_close_exchange_trades_verified"
+    assert event["external_order_ids"] == ["manual-close-1"]
+    assert event["closed_at"] == closed_at.isoformat()
+    assert event["price"] == 105.0
+    assert event["fees"] == pytest.approx(0.41)
+    assert event["net_pnl"] == pytest.approx(9.69)
+    assert event["pnl_recorded"] is True
+
+
+def test_demo_sync_backfills_previous_unverified_external_close():
+    symbol = "APR/USDT:USDT"
+    opened_at = datetime(2026, 10, 26, 3, tzinfo=timezone.utc)
+    closed_at = opened_at + timedelta(hours=2)
+    observed_flat_at = closed_at + timedelta(seconds=5)
+    now = closed_at + timedelta(minutes=6)
+    state = MultiPaperState(initial_equity=5_000, cash=5_000)
+    state.execution_mode = "demo_usdm"
+    state.events.extend([
+        {"event": "paper_fill", "action": "OPEN", "symbol": symbol,
+         "side": "long", "at": opened_at.isoformat(), "quantity": 2.0,
+         "price": 100.0, "fee": 0.2, "execution_source": "binance_usdm_demo"},
+        {"event": "paper_fill", "action": "CLOSE", "symbol": symbol,
+         "side": "long", "at": observed_flat_at.isoformat(), "opened_at": opened_at.isoformat(),
+         "quantity": 2.0, "price": None, "reason": "exchange_flat_unverified",
+         "net_pnl": None, "pnl_recorded": False,
+         "execution_source": "binance_usdm_demo"},
+    ])
+
+    class Execution:
+        @staticmethod
+        def sync_snapshot():
+            return {"positions": {}}
+
+        @staticmethod
+        def resolve_exchange_flat_close_fill(requested_symbol, side, start, observed, quantity):
+            assert (requested_symbol, side, start, observed, quantity) == (
+                symbol, Side.LONG, opened_at, observed_flat_at, 2.0,
+            )
+            return {"order_ids": ["manual-close-1"], "quantity": 2.0,
+                    "average": 105.0, "gross_pnl": 10.0, "exit_fee": 0.21,
+                    "closed_at": closed_at.isoformat()}
+
+        @staticmethod
+        def funding_fee(_symbol, start, end):
+            assert (start, end) == (opened_at, closed_at)
+            return 0.1
+
+    assert runner._demo_sync_stopped(Execution(), state, now)
+    event = next(row for row in state.events
+                 if row.get("event") == "paper_fill" and row.get("reason") ==
+                 "external_close_exchange_trades_verified")
+    assert event["closed_at"] == closed_at.isoformat()
+    assert event["price"] == 105.0
+    assert event["net_pnl"] == pytest.approx(9.69)
+    assert event["external_close_reconciled_at"] == now.isoformat()
+    assert any(row.get("event") == "external_close_fill_reconciled" for row in state.events)
+
+
 def test_demo_sync_cancels_orphaned_bot_stops_after_flat_snapshot():
     state = MultiPaperState(initial_equity=5_000, cash=5_000)
     state.execution_mode = "demo_usdm"

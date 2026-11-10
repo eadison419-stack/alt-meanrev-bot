@@ -28,6 +28,14 @@ def _exchange_execution_source(mode: str) -> str | None:
             "lead_usdm": "binance_usdm_lead"}.get(mode)
 
 
+def _display_close_reason(reason: str | None) -> str | None:
+    return {
+        "exchange_flat_unverified": "外部平仓（成交价／盈亏待核验）",
+        "external_close_exchange_trades_verified": "手动／外部平仓（交易所成交已核验）",
+        "protective_stop_exchange_algo": "机器人保护止损",
+    }.get(reason, reason)
+
+
 def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None,
                          end_date: str | None = None,
                          current_positions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -119,6 +127,7 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
                                    else None if exchange_mode else 0.0), "exit_reason": event.get("reason"),
                           "entry_reason": event.get("entry_reason", trade.get("entry_reason")),
                           "entry_regime": event.get("entry_regime", trade.get("entry_regime")),
+                          "exit_reason": _display_close_reason(event.get("reason")),
                           "held_hours": event.get("held_hours"), "mfe_r": event.get("mfe_r"),
                           "mfe_available": event.get("mfe_available"), "mae_r": event.get("mae_r"),
                           "mae_available": event.get("mae_available"),

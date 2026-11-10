@@ -558,6 +558,80 @@ def test_triggered_bot_stop_fill_is_verified_from_algo_and_user_trades():
     assert result["order_id"] == "close-1"
 
 
+def test_exchange_flat_close_fill_aggregates_exact_opposite_side_trades():
+    from datetime import datetime, timedelta, timezone
+
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    observed_flat_at = opened_at + timedelta(hours=1)
+    closed_ms = int((opened_at + timedelta(minutes=50)).timestamp() * 1000)
+    rows = [
+        {"id": 10, "orderId": 20, "symbol": "ADAUSDT", "side": "SELL",
+         "positionSide": "BOTH", "qty": "2", "price": "100", "time": closed_ms - 1_000,
+         "commission": "0.2", "commissionAsset": "USDT", "realizedPnl": "0"},
+        {"id": 11, "orderId": 21, "symbol": "ADAUSDT", "side": "BUY",
+         "positionSide": "BOTH", "qty": "0.5", "price": "90", "time": closed_ms,
+         "commission": "-0.01", "commissionAsset": "USDT", "realizedPnl": "5"},
+        {"id": 12, "orderId": 21, "symbol": "ADAUSDT", "side": "BUY",
+         "positionSide": "BOTH", "qty": "1.5", "price": "92", "time": closed_ms + 1_000,
+         "commission": "0.03", "commissionAsset": "USDT", "realizedPnl": "12"},
+    ]
+
+    class TradeClient(OrderSpy):
+        def market(self, symbol):
+            assert symbol == "ADA/USDT:USDT"
+            return {"id": "ADAUSDT"}
+
+        def fapiPrivateGetUserTrades(self, params):
+            assert params == {
+                "symbol": "ADAUSDT", "startTime": int(opened_at.timestamp() * 1000),
+                "endTime": int(observed_flat_at.timestamp() * 1000), "limit": 1000,
+            }
+            return rows
+
+    service = DemoExecutionService(TradeClient(), SimpleNamespace())
+    service._market_rules = lambda _symbol: (0.1, 0.1, 0.0)
+
+    result = service.resolve_exchange_flat_close_fill(
+        "ADA/USDT:USDT", Side.SHORT, opened_at, observed_flat_at, 2.0,
+    )
+
+    assert result == {
+        "order_ids": ["21"], "quantity": 2.0, "average": 91.5,
+        "gross_pnl": 17.0, "exit_fee": pytest.approx(0.02),
+        "closed_at": datetime.fromtimestamp((closed_ms + 1_000) / 1000, timezone.utc).isoformat(),
+    }
+
+
+@pytest.mark.parametrize("invalid_row", [
+    {"id": 11, "orderId": 21, "symbol": "ADAUSDT", "side": "BUY", "positionSide": "BOTH",
+     "qty": "1.9", "price": "90", "commission": "0.1", "commissionAsset": "USDT",
+     "realizedPnl": "5", "time": 1_800_000_000_000},
+    {"id": 11, "orderId": 21, "symbol": "ADAUSDT", "side": "BUY", "positionSide": "BOTH",
+     "qty": "2", "price": "90", "commission": "0.1", "commissionAsset": "BNB",
+     "realizedPnl": "5", "time": 1_800_000_000_000},
+])
+def test_exchange_flat_close_fill_keeps_unmatched_quantity_or_fee_unverified(invalid_row):
+    from datetime import datetime, timedelta, timezone
+
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    observed_flat_at = opened_at + timedelta(hours=1)
+
+    class TradeClient(OrderSpy):
+        def market(self, _symbol):
+            return {"id": "ADAUSDT"}
+
+        def fapiPrivateGetUserTrades(self, _params):
+            invalid_row["time"] = int((opened_at + timedelta(minutes=30)).timestamp() * 1000)
+            return [invalid_row]
+
+    service = DemoExecutionService(TradeClient(), SimpleNamespace())
+    service._market_rules = lambda _symbol: (0.1, 0.1, 0.0)
+
+    assert service.resolve_exchange_flat_close_fill(
+        "ADA/USDT:USDT", Side.SHORT, opened_at, observed_flat_at, 2.0,
+    ) is None
+
+
 def test_unverified_or_incomplete_stop_trade_is_not_recorded():
     from types import SimpleNamespace
 
