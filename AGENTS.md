@@ -14,6 +14,7 @@
 - src/bot/：唯一业务包；exchange、data、backtest、live、utils 分别负责交易所、行情、回测、运行和通用工具。
 - configs/：无密钥的策略参数；default.yaml 为唯一参数源，暂不重复建立 universe.yaml。
 - scripts/：命令入口；tests/：离线测试；data/、logs/：未来缓存与日志，忽略版本管理。
+- `src/bot/backtest/research_data.py` 与 `scripts/research_mr_baseline.py`、`scripts/replay_mr_baseline.py`：独立的均值回归数据核验及 Runner 离线回放入口。`data/research/` 保存按版本隔离的公共行情快照、来源与 SHA256 清单及可重建研究结果。不写既有行情数据库或运行账本，不自动覆盖快照或清理目录。
 - goals/：保存用户明确要求的长期目标、阶段顺序与验收清单；已完成阶段需标记验收证据，不在未通过前启动后续阶段。
 - .venv/：项目局部依赖；.tmp/：可重建验证产物；均忽略版本管理，不自动删除。
 - README.md：当前能力及命令；ROADMAP.md：阶段状态；长期保留，不自动清理。

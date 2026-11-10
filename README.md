@@ -156,3 +156,14 @@ Dashboard 使用独立账本和 8767 端口：
 若均值回归条件本身形成候选，账本会写入 `entry_time_filter_decision`，记录候选方向、允许／拦截结果、原因、K 线 UTC／上海时间、脉冲 ATR 倍数、区间标记和 Runner／过滤器源码指纹。8767 对未收盘或迟到的 K 线记录 `entry_bar_rejected`。可在 Dashboard 对应账本状态中的事件记录和 Runner 日志中核对。
 
 8766 的 LOW/HIGH 衰退退出现在会在每次持仓 1H 退出评估时写入 `regime_fade_evaluated`，包含持仓／当前 4H regime、1H 收盘进展 ATR 倍数、0.5 ATR 阈值及是否在热点榜。数据缺失或更高优先级退出先发生时写入 `regime_fade_check_skipped`；条件触发时先写 `regime_fade_exit_attempted`，交易所确认平仓后仍以 `paper_fill` 和 `long_regime_faded`／`short_regime_faded` 记录成交。以上事件仅用于审计，不改变退出条件。
+
+## 均值回归二期离线研究
+
+使用 `scripts.research_mr_baseline` 核验独立的 Binance 公共行情快照并生成固定评估计划，使用 `scripts.replay_mr_baseline` 复用当前 Runner 的候选、预检、仓位风控和退出规则。数据保存在 `data/research/`。历史报价按小时模拟，币池、费用和时间窗见 [研究基线](RESEARCH_BASELINE.md)。
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.research_mr_baseline --collect-public --snapshot data/research/public-20261110-v1 --output-dir data/research/audit-next
+.\.venv\Scripts\python.exe -m scripts.replay_mr_baseline --snapshot data/research/public-20261110-v1 --plan data/research/audit-next/evaluation_plan.json --output-dir data/research/replay-next --window test
+```
+
+省略 `--window` 运行计划内的全部场景，`--scenario` 可单独选择对应的成本方案。为每次输出指定新目录，保存输入摘要和 SHA256、逐笔交易、权益曲线和对账差额。快照来源为无凭据的生产公共接口，原有市场 SQLite 仅读取。该入口仅供离线研究。
