@@ -121,7 +121,7 @@ def test_initial_entry_zero_quantity_persists_xmr_like_risk_reason(settings, mon
     monkeypatch.setattr(runner, "_utc_now", lambda: NOW)
     monkeypatch.setattr(runner, "_ema9_reclaim_side", lambda _frame: "long")
     monkeypatch.setattr(runner, "_funding_flip_side", lambda *_args, **_kwargs: ("long", {}))
-    context = EntrySignalContext(SYMBOL, Side.LONG, NOW, NOW, NOW, 98, 99, 101, 1, 97, 103)
+    context = EntrySignalContext(SYMBOL, Side.LONG, NOW, NOW, NOW, 98, 99, 101, 1, 97, 103, .01)
     candidate = (SYMBOL, .02, Side.LONG, 99, 97, 1, 97, 103, "MID", "test", None,
                  context, TimeFilterFlags(True, True, False, False), 0)
     execution = SimpleNamespace(lead_market_ids={"TESTUSDT"})
@@ -475,7 +475,7 @@ def test_next_candidate_refreshes_snapshot_after_prior_fill(settings, monkeypatc
     monkeypatch.setattr(runner, "_audit_demo_protective_stops", audit)
     monkeypatch.setattr(runner, "_fetch_entry_funding_rate", lambda *args, **kwargs: 0)
     monkeypatch.setattr(runner, "_open_position", lambda *args, **kwargs: calls.append("open") or None)
-    context = EntrySignalContext(SYMBOL, Side.LONG, NOW, NOW, NOW, 97, 98, 100, 1, 97, 103)
+    context = EntrySignalContext(SYMBOL, Side.LONG, NOW, NOW, NOW, 97, 98, 100, 1, 97, 103, .01)
     candidate = (SYMBOL, 1, Side.LONG, 98, 96.6, 1, 97, 103, "MID", "test", None, context, None, 0)
     market_risk = MarketRiskAssessment(MarketRiskState.NORMAL, "normal", NOW, "BTC/USDT:USDT", "4h", {})
     execution = SimpleNamespace(lead_market_ids={"TESTUSDT"})

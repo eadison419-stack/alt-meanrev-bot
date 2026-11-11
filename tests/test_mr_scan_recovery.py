@@ -32,7 +32,8 @@ def scan_env(monkeypatch, tmp_path):
     faults = {}
     one = pd.DataFrame({"open": 97.5, "high": 99., "low": 97., "close": 98., "volume": 1.},
                        index=pd.date_range(end=NOW.replace(second=0)-timedelta(hours=1), periods=60, freq="h"))
-    four = pd.DataFrame({"close": 100.}, index=pd.date_range(end=NOW, periods=100, freq="4h"))
+    four = pd.DataFrame({"open": 100., "high": 101., "low": 99., "close": 100., "volume": 1.},
+                        index=pd.date_range(end=NOW.replace(hour=0, minute=0, second=0), periods=100, freq="4h"))
     monkeypatch.setattr(runner, "_utc_now", lambda: clock[0])
     monkeypatch.setattr(
         runner, "_ema9_reclaim_side",

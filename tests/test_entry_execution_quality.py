@@ -27,7 +27,7 @@ def _book(at=NOW, *, bid=98.1, ask=98.2):
             "bids": [[bid, 1000.0]], "asks": [[ask, 1000.0]]}
 
 
-def _guard(monkeypatch, *, side=Side.LONG, book=None):
+def _guard(monkeypatch, *, side=Side.LONG, book=None, deviation_pct=0.01):
     settings = load_settings(env_file=None)
     clock = [NOW]
     monkeypatch.setattr(runner, "_utc_now", lambda: clock[0])
@@ -36,7 +36,7 @@ def _guard(monkeypatch, *, side=Side.LONG, book=None):
         SYMBOL, side, NOW.replace(second=0), NOW-timedelta(seconds=5), NOW,
         97.5 if side is Side.LONG else 102.5,
         98.0 if side is Side.LONG else 102.0,
-        100.0, 1.0, 97.0, 103.0,
+        100.0, 1.0, 97.0, 103.0, deviation_pct,
     )
     planned_stop = 96.75 if side is Side.LONG else 103.25
     intent = OrderIntent(SYMBOL, side, Action.OPEN, 1.0, context.signal_close,
@@ -67,6 +67,32 @@ def _guard(monkeypatch, *, side=Side.LONG, book=None):
         TimeFilterFlags(True, True, False, False), 0.0, risk, audit,
     )
     return guard, deadline, audit, intent, state, settings, clock, client
+
+
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+def test_preflight_retains_original_atr_threshold_after_price_returns_inside_it(monkeypatch, side):
+    guard, _, audit, intent, state, _, _, _ = _guard(monkeypatch, side=side, deviation_pct=0.02)
+    # The executable quote is still 1.8% from EMA, but the closed signal required 2%.
+    with pytest.raises(EntryPreflightRejected, match="entry_signal_no_longer_valid"):
+        guard(intent, intent.stop_price)
+    assert audit["deviation_threshold_pct"] == 0.02
+    assert not state.portfolio.positions
+
+
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+def test_preflight_does_not_recalculate_atr_from_later_bars(monkeypatch, side):
+    guard, _, audit, intent, _, _, _, _ = _guard(monkeypatch, side=side, deviation_pct=0.016)
+    monkeypatch.setattr(runner, "_atr_deviation_threshold", lambda *_:
+                        pytest.fail("preflight must use the frozen closed-bar threshold"))
+    guard(intent, intent.stop_price)
+    assert audit["decision"] == "ALLOW"
+
+
+def test_preflight_rejects_missing_threshold_before_fetching_quotes(monkeypatch):
+    guard, _, audit, intent, _, _, _, client = _guard(monkeypatch, deviation_pct=float("nan"))
+    with pytest.raises(EntryPreflightRejected, match="entry_deviation_unavailable"):
+        guard(intent, intent.stop_price)
+    assert client.calls == 0 and audit["decision"] == "BLOCK"
 
 
 @pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])

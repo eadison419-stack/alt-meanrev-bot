@@ -85,6 +85,8 @@ FOUR_H_MS = 4 * HOUR_MS
 DAY_MS = 24 * HOUR_MS
 TOP_N = 20
 DEV_PCT = 0.01
+DEV_ATR_MULTIPLIER = 0.8
+DEV_RULE = "atr_0p8_floor_1pct"
 EMA9_RECLAIM_PERIOD = 9
 DYNAMIC_LIMIT_RANGE_ATR = 1.8
 DYNAMIC_LIMIT_BODY_RETRACE = 0.441
@@ -451,11 +453,12 @@ def _record_lead_whitelist_observation(state, execution, ranked_hotlist,
     return True
 
 
-def _atr_deviation_shadow_threshold(frame4, settings):
-    """Return (ATR, ATR%, candidate threshold), or null values if unavailable."""
-    if frame4 is None or frame4.empty:
+def _atr_deviation_threshold(frame4, settings):
+    """Return the entry threshold from closed 4H bars, failing closed if invalid."""
+    if frame4 is None or len(frame4) < settings.lookback.atr_len:
         return None, None, None
     try:
+        validate_ohlcv(frame4)
         atr_value = float(atr(frame4, settings.lookback.atr_len).iloc[-1])
         close = float(frame4["close"].iloc[-1])
     except (IndexError, KeyError, TypeError, ValueError, OverflowError):
@@ -463,18 +466,18 @@ def _atr_deviation_shadow_threshold(frame4, settings):
     if not math.isfinite(atr_value) or atr_value <= 0 or not math.isfinite(close) or close <= 0:
         return None, None, None
     atr_pct = atr_value / close
-    return atr_value, atr_pct, max(DEV_PCT, 0.8 * atr_pct)
+    return atr_value, atr_pct, max(DEV_PCT, DEV_ATR_MULTIPLIER * atr_pct)
 
 
 def _record_atr_deviation_shadow(state, symbol, frame1, frame4, bar_close_time,
                                  evaluated_at, closed_ema, close, flags, settings,
                                  baseline_signal, stop, entry_atr, regime_value,
-                                 daily_gate, scan_row):
-    """Record an observe-only threshold comparison for an accepted Lead candidate."""
+                                 daily_gate, scan_row, active_threshold):
+    """Retain the fixed-threshold comparison before applying the active ATR gate."""
     shadow_key = f"{symbol}|{bar_close_time.isoformat()}"
     if scan_row is not None and scan_row.get("atr_deviation_shadow_key") == shadow_key:
         return
-    atr4, atr_pct, threshold = _atr_deviation_shadow_threshold(frame4, settings)
+    atr4, atr_pct, threshold = _atr_deviation_threshold(frame4, settings)
     if threshold is None:
         shadow_signal = None
         shadow_reason = "closed_4h_atr_unavailable"
@@ -519,6 +522,10 @@ def _record_atr_deviation_shadow(state, symbol, frame1, frame4, bar_close_time,
                             else "ALLOW" if shadow_allowed else "FILTER"),
         "shadow_side": shadow_signal.side.value if shadow_allowed else None,
         "shadow_reason": shadow_reason,
+        "active_deviation_rule": DEV_RULE,
+        "active_threshold_pct": active_threshold,
+        "active_decision": ("UNAVAILABLE" if active_threshold is None else
+                            "ALLOW" if abs(close / closed_ema - 1.0) >= active_threshold else "FILTER"),
         "time_filter_decision": "ALLOW",
         "daily_gate": ({
             "ready": daily_gate.get("ready"),
@@ -821,6 +828,7 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
         "submission_deadline": deadline.isoformat(),
         "signal_open": context.signal_open, "signal_close": context.signal_close,
         "closed_4h_ema": context.closed_ema, "signal_atr": context.atr,
+        "deviation_threshold_pct": context.deviation_pct,
         "public_quote": None, "demo_quote": None,
     })
     multiplier = (settings.market_risk.elevated_size_multiplier
@@ -849,6 +857,8 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
             reject("exchange_clock_stale_or_unavailable")
         if _utc_now() > deadline:
             reject("entry_signal_expired")
+        if not math.isfinite(context.deviation_pct) or context.deviation_pct <= 0:
+            reject("entry_deviation_unavailable")
         if state.execution_mode == "lead_usdm":
             if (mr_scan.unresolved_attempts(state)
                     or not _demo_sync_stopped(execution, state, _utc_now())
@@ -903,7 +913,7 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
             reject("entry_price_beyond_planned_stop")
         signal = deviation_entry_signal_at_ema(
             context.closed_ema, context.signal_open, quote_price, settings, flags,
-            deviation_pct=DEV_PCT,
+            deviation_pct=context.deviation_pct,
         )
         if signal.action is not Action.OPEN or signal.side is not context.side:
             reject("entry_signal_no_longer_valid")
@@ -3698,7 +3708,8 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
 
 def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regimes,
                      settings, now, structure_reentry_states, *, daily_direction_gate=False,
-                     position_monitor=None, closed_market_cache=None, scan_row=None):
+                     position_monitor=None, closed_market_cache=None, scan_row=None,
+                     deviation_pct=None):
     span = settings.symbol_regime.ema_slow_bars
     if position_monitor is not None:
         position_monitor()
@@ -3816,21 +3827,45 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
             scan_row=scan_row,
         )
         return None
-    context = EntrySignalContext(
-        symbol, sig.side, bar_close_time, now, evaluated_at,
-        float(candle["open"]), close, closed_ema, entry_atr, swing_low, swing_high,
-    ) if is_demo else None
-    execution_plan = _entry_execution_plan(candle, entry_atr, bar_close_time, sig.side)
-    execution_plan["ema9_reclaim_side"] = ema9_side
+    atr4, atr4_pct, atr_threshold = _atr_deviation_threshold(frame4, settings)
+    # The explicit override is used only by frozen offline research hypotheses.
+    threshold = atr_threshold if deviation_pct is None else deviation_pct
     if state.execution_mode == "lead_usdm" and scan_row is not None:
         try:
             _record_atr_deviation_shadow(
                 state, symbol, frame1, frame4, bar_close_time, evaluated_at,
                 closed_ema, close, flags, settings, sig, stop, entry_atr,
-                regime_value, daily_gate, scan_row,
+                regime_value, daily_gate, scan_row, threshold,
             )
         except Exception as exc:  # Observability must not affect the live candidate.
             logger.warning("Lead ATR deviation shadow unavailable: {}", type(exc).__name__)
+    deviation_details = {"deviation_threshold_pct": threshold,
+                         "closed_4h_atr": atr4, "closed_4h_atr_pct": atr4_pct,
+                         "deviation_pct": dev}
+    if threshold is None or not math.isfinite(threshold) or threshold <= 0:
+        _record_entry_rejection(
+            state, symbol, sig.side, "entry_deviation_unavailable", "entry_deviation", now,
+            bar_close_at=bar_close_time, scan_row=scan_row, details=deviation_details,
+        )
+        return None
+    active_signal = deviation_entry_signal_at_ema(
+        closed_ema, float(candle["open"]), close, settings, flags,
+        deviation_pct=threshold,
+    )
+    if active_signal.action is not Action.OPEN or active_signal.side is not sig.side:
+        _record_entry_rejection(
+            state, symbol, sig.side, "atr_deviation_not_met", "entry_deviation", now,
+            bar_close_at=bar_close_time, scan_row=scan_row, details=deviation_details,
+        )
+        return None
+    context = EntrySignalContext(
+        symbol, sig.side, bar_close_time, now, evaluated_at,
+        float(candle["open"]), close, closed_ema, entry_atr, swing_low, swing_high,
+        threshold,
+    ) if is_demo else None
+    execution_plan = _entry_execution_plan(candle, entry_atr, bar_close_time, sig.side)
+    execution_plan.update(ema9_reclaim_side=ema9_side, deviation_threshold_pct=threshold,
+                          closed_4h_atr_pct=atr4_pct)
     return (symbol, strength, sig.side, close, stop, entry_atr,
                        swing_low, swing_high, regime_value, sig.reason, daily_gate,
                        context, flags, execution_plan)
@@ -4006,6 +4041,7 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
             "quantity": float(qty), "expires_at": limit_expires_at,
             "ema9_reclaim_side": execution_plan.get("ema9_reclaim_side"),
             "funding_flip": execution_plan.get("funding_flip"),
+            "deviation_threshold_pct": execution_plan.get("deviation_threshold_pct"),
             "meta": {"entry_atr": float(entry_atr),
                      "structure_low": float(swing_low),
                      "structure_high": float(swing_high)},
@@ -4397,6 +4433,10 @@ def main() -> int:
                                  "previous": state.strategy_variant,
                                  "current": candidate_variant})
             state.strategy_variant = candidate_variant
+        state.events.append({"event": "entry_deviation_policy_loaded", "at": _utc_now().isoformat(),
+                             "rule": DEV_RULE, "minimum_deviation_pct": DEV_PCT,
+                             "atr_multiplier": DEV_ATR_MULTIPLIER, "timeframe": "4h",
+                             "price_source": "last_closed_4h_close", "runner_build_id": RUNNER_BUILD_ID})
         checkpoint.try_save()
 
         logger.info("Starting MR candidate: mode={} strategy={} max_positions={} risk_per_trade_pct={} poll={} intrabar_entries={} adopt_manual_positions={} runner_build_id={} time_filter_build_id={} state={}",

@@ -20,6 +20,7 @@ class EntrySignalContext:
     atr: float
     structure_low: float
     structure_high: float
+    deviation_pct: float
 
 
 def execution_quote(book, side, observed_at, *, max_age_sec):

@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import json
+import math
 import os
 
 import pandas as pd
@@ -331,26 +332,65 @@ def test_lead_whitelist_observation_records_ranking_and_deduplicates_per_bar():
     ]
 
 
-def test_atr_deviation_shadow_threshold_uses_floor_and_closed_4h_atr_percent():
+def test_atr_deviation_threshold_uses_floor_and_closed_4h_atr_percent():
     settings = load_settings(env_file=None)
     _one_hour, four_hour = _frames()
 
-    _atr_value, atr_pct, threshold = runner._atr_deviation_shadow_threshold(four_hour, settings)
+    _atr_value, atr_pct, threshold = runner._atr_deviation_threshold(four_hour, settings)
 
     assert atr_pct == pytest.approx(0.02)
     assert threshold == pytest.approx(0.016)
     four_hour.loc[:, "high"] = four_hour["close"] + 0.1
     four_hour.loc[:, "low"] = four_hour["close"] - 0.1
-    _atr_value, atr_pct, threshold = runner._atr_deviation_shadow_threshold(four_hour, settings)
+    _atr_value, atr_pct, threshold = runner._atr_deviation_threshold(four_hour, settings)
     assert threshold == runner.DEV_PCT
 
 
-@pytest.mark.parametrize(("side", "open_price", "close_price", "expected_stop"), [
-    (Side.LONG, 98.0, 98.5, 96.5),
-    (Side.SHORT, 102.0, 101.5, 103.5),
+@pytest.mark.parametrize("invalid", ["missing", "short", "bad_ohlc", "zero_price"])
+def test_atr_deviation_threshold_has_no_fixed_fallback_when_data_is_invalid(invalid):
+    settings = load_settings(env_file=None)
+    _, frame = _frames()
+    if invalid == "missing":
+        frame = None
+    elif invalid == "short":
+        frame = frame.iloc[:settings.lookback.atr_len - 1]
+    elif invalid == "bad_ohlc":
+        frame.loc[frame.index[-1], "high"] = float("nan")
+    else:
+        frame.loc[frame.index[-1], "close"] = 0
+    assert runner._atr_deviation_threshold(frame, settings) == (None, None, None)
+
+
+@pytest.mark.parametrize("mode", ["lead_usdm", "demo_usdm", "local_paper"])
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+def test_atr_gate_is_shared_by_execution_modes(monkeypatch, mode, side):
+    settings = load_settings(env_file=None)
+    state = MultiPaperState(execution_mode=mode)
+    symbol = "APR/USDT:USDT"
+    now = datetime(2026, 10, 26, 5, tzinfo=timezone.utc)
+    f1, f4 = _frames()
+    op, close = (98, 98.5) if side is Side.LONG else (102, 101.5)
+    f1.loc[f1.index[-1], ["open", "high", "low", "close"]] = [op, max(op, close)+.2, min(op, close)-.2, close]
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    monkeypatch.setattr(runner, "atr", lambda frame, _: pd.Series(1 if frame is f1 else 2, index=frame.index))
+    monkeypatch.setattr(runner, "evaluate_time_filter", lambda *a, **k: TimeFilterFlags(True, True, False, False))
+    monkeypatch.setattr(runner, "_cached_daily_direction_gate", lambda *a, **k: {"ready": True, "direction": side.value})
+    monkeypatch.setattr(runner, "_ema9_reclaim_side", lambda _: side.value)
+    monkeypatch.setattr(runner, "calculate_adaptive_stop", lambda *a, **k: (96 if side is Side.LONG else 104, 1))
+    scan_row = {"bar": f1.index[-1].isoformat()}
+    assert runner._entry_candidate(object(), state, mode != "local_paper", symbol,
+        {symbol: f1}, {symbol: f4}, {}, settings, now, {}, scan_row=scan_row) is None
+    assert scan_row["reason"] == "atr_deviation_not_met"
+
+
+@pytest.mark.parametrize(("side", "open_price", "close_price", "expected_stop", "allowed"), [
+    (Side.LONG, 98.0, 98.5, 96.5, False),
+    (Side.SHORT, 102.0, 101.5, 103.5, False),
+    (Side.LONG, 98.0, 98.3, 96.5, True),
+    (Side.SHORT, 102.0, 101.7, 103.5, True),
 ])
-def test_lead_atr_deviation_shadow_is_observational_and_deduplicated(
-        side, open_price, close_price, expected_stop, monkeypatch):
+def test_lead_atr_gate_filters_both_sides_and_retains_deduplicated_fixed_comparison(
+        side, open_price, close_price, expected_stop, allowed, monkeypatch):
     settings = load_settings(env_file=None)
     state = MultiPaperState(execution_mode="lead_usdm")
     symbol = "APR/USDT:USDT"
@@ -389,8 +429,14 @@ def test_lead_atr_deviation_shadow_is_observational_and_deduplicated(
         settings, now, {}, scan_row=scan_row,
     )
 
-    assert candidate[2] is side and candidate[4] == expected_stop
-    assert repeated_candidate[:11] == candidate[:11]
+    if allowed:
+        assert candidate[2] is side and candidate[4] == expected_stop
+        assert candidate[11].deviation_pct == pytest.approx(.016)
+        assert candidate[13]["deviation_threshold_pct"] == pytest.approx(.016)
+        assert repeated_candidate[:11] == candidate[:11]
+    else:
+        assert candidate is None and repeated_candidate is None
+        assert scan_row["reason"] == "atr_deviation_not_met"
     assert scan_row["atr_deviation_shadow_key"] == (
         f"{symbol}|{(one_hour.index[-1] + timedelta(hours=1)).isoformat()}"
     )
@@ -400,7 +446,9 @@ def test_lead_atr_deviation_shadow_is_observational_and_deduplicated(
     assert events[0]["baseline_decision"] == "ALLOW"
     assert events[0]["baseline_side"] == side.value
     assert events[0]["shadow_threshold_pct"] == pytest.approx(0.016)
-    assert events[0]["shadow_decision"] == "FILTER"
+    assert events[0]["shadow_decision"] == ("ALLOW" if allowed else "FILTER")
+    assert events[0]["active_decision"] == events[0]["shadow_decision"]
+    assert events[0]["active_deviation_rule"] == runner.DEV_RULE
     assert events[0]["shadow_key"] == scan_row["atr_deviation_shadow_key"]
 
 
@@ -437,7 +485,8 @@ def test_atr_deviation_shadow_key_flows_into_lead_entry_attempt():
     assert outcome["atr_deviation_shadow_key"] == scan_row["atr_deviation_shadow_key"]
 
 
-def test_lead_atr_shadow_observer_failure_does_not_block_baseline_candidate(monkeypatch):
+@pytest.mark.parametrize(("atr4", "allowed"), [(1.0, True), (2.0, False), (float("nan"), False)])
+def test_lead_atr_observer_failure_cannot_bypass_active_threshold(monkeypatch, atr4, allowed):
     settings = load_settings(env_file=None)
     state = MultiPaperState(execution_mode="lead_usdm")
     symbol = "APR/USDT:USDT"
@@ -450,7 +499,7 @@ def test_lead_atr_shadow_observer_failure_does_not_block_baseline_candidate(monk
     flags = TimeFilterFlags(True, True, False, False)
     monkeypatch.setattr(
         runner, "atr",
-        lambda frame, _period: pd.Series(1.0, index=frame.index),
+        lambda frame, _period: pd.Series(1.0 if frame is one_hour else atr4, index=frame.index),
     )
     monkeypatch.setattr(runner, "evaluate_time_filter", lambda *args, **kwargs: flags)
     monkeypatch.setattr(
@@ -471,8 +520,13 @@ def test_lead_atr_shadow_observer_failure_does_not_block_baseline_candidate(monk
         settings, now, {}, scan_row=scan_row,
     )
 
-    assert candidate is not None and candidate[2] is Side.LONG
-    assert candidate[4] == 96.5
+    if allowed:
+        assert candidate is not None and candidate[2] is Side.LONG
+        assert candidate[4] == 96.5
+    else:
+        assert candidate is None
+        assert scan_row["reason"] == ("entry_deviation_unavailable" if math.isnan(atr4)
+                                     else "atr_deviation_not_met")
     assert "atr_deviation_shadow_key" not in scan_row
     assert not [event for event in state.events
                 if event.get("event") == "atr_deviation_entry_shadow"]

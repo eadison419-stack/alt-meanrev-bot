@@ -524,7 +524,6 @@ def _replay(frames, metadata, settings, start, end, initial_equity, mode, clock,
         reentry = runner._structure_reentry_states(reentry_events, symbols)
         if market_risk.state is not MarketRiskState.PAUSE_NEW:
             candidates = []
-            candidate_thresholds = {}
             for row in hotlist:
                 symbol = row["symbol"]
                 if symbol in state.portfolio.positions:
@@ -543,22 +542,15 @@ def _replay(frames, metadata, settings, start, end, initial_equity, mode, clock,
                         and not _reversal_body_midpoint_pass(one[symbol], raw_side)):
                     research_filter_rejections["reversal_body_midpoint"] += 1
                     continue
-                previous_deviation = runner.DEV_PCT
-                runner.DEV_PCT = thresholds[raw_side]
-                try:
-                    candidate = runner._entry_candidate(public, state, True, symbol, one, four,
-                        {}, settings, clock.now(), reentry, closed_market_cache=cache)
-                finally:
-                    runner.DEV_PCT = previous_deviation
+                candidate = runner._entry_candidate(public, state, True, symbol, one, four,
+                    {}, settings, clock.now(), reentry, closed_market_cache=cache,
+                    deviation_pct=thresholds[raw_side])
                 if candidate is not None:
                     if _ema_space_r(raw_side, candidate[3], candidate[4], ema[symbol]) < hypothesis.minimum_ema_space_r:
                         research_filter_rejections["ema_space_below_minimum"] += 1
                         continue
                     candidates.append(_with_entry_regime(candidate, regimes))
-                    candidate_thresholds[symbol] = thresholds[candidate[2]]
             for candidate in sorted(candidates, key=lambda row: -row[1]):
-                previous_deviation = runner.DEV_PCT
-                runner.DEV_PCT = candidate_thresholds[candidate[0]]
                 previous_runner_funding_gate = runner.funding_rate_rejection_reason
                 previous_risk_funding_gate = risk_module.funding_rate_rejection_reason
                 if hypothesis.funding_adverse_threshold is not None:
@@ -572,7 +564,6 @@ def _replay(frames, metadata, settings, start, end, initial_equity, mode, clock,
                         (*candidate, None), settings, settings.sizing.max_symbols, fee, slip,
                         clock.now(), market_risk)
                 finally:
-                    runner.DEV_PCT = previous_deviation
                     runner.funding_rate_rejection_reason = previous_runner_funding_gate
                     risk_module.funding_rate_rejection_reason = previous_risk_funding_gate
         state.exchange_snapshot = execution.sync_snapshot()
