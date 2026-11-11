@@ -194,6 +194,108 @@ def rank_hot_candidates(candidates: list[tuple[str, float]], tickers: dict,
     return score_hot_candidates(candidates, tickers, activity)[:limit]
 
 
+def rank_mean_reversion_candidates(candidates_metrics: list[dict]) -> list[dict]:
+    """Rank eligible symbols by mean-reversion volatility, activity, and liquidity.
+
+    Inputs must already pass tradability, account whitelist, and closed-daily-history
+    gates. Scores use bounded component values and cross-sectional midranks so no
+    single extreme raw metric can dominate the final 30/35/35 weighting.
+    """
+    if not candidates_metrics:
+        return []
+
+    symbols = [str(item["symbol"]) for item in candidates_metrics]
+    if len(symbols) != len(set(symbols)):
+        raise ValueError("candidate symbols must be unique")
+
+    def finite_metric(item, key, *, positive=False):
+        try:
+            value = float(item.get(key))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(value) or (positive and value <= 0):
+            return None
+        return value
+
+    volume_health = {}
+    elasticity = {}
+    quote_volume = {}
+    trade_count = {}
+    spread = {}
+    depth = {}
+    efficiency = {}
+    for item in candidates_metrics:
+        symbol = str(item["symbol"])
+        ratio = finite_metric(item, "volume_ratio_24h_7d", positive=True)
+        if ratio is None:
+            volume_health[symbol] = None
+        elif ratio < 1.2:
+            volume_health[symbol] = max(0.1, ratio / 1.2)
+        elif ratio <= 2.5:
+            volume_health[symbol] = 1.0
+        elif ratio <= 3.5:
+            volume_health[symbol] = 1.0 - (ratio - 2.5) * 0.3
+        else:
+            volume_health[symbol] = max(0.2, 0.7 - (ratio - 3.5) * 0.5)
+
+        natr = finite_metric(item, "natr_4h", positive=True)
+        range_24h = finite_metric(item, "range_24h", positive=True)
+        net_move_24h = finite_metric(item, "net_move_24h")
+        if natr is None or range_24h is None or net_move_24h is None:
+            elasticity[symbol] = None
+            efficiency[symbol] = None
+        else:
+            two_way = range_24h / max(abs(net_move_24h), range_24h * 0.2)
+            efficiency[symbol] = min(two_way, 3.0)
+            elasticity[symbol] = natr * efficiency[symbol]
+
+        quote_volume[symbol] = finite_metric(item, "quote_volume_24h", positive=True)
+        trade_count[symbol] = finite_metric(item, "trade_count_24h", positive=True)
+        spread[symbol] = finite_metric(item, "spread_pct", positive=True)
+        depth[symbol] = finite_metric(item, "top_book_depth_usdt", positive=True)
+
+    volume_scores = _percentile_scores(volume_health)
+    elasticity_scores = _percentile_scores(elasticity)
+    turnover_scores = _percentile_scores(quote_volume)
+    trade_scores = _percentile_scores(trade_count)
+    spread_scores = _percentile_scores({
+        symbol: -value if value is not None else None for symbol, value in spread.items()
+    })
+    depth_scores = _percentile_scores(depth)
+
+    ranked = []
+    for item in candidates_metrics:
+        symbol = str(item["symbol"])
+        liquidity_score = (
+            0.40 * turnover_scores[symbol]
+            + 0.20 * trade_scores[symbol]
+            + 0.20 * spread_scores[symbol]
+            + 0.20 * depth_scores[symbol]
+        )
+        components = {
+            "volume_health": volume_scores[symbol],
+            "elasticity": elasticity_scores[symbol],
+            "liquidity": liquidity_score,
+        }
+        score = 100 * (
+            0.30 * components["volume_health"]
+            + 0.35 * components["elasticity"]
+            + 0.35 * components["liquidity"]
+        )
+        ranked.append({
+            **item,
+            "hot_score": round(score, 2),
+            "two_way_efficiency": efficiency[symbol],
+            "hot_score_components": components,
+        })
+    ranked.sort(key=lambda row: (
+        -row["hot_score"],
+        -float(row.get("quote_volume_24h") or 0),
+        str(row["symbol"]),
+    ))
+    return ranked
+
+
 def select_tradable_crypto_universe(exchange: OHLCVExchange, settings, *,
                                     now: datetime | None = None) -> list[tuple[str, float]]:
     """Fetch current exchange metadata and return all basically tradable crypto contracts."""

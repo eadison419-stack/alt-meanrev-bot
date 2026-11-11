@@ -550,7 +550,9 @@ def test_demo_cycle_evaluates_the_same_closed_hour_only_once(monkeypatch):
     monkeypatch.setattr(runner, "_utc_now", lambda: NOW)
     risk = MarketRiskAssessment(MarketRiskState.NORMAL, "normal", NOW, "BTC/USDT:USDT", "4h", {})
     monkeypatch.setattr(runner, "_update_market_risk", lambda *args: risk)
-    monkeypatch.setattr(runner, "_build_universe", lambda *args, **kwargs: ({}, [{"symbol": SYMBOL}], {SYMBOL: one}, {}, {}))
+    monkeypatch.setattr(runner, "_build_universe", lambda *args, **kwargs: (
+        {}, [{"symbol": SYMBOL}], {SYMBOL: one}, {}, {}, [],
+    ))
     monkeypatch.setattr(runner, "_cached_four_hour", lambda *args: four)
     monkeypatch.setattr(runner, "_demo_sync_stopped", lambda *args: True)
     monkeypatch.setattr(runner, "_demo_stop_audit_due", lambda *args: False)

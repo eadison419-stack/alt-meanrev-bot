@@ -49,7 +49,8 @@ from loguru import logger
 
 from bot.config import PROJECT_ROOT, load_settings
 from bot.data.klines import (filter_tradable_crypto_universe, hot_activity_metrics,
-                             ohlcv_frame, score_hot_candidates)
+                             ohlcv_frame, rank_mean_reversion_candidates,
+                             score_hot_candidates)
 from bot.exchange.binance_usdm import (create_demo_usdm, create_lead_usdm,
                                        resolve_execution_mode)
 from bot.exchange.network import configure_system_proxy
@@ -84,6 +85,7 @@ HOUR_MS = 3600 * 1000
 FOUR_H_MS = 4 * HOUR_MS
 DAY_MS = 24 * HOUR_MS
 TOP_N = 20
+MIN_DAILY_UNIVERSE_BARS = 55
 DEV_PCT = 0.01
 DEV_ATR_MULTIPLIER = 0.8
 DEV_RULE = "atr_0p8_floor_1pct"
@@ -126,6 +128,7 @@ class ClosedMarketCache:
 
     four_hour: dict = field(default_factory=dict)
     daily_direction: dict = field(default_factory=dict)
+    universe_four_hour: dict = field(default_factory=dict)
 
 
 def _utc_now():
@@ -416,6 +419,16 @@ def _filter_lead_candidates(hotlist, markets, execution):
         row for row in hotlist
         if str((markets.get(row["symbol"]) or {}).get("id", "")).upper()
         in allowed_market_ids
+    ]
+
+
+def _filter_lead_market_candidates(candidates, markets, lead_market_ids):
+    if not lead_market_ids:
+        raise RuntimeError("Lead Portfolio contract whitelist is unavailable; refusing entries")
+    allowed = {str(value).upper() for value in lead_market_ids}
+    return [
+        (symbol, quote_volume) for symbol, quote_volume in candidates
+        if str((markets.get(symbol) or {}).get("id", "")).upper() in allowed
     ]
 
 
@@ -2372,7 +2385,7 @@ def _closed(frame_rows, timeframe_ms, now_ms):
 
 
 def _daily_direction_gate(exchange, symbol, signal_at, span, *, fail_on_market_error=False,
-                          prefetched=None):
+                          prefetched=None, atr_period=14, minimum_bars=55):
     """Return a fail-closed direction from completed UTC daily candles only."""
     signal_at = signal_at.replace(tzinfo=timezone.utc) if signal_at.tzinfo is None else signal_at
     signal_at = signal_at.astimezone(timezone.utc)
@@ -2393,7 +2406,7 @@ def _daily_direction_gate(exchange, symbol, signal_at, span, *, fail_on_market_e
         completed = _closed(rows, DAY_MS, signal_ms)
         frame = ohlcv_frame(completed)
         frame = frame.loc[~frame.index.duplicated(keep="last")]
-        if len(frame) < span + 1:
+        if len(frame) < max(span + 1, minimum_bars):
             return {
                 "ready": False, "direction": None,
                 "reason": "daily_history_insufficient", "daily_bars": len(frame),
@@ -2414,6 +2427,28 @@ def _daily_direction_gate(exchange, symbol, signal_at, span, *, fail_on_market_e
         daily_ema = float(ema.iloc[-1])
         if not math.isfinite(daily_ema) or daily_ema <= 0 or daily_close <= 0:
             raise ValueError("invalid daily EMA")
+        daily_atr = float(atr(frame, atr_period).iloc[-1])
+        if not math.isfinite(daily_atr) or daily_atr < 0:
+            raise ValueError("invalid daily ATR")
+        previous_days = frame.iloc[-8:-1]
+        previous_quote_volumes = (
+            previous_days["volume"]
+            * (previous_days["high"] + previous_days["low"] + previous_days["close"]) / 3
+        )
+        if len(previous_quote_volumes) != 7 or not all(
+                math.isfinite(float(value)) and float(value) > 0
+                for value in previous_quote_volumes):
+            raise ValueError("invalid daily quote volume baseline")
+        daily_metrics = {
+            "daily_bars": len(frame), "daily_close": daily_close,
+            "daily_ema50": daily_ema, "daily_atr": daily_atr,
+            "daily_ema_distance_atr": (
+                abs(daily_close - daily_ema) / daily_atr if daily_atr > 0 else None
+            ),
+            "daily_quote_volume_7d_avg": float(previous_quote_volumes.mean()),
+            "daily_bar_close_time": (frame.index[-1].to_pydatetime()
+                                     + timedelta(days=1)).isoformat(),
+        }
     except (IndexError, KeyError, TypeError, ValueError, OverflowError) as exc:
         return {
             "ready": False, "direction": None, "reason": "daily_data_invalid",
@@ -2428,19 +2463,13 @@ def _daily_direction_gate(exchange, symbol, signal_at, span, *, fail_on_market_e
     else:
         return {
             "ready": False, "direction": None,
-            "reason": "daily_close_equals_ema50", "daily_bars": len(frame),
-            "daily_close": daily_close, "daily_ema50": daily_ema,
-            "daily_bar_close_time": (frame.index[-1].to_pydatetime()
-                                     + timedelta(days=1)).isoformat(),
+            "reason": "daily_close_equals_ema50", **daily_metrics,
             "signal_at": signal_at.isoformat(),
         }
 
     return {
         "ready": True, "direction": direction, "reason": None,
-        "daily_bars": len(frame), "daily_close": daily_close,
-        "daily_ema50": daily_ema,
-        "daily_bar_close_time": (frame.index[-1].to_pydatetime()
-                                 + timedelta(days=1)).isoformat(),
+        **daily_metrics,
         "signal_at": signal_at.isoformat(),
     }
 
@@ -2448,12 +2477,14 @@ def _daily_direction_gate(exchange, symbol, signal_at, span, *, fail_on_market_e
 def _cached_daily_direction_gate(exchange, symbol, signal_at, span, cache, **kwargs):
     if cache is None:
         return _daily_direction_gate(exchange, symbol, signal_at, span, **kwargs)
-    key = (int(signal_at.timestamp() * 1000) // DAY_MS, span)
+    key = (int(signal_at.timestamp() * 1000) // DAY_MS, span,
+           kwargs.get("atr_period", 14), kwargs.get("minimum_bars", 55))
     saved = cache.daily_direction.get(symbol)
     if saved is not None and saved[0] == key:
         return {**saved[1], "signal_at": signal_at.isoformat()}
     result = _daily_direction_gate(exchange, symbol, signal_at, span, **kwargs)
-    if result.get("ready"):
+    if result.get("reason") not in {
+            "daily_data_unavailable", "daily_data_invalid", "daily_data_stale"}:
         cache.daily_direction[symbol] = (key, result)
     return result
 
@@ -2488,6 +2519,7 @@ def _daily_direction_rejection_reason(gate, side):
 def _daily_gate_status_fields(gate):
     fields = {key: gate[key] for key in (
         "daily_bars", "daily_close", "daily_ema50",
+        "daily_atr", "daily_ema_distance_atr", "daily_quote_volume_7d_avg",
         "daily_bar_close_time", "signal_at", "error_type",
     ) if key in gate}
     if "direction" in gate:
@@ -2646,20 +2678,38 @@ def _ticker_observed_at(tickers, symbol):
 
 
 def _build_universe(exchange, settings, now, now_ms, *, fail_on_market_error=False,
-                    on_progress=None, retry_reads=False, candle_reader=None):
+                    on_progress=None, retry_reads=False, candle_reader=None,
+                    closed_market_cache=None, lead_market_ids=None):
     deadline = now.replace(minute=0, second=0, microsecond=0) + timedelta(
         seconds=settings.execution.confirm_delay_sec_max)
     read_kwargs = {"retry": retry_reads, "deadline": deadline, "monitor": on_progress}
     markets = _read_entry_data(exchange.load_markets, phase="universe_markets", **read_kwargs)
     tickers = _read_entry_data(exchange.fetch_tickers, phase="universe_tickers", **read_kwargs)
-    candidates = filter_tradable_crypto_universe(markets, tickers, settings, now=now)
-    prefetched = (candle_reader.read_many([(symbol, "1h", 60) for symbol, _ in candidates],
-                  _public_read_deadline(now, settings), monitor=on_progress)
-                  if candle_reader is not None else {})
+    basic_candidates = filter_tradable_crypto_universe(markets, tickers, settings, now=now)
+    candidates = (basic_candidates if lead_market_ids is None else
+                  _filter_lead_market_candidates(basic_candidates, markets, lead_market_ids))
+    span = settings.symbol_regime.ema_slow_bars
+    day_key = int(now_ms) // DAY_MS
+    four_hour_key = int(now_ms) // FOUR_H_MS
+    daily_cache = closed_market_cache.daily_direction if closed_market_cache is not None else {}
+    four_hour_cache = (closed_market_cache.universe_four_hour
+                       if closed_market_cache is not None else {})
+    requests = [(symbol, "1h", 60) for symbol, _ in basic_candidates]
+    for symbol, _ in candidates:
+        daily_saved = daily_cache.get(symbol)
+        daily_key = (day_key, span, settings.lookback.atr_len, MIN_DAILY_UNIVERSE_BARS)
+        if daily_saved is None or daily_saved[0] != daily_key:
+            requests.append((symbol, "1d", max(span + 1, 100)))
+        four_saved = four_hour_cache.get(symbol)
+        if four_saved is None or four_saved[0] != four_hour_key:
+            requests.append((symbol, "4h", 15))
+    prefetched = (candle_reader.read_many(
+        requests, _public_read_deadline(now, settings), monitor=on_progress,
+    ) if candle_reader is not None else {})
     one_hour: dict[str, pd.DataFrame] = {}
     current_hour: dict[str, dict] = {}
     activity: dict[str, dict] = {}
-    for symbol, _q in candidates:
+    for symbol, _q in basic_candidates:
         if on_progress is not None:
             on_progress()
         try:
@@ -2681,10 +2731,167 @@ def _build_universe(exchange, settings, now, now_ms, *, fail_on_market_error=Fal
         closed = _closed(rows, HOUR_MS, now_ms)
         if closed:
             one_hour[symbol] = ohlcv_frame(closed)
-    scored = score_hot_candidates(candidates, tickers, activity)
+
+    # Keep the former ranking for the Lead whitelist comparison event.
+    legacy_scored = score_hot_candidates(basic_candidates, tickers, activity)
+    legacy_hotlist = [{**row, "rank": rank}
+                      for rank, row in enumerate(legacy_scored[:TOP_N], start=1)]
+
+    try:
+        book_tickers = exchange.fetch_bids_asks([symbol for symbol, _ in candidates]) if candidates else {}
+    except (AttributeError, NotImplementedError):
+        book_tickers = {}
+    except ccxt.BaseError as exc:
+        _raise_market_error_if_needed(exc, fail_on_market_error)
+        logger.warning("Universe best-bid/ask data unavailable; spread scores will be missing: {}",
+                       type(exc).__name__)
+        book_tickers = {}
+
+    def read_rows(symbol, timeframe, limit):
+        request = (symbol, timeframe, limit)
+        return _read_entry_data(
+            lambda: prefetched_read(prefetched, request,
+                                    lambda: exchange.fetch_ohlcv(symbol, timeframe, limit=limit)),
+            phase=f"universe_{timeframe}", symbol=symbol, **read_kwargs,
+        )
+
+    daily_ready = {}
+    rejection_counts = {}
+    four_hour_metrics = {}
+    for symbol, _quote_volume in candidates:
+        if on_progress is not None:
+            on_progress()
+        gate = _cached_daily_direction_gate(
+            exchange, symbol, now, span, closed_market_cache,
+            fail_on_market_error=fail_on_market_error,
+            prefetched=prefetched, atr_period=settings.lookback.atr_len,
+            minimum_bars=MIN_DAILY_UNIVERSE_BARS,
+        )
+        if not gate.get("ready"):
+            reason = gate.get("reason") or "daily_data_unavailable"
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+            continue
+        daily_ready[symbol] = gate
+
+        cached_four = four_hour_cache.get(symbol)
+        if cached_four is not None and cached_four[0] == four_hour_key:
+            four_metrics = cached_four[1]
+        else:
+            try:
+                rows4 = read_rows(symbol, "4h", 15)
+                closed4 = _closed(rows4, FOUR_H_MS, now_ms)
+                frame4 = ohlcv_frame(closed4)
+                validate_ohlcv(frame4)
+                if len(frame4) < settings.lookback.atr_len:
+                    raise ValueError("four-hour history insufficient")
+                atr4 = float(atr(frame4, settings.lookback.atr_len).iloc[-1])
+                close4 = float(frame4["close"].iloc[-1])
+                if not math.isfinite(atr4) or atr4 <= 0 or not math.isfinite(close4) or close4 <= 0:
+                    raise ValueError("four-hour ATR unavailable")
+                four_metrics = {"natr_4h": atr4 / close4}
+                four_hour_cache[symbol] = (four_hour_key, four_metrics)
+            except (ccxt.BaseError, KeyError, TypeError, ValueError, IndexError, OverflowError) as exc:
+                _raise_market_error_if_needed(exc, fail_on_market_error)
+                rejection_counts["four_hour_data_unavailable"] = (
+                    rejection_counts.get("four_hour_data_unavailable", 0) + 1
+                )
+                continue
+        four_hour_metrics[symbol] = four_metrics
+
+    metrics = []
+    for symbol, quote_volume in candidates:
+        gate = daily_ready.get(symbol)
+        frame1 = one_hour.get(symbol)
+        four_metrics = four_hour_metrics.get(symbol)
+        if gate is None or frame1 is None or four_metrics is None or len(frame1) < 24:
+            if gate is not None:
+                rejection_counts["hourly_range_unavailable"] = (
+                    rejection_counts.get("hourly_range_unavailable", 0) + 1
+                )
+            continue
+        window = frame1.iloc[-24:]
+        first_open = float(window["open"].iloc[0])
+        last_close = float(window["close"].iloc[-1])
+        range_24h = float(window["high"].max() - window["low"].min())
+        if (not all(math.isfinite(value) for value in (first_open, last_close, range_24h))
+                or first_open <= 0 or range_24h <= 0):
+            rejection_counts["hourly_range_invalid"] = rejection_counts.get("hourly_range_invalid", 0) + 1
+            continue
+
+        ticker = tickers.get(symbol) or {}
+        info = ticker.get("info") or {}
+        try:
+            raw_count = info.get("count", ticker.get("count"))
+            trade_count = float(raw_count) if raw_count is not None else None
+        except (TypeError, ValueError, OverflowError):
+            trade_count = None
+        if trade_count is not None and (not math.isfinite(trade_count) or trade_count < 0):
+            trade_count = None
+
+        book = book_tickers.get(symbol) or {}
+        try:
+            bid = float(book.get("bid"))
+            ask = float(book.get("ask"))
+            bid_volume = float(book.get("bidVolume"))
+            ask_volume = float(book.get("askVolume"))
+            if (not all(math.isfinite(value) and value > 0
+                        for value in (bid, ask, bid_volume, ask_volume)) or bid >= ask):
+                raise ValueError("invalid best bid/ask")
+            spread_pct = (ask - bid) / ((ask + bid) / 2)
+            top_book_depth = min(bid * bid_volume, ask * ask_volume)
+        except (TypeError, ValueError, OverflowError):
+            spread_pct = top_book_depth = None
+
+        daily_volume_average = gate.get("daily_quote_volume_7d_avg")
+        hourly_activity = activity.get(symbol, {})
+        metrics.append({
+            "symbol": symbol,
+            "quote_volume_24h": quote_volume,
+            "trade_count_24h": trade_count,
+            "volume_burst_ratio": hourly_activity.get("volume_burst_ratio"),
+            "return_4h_pct": hourly_activity.get("return_4h_pct"),
+            "return_24h_pct": hourly_activity.get("return_24h_pct"),
+            "volume_ratio_24h_7d": (
+                quote_volume / daily_volume_average if daily_volume_average else None
+            ),
+            "natr_4h": four_metrics["natr_4h"],
+            "range_24h": range_24h,
+            "net_move_24h": abs(last_close - first_open),
+            "spread_pct": spread_pct,
+            "top_book_depth_usdt": top_book_depth,
+            "daily_ema_distance_atr": gate.get("daily_ema_distance_atr"),
+            "daily_bars": gate.get("daily_bars"),
+            "daily_direction": gate.get("direction"),
+        })
+
+    scored = rank_mean_reversion_candidates(metrics)
     hotlist = [{**row, "rank": rank}
                for rank, row in enumerate(scored[:TOP_N], start=1)]
-    return markets, hotlist, one_hour, current_hour, tickers
+    daily_distance_shadow_top_n = [
+        {"symbol": row["symbol"], "rank": row["rank"],
+         "distance_atr": row["daily_ema_distance_atr"]}
+        for row in hotlist
+        if row.get("daily_ema_distance_atr") is not None
+        and row["daily_ema_distance_atr"] <= 0.25
+    ]
+    logger.info("MR universe funnel {}", json.dumps({
+        "basic_tradable": len(basic_candidates),
+        "lead_whitelist": len(candidates),
+        "daily_and_volatility_ready": len(daily_ready),
+        "book_quote_ready": sum(
+            1 for row in metrics if row["spread_pct"] is not None
+            and row["top_book_depth_usdt"] is not None
+        ),
+        "rankable": len(metrics),
+        "selected_top_n": len(hotlist),
+        "rejections": rejection_counts,
+        "daily_distance_shadow_rejections": sum(
+            1 for row in metrics if row.get("daily_ema_distance_atr") is not None
+            and row["daily_ema_distance_atr"] <= 0.25
+        ),
+        "daily_distance_shadow_top_n": daily_distance_shadow_top_n,
+    }, ensure_ascii=False, sort_keys=True))
+    return markets, hotlist, one_hour, current_hour, tickers, legacy_hotlist
 
 
 def _fetch_selected_bars(exchange, symbols, settings, now_ms, *, fail_on_market_error=False,
@@ -3070,6 +3277,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
     fee_rate = settings.fees.taker_bps / 10_000
     slip_rate = settings.fees.slippage_bps / 10_000
     leverage = int(settings.sizing.leverage)
+    lead_market_ids = (getattr(execution, "lead_market_ids", set())
+                       if state.execution_mode == "lead_usdm" else None)
     if is_demo:
         _reconcile_pending_entries(execution, state, checkpoint)
     resume_symbols = (state.mr_entry_scan.get("symbols", [])
@@ -3097,8 +3306,9 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
     if intrabar_entries and market_cache is not None:
         refresh_universe = (market_cache.markets is None or not _hotlist_cache_is_fresh(state, now))
         if refresh_universe:
-            markets, hotlist, one_hour, current_hour, _universe_tickers = _build_universe(
+            markets, hotlist, one_hour, current_hour, _universe_tickers, legacy_hotlist = _build_universe(
                 exchange, settings, now, now_ms, fail_on_market_error=True,
+                closed_market_cache=closed_market_cache, lead_market_ids=lead_market_ids,
             )
             market_cache.markets = markets
             market_cache.one_hour.update(one_hour)
@@ -3106,6 +3316,7 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
         else:
             markets = market_cache.markets
             hotlist = state.watchlist
+            legacy_hotlist = hotlist
 
         top_symbols = [row["symbol"] for row in hotlist]
         track = sorted(set(top_symbols) | set(state.portfolio.positions)
@@ -3155,9 +3366,10 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
         )
     else:
         batch_kwargs = {"candle_reader": candle_reader} if candle_reader is not None else {}
-        markets, hotlist, one_hour, current_hour, tickers = _build_universe(
+        markets, hotlist, one_hour, current_hour, tickers, legacy_hotlist = _build_universe(
             exchange, settings, now, now_ms, fail_on_market_error=intrabar_entries,
             on_progress=position_monitor, retry_reads=is_demo,
+            closed_market_cache=closed_market_cache, lead_market_ids=lead_market_ids,
             **batch_kwargs,
         )
         top_symbols = [row["symbol"] for row in hotlist]
@@ -3216,9 +3428,7 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
                 logger.warning("Local dynamic limit quote unavailable for {}: {}",
                                symbol, type(exc).__name__)
 
-    ranked_hotlist = hotlist
-    if state.execution_mode == "lead_usdm":
-        hotlist = _filter_lead_candidates(hotlist, markets, execution)
+    ranked_hotlist = legacy_hotlist if state.execution_mode == "lead_usdm" else hotlist
     state.watchlist = hotlist
     if intrabar_entries and not _hotlist_cache_is_fresh(state, now):
         state.exit_management_by_symbol[HOTLIST_CACHE_KEY] = {"refreshed_at": now.isoformat()}
@@ -3227,9 +3437,11 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
     if candle_reader is not None and is_demo and closed_market_cache is not None:
         span = settings.symbol_regime.ema_slow_bars
         key = (now_ms // DAY_MS, span)
+        daily_cache_key = (key[0], span, settings.lookback.atr_len,
+                           MIN_DAILY_UNIVERSE_BARS)
         requests = [(symbol, "1d", max(span + 1, 100)) for symbol in top_symbols
                     if not closed_market_cache.daily_direction.get(symbol)
-                    or closed_market_cache.daily_direction[symbol][0] != key]
+                    or closed_market_cache.daily_direction[symbol][0] != daily_cache_key]
         prefetched = candle_reader.read_many(requests, _public_read_deadline(now, settings),
                                               monitor=position_monitor)
         for symbol, _, _ in requests:
@@ -3706,6 +3918,49 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
             continue
 
 
+def _entry_priority_sort_key(candidate):
+    priority = candidate[1]
+    return (
+        -int(priority["deviation_zone"]),
+        -float(priority["reversal_score"]),
+        -min(float(priority["ema_space_r"]), 3.0),
+        abs(float(priority["deviation_atr"]) - 1.6),
+        candidate[0],
+    )
+
+
+def _entry_priority_metrics(side, candle, close, stop, closed_ema, deviation_pct, atr_pct):
+    deviation_atr = abs(deviation_pct) / atr_pct
+    if 1.0 <= deviation_atr <= 2.2:
+        zone = 2
+    elif 2.2 < deviation_atr <= 3.0:
+        zone = 1
+    else:
+        zone = 0
+    candle_range = float(candle["high"] - candle["low"])
+    if candle_range > 0:
+        close_location = ((close - float(candle["low"])) / candle_range
+                          if side is Side.LONG else
+                          (float(candle["high"]) - close) / candle_range)
+        body_ratio = abs(close - float(candle["open"])) / candle_range
+        close_location = min(1.0, max(0.0, close_location))
+        body_ratio = min(1.0, max(0.0, body_ratio))
+    else:
+        close_location = body_ratio = 0.0
+    reversal_score = (close_location + body_ratio) / 2
+    ema_space = (closed_ema - close if side is Side.LONG else close - closed_ema)
+    stop_distance = abs(close - stop)
+    ema_space_r = max(0.0, ema_space) / stop_distance if stop_distance > 0 else 0.0
+    return {
+        "deviation_atr": deviation_atr,
+        "deviation_zone": zone,
+        "reversal_score": reversal_score,
+        "candle_close_location": close_location,
+        "candle_body_ratio": body_ratio,
+        "ema_space_r": ema_space_r,
+    }
+
+
 def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regimes,
                      settings, now, structure_reentry_states, *, daily_direction_gate=False,
                      position_monitor=None, closed_market_cache=None, scan_row=None,
@@ -3788,7 +4043,6 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         return None
     closed_ema = float(frame4["close"].ewm(span=span, adjust=False, min_periods=span).mean().iloc[-1])
     dev = close / closed_ema - 1.0
-    strength = -dev if sig.side is Side.LONG else dev
     reg_frame = regimes.get(symbol)
     regime_value = Regime.MID.value
     if reg_frame is not None and len(reg_frame):
@@ -3864,9 +4118,13 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         threshold,
     ) if is_demo else None
     execution_plan = _entry_execution_plan(candle, entry_atr, bar_close_time, sig.side)
+    priority = _entry_priority_metrics(
+        sig.side, candle, close, stop, closed_ema, dev, atr4_pct,
+    )
+    execution_plan["candidate_priority"] = priority
     execution_plan.update(ema9_reclaim_side=ema9_side, deviation_threshold_pct=threshold,
                           closed_4h_atr_pct=atr4_pct)
-    return (symbol, strength, sig.side, close, stop, entry_atr,
+    return (symbol, priority, sig.side, close, stop, entry_atr,
                        swing_low, swing_high, regime_value, sig.reason, daily_gate,
                        context, flags, execution_plan)
 
@@ -4182,7 +4440,8 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                     if candidate is None:
                         finish(symbol, "evaluated", reason="no_eligible_signal")
                     else:
-                        finish(symbol, "candidate", side=candidate[2].value)
+                        finish(symbol, "candidate", side=candidate[2].value,
+                               candidate_priority=candidate[1])
                         candidates.append(candidate)
                 except mr_scan.ScanCheckpointError:
                     raise
@@ -4190,7 +4449,7 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                     if not failure(symbol, exc):
                         scan["status"] = "paused"
                         return
-            candidates.sort(key=lambda candidate: -candidate[1])
+            candidates.sort(key=_entry_priority_sort_key)
             for candidate in candidates:
                 symbol = candidate[0]
                 row = scan["outcomes"][symbol]
@@ -4260,7 +4519,10 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
         if candidate is not None:
             candidates.append(candidate)
 
-    candidates.sort(key=lambda x: -x[1])
+    candidates.sort(key=_entry_priority_sort_key)
+    logger.info("MR entry candidate priority {}", json.dumps([
+        {"symbol": candidate[0], **candidate[1]} for candidate in candidates
+    ], ensure_ascii=False, sort_keys=True))
     eligible_candidates = []
     for candidate in candidates:
         if position_monitor is not None:
@@ -4445,8 +4707,8 @@ def main() -> int:
                     args.intrabar_entries, bool(args.adopt_manual_positions),
                     RUNNER_BUILD_ID, TIME_FILTER_BUILD_ID, state_path)
         market_cache = IntrabarMarketCache() if args.intrabar_entries else None
-        closed_market_cache = ClosedMarketCache() if is_exchange_execution else None
-        candle_reader = CandleBatchReader(exchange, _utc_now) if is_exchange_execution else None
+        closed_market_cache = ClosedMarketCache()
+        candle_reader = CandleBatchReader(exchange, _utc_now)
         retry_after = _persisted_market_retry_after(state) if args.intrabar_entries else None
         market_failure_attempt = 0
         last_position_monitor_at = 0.0

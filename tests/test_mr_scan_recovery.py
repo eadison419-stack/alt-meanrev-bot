@@ -185,8 +185,10 @@ def test_interrupted_scan_resumes_unfinished_symbols_without_repeating_exits(sca
     env.state.save(env.path)
     restored = MultiPaperState.load(env.path)
     monkeypatch.setattr(runner, "_update_market_risk", lambda *a: env.risk)
-    monkeypatch.setattr(runner, "_build_universe", lambda *a, **kw: ({}, [{"symbol": s} for s in [FIRST, SECOND]],
-                                                                                {FIRST: env.one, SECOND: env.one}, {}, {}))
+    monkeypatch.setattr(runner, "_build_universe", lambda *a, **kw: (
+        {}, [{"symbol": s} for s in [FIRST, SECOND]],
+        {FIRST: env.one, SECOND: env.one}, {}, {}, [],
+    ))
     monkeypatch.setattr(runner, "_cached_four_hour", lambda *a: env.four)
     monkeypatch.setattr(runner, "_demo_sync_stopped", lambda *a: True)
     monkeypatch.setattr(runner, "_demo_stop_audit_due", lambda *a: False)

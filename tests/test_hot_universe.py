@@ -7,6 +7,7 @@ from bot.data.klines import (
     TIMEFRAME_MS,
     _percentile_scores,
     hot_activity_metrics,
+    rank_mean_reversion_candidates,
     rank_hot_candidates,
     filter_tradable_crypto_universe,
 )
@@ -155,3 +156,26 @@ def test_percentile_scores_keep_midrank_for_ties_and_zero_for_missing():
 
     assert scores == {"low": 0.125, "tie_a": 0.5, "tie_b": 0.5,
                       "high": 0.875, "missing": 0.0}
+
+
+def test_mean_reversion_rank_prefers_balanced_volume_and_tight_liquidity():
+    candidates = [
+        {"symbol": "CHOP/USDT:USDT", "volume_ratio_24h_7d": 1.8, "natr_4h": 0.02,
+         "range_24h": 8.0, "net_move_24h": 1.0, "quote_volume_24h": 80_000_000,
+         "trade_count_24h": 20_000, "spread_pct": 0.001, "top_book_depth_usdt": 50_000},
+        {"symbol": "NEWS/USDT:USDT", "volume_ratio_24h": 5.0, "natr_4h": 0.04,
+         "range_24h": 4.0, "net_move_24h": 3.0, "quote_volume_24h": 120_000_000,
+         "trade_count_24h": 40_000, "spread_pct": 0.006, "top_book_depth_usdt": 2_000},
+        {"symbol": "QUIET/USDT:USDT", "volume_ratio_24h": 0.8, "natr_4h": 0.01,
+         "range_24h": 2.0, "net_move_24h": 1.0, "quote_volume_24h": 30_000_000,
+         "trade_count_24h": 5_000, "spread_pct": 0.003, "top_book_depth_usdt": 8_000},
+    ]
+
+    ranked = rank_mean_reversion_candidates(candidates)
+
+    assert [row["symbol"] for row in ranked] == [
+        "CHOP/USDT:USDT", "NEWS/USDT:USDT", "QUIET/USDT:USDT",
+    ]
+    assert ranked[0]["two_way_efficiency"] == 3.0
+    assert ranked[0]["hot_score_components"]["volume_health"] > ranked[1]["hot_score_components"]["volume_health"]
+    assert ranked[0]["hot_score_components"]["liquidity"] > ranked[1]["hot_score_components"]["liquidity"]

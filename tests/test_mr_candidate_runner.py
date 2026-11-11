@@ -303,6 +303,108 @@ def test_lead_candidate_filter_keeps_only_portfolio_whitelisted_usdt_symbols():
     with pytest.raises(RuntimeError, match="whitelist"):
         runner._filter_lead_candidates(hotlist, markets, SimpleNamespace(lead_market_ids=set()))
 
+    candidates = [("BTC/USDT:USDT", 30_000_000), ("ETH/USDT:USDT", 25_000_000)]
+    assert runner._filter_lead_market_candidates(
+        candidates, markets, execution.lead_market_ids,
+    ) == [candidates[0]]
+
+
+def test_lead_universe_applies_whitelist_and_daily_history_before_top_n(monkeypatch):
+    settings = load_settings(env_file=None)
+    settings.universe.exclude_symbols = []
+    now = datetime(2026, 10, 26, 5, 5, tzinfo=timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    symbols = [f"{name}/USDT:USDT" for name in ("AAA", "BBB", "CCC")]
+    onboard = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+
+    class Exchange:
+        def __init__(self):
+            self.ohlcv_calls = []
+            self.markets = {
+                symbol: {
+                    "id": symbol.split("/", 1)[0] + "USDT",
+                    "active": True, "swap": True, "quote": "USDT", "settle": "USDT",
+                    "info": {"contractType": "PERPETUAL", "underlyingType": "COIN",
+                             "underlyingSubType": ["Crypto"], "onboardDate": onboard},
+                } for symbol in symbols
+            }
+
+        def load_markets(self):
+            return self.markets
+
+        def fetch_tickers(self):
+            return {symbol: {"quoteVolume": 50_000_000, "info": {"count": 10_000}}
+                    for symbol in symbols}
+
+        def fetch_bids_asks(self, requested):
+            assert requested == [symbols[0], symbols[2]]
+            return {symbol: {"bid": 99.9, "ask": 100.1,
+                             "bidVolume": 1_000, "askVolume": 1_000}
+                    for symbol in requested}
+
+        def fetch_ohlcv(self, symbol, timeframe, *, limit):
+            self.ohlcv_calls.append((symbol, timeframe))
+            if timeframe == "1h":
+                end_open = now_ms // runner.HOUR_MS * runner.HOUR_MS
+                start = end_open - 59 * runner.HOUR_MS
+                return [[start + index * runner.HOUR_MS, 100.0, 101.0, 99.0,
+                         100.0 + index * 0.01, 1_000.0] for index in range(60)]
+            if timeframe == "1d":
+                if symbol == symbols[2]:
+                    count = 54
+                else:
+                    count = 55
+                end_open = now_ms // runner.DAY_MS * runner.DAY_MS
+                start = end_open - count * runner.DAY_MS
+                return [[start + index * runner.DAY_MS, 100.0 + index * 0.1,
+                         101.0 + index * 0.1, 99.0 + index * 0.1,
+                         100.0 + index * 0.1, 100_000.0]
+                        for index in range(count)]
+            if timeframe == "4h":
+                end_open = now_ms // runner.FOUR_H_MS * runner.FOUR_H_MS
+                start = end_open - 15 * runner.FOUR_H_MS
+                return [[start + index * runner.FOUR_H_MS, 100.0, 102.0, 99.0,
+                         100.0 + index * 0.1, 1_000.0] for index in range(15)]
+            raise AssertionError(timeframe)
+
+    exchange = Exchange()
+    hotlist_result = runner._build_universe(
+        exchange, settings, now, now_ms,
+        closed_market_cache=runner.ClosedMarketCache(),
+        lead_market_ids={"AAAUSDT", "CCCUSDT"},
+    )
+    _markets, hotlist, _one_hour, _current_hour, _tickers, legacy = hotlist_result
+
+    assert [row["symbol"] for row in hotlist] == [symbols[0]]
+    assert [row["symbol"] for row in legacy] == symbols
+    assert (symbols[1], "1d") not in exchange.ohlcv_calls
+    assert (symbols[2], "1d") in exchange.ohlcv_calls
+    assert (symbols[2], "4h") not in exchange.ohlcv_calls
+    assert hotlist[0]["daily_bars"] == 55
+    assert hotlist[0]["daily_ema_distance_atr"] is not None
+
+
+def test_candidate_priority_prefers_golden_atr_band_then_reversal_quality():
+    extreme = ("EXTREME/USDT:USDT", {
+        "deviation_atr": 3.4, "deviation_zone": 0,
+        "reversal_score": 1.0, "ema_space_r": 2.0,
+    })
+    golden = ("GOLDEN/USDT:USDT", {
+        "deviation_atr": 1.6, "deviation_zone": 2,
+        "reversal_score": 0.65, "ema_space_r": 1.2,
+    })
+    weak_reversal = ("WEAK/USDT:USDT", {
+        "deviation_atr": 1.4, "deviation_zone": 2,
+        "reversal_score": 0.30, "ema_space_r": 2.0,
+    })
+
+    ordered = sorted((extreme, weak_reversal, golden),
+                     key=lambda row: runner._entry_priority_sort_key((row[0], row[1])))
+
+    assert [row[0] for row in ordered] == [
+        "GOLDEN/USDT:USDT", "WEAK/USDT:USDT", "EXTREME/USDT:USDT",
+    ]
+
 
 def test_lead_whitelist_observation_records_ranking_and_deduplicates_per_bar():
     state = MultiPaperState(execution_mode="lead_usdm")
@@ -764,7 +866,8 @@ def test_structure_confirmation_gate_blocks_candidate_before_funding(monkeypatch
         @staticmethod
         def fetch_ohlcv(_symbol, timeframe, *, limit):
             assert timeframe == "1d"
-            return _daily_rows(list(range(100, 151)) + [1.0])
+            return _daily_rows(list(range(100, 155)) + [1.0],
+                               start=datetime(2026, 9, 1, tzinfo=timezone.utc))
 
         @staticmethod
         def fetch_funding_rate(_symbol):
@@ -912,7 +1015,8 @@ def test_daily_direction_gate_uses_only_completed_utc_candles():
         def fetch_ohlcv(self, _symbol, timeframe, *, limit):
             assert timeframe == "1d"
             self.limit = limit
-            return _daily_rows(list(range(100, 151)) + [1.0])
+            return _daily_rows(list(range(100, 155)) + [1.0],
+                               start=datetime(2026, 9, 1, tzinfo=timezone.utc))
 
     exchange = Exchange()
     gate = runner._daily_direction_gate(
@@ -922,15 +1026,16 @@ def test_daily_direction_gate_uses_only_completed_utc_candles():
     assert exchange.limit == 100
     assert gate["ready"] is True
     assert gate["direction"] == "long"
-    assert gate["daily_bars"] == 51
-    assert gate["daily_close"] == 150.0
+    assert gate["daily_bars"] == 55
+    assert gate["daily_close"] == 154.0
     assert gate["daily_bar_close_time"] == "2026-10-26T00:00:00+00:00"
     assert runner._daily_direction_rejection_reason(gate, Side.LONG) is None
 
     class FallingExchange:
         @staticmethod
         def fetch_ohlcv(*_args, **_kwargs):
-            return _daily_rows(list(range(151, 100, -1)))
+            return _daily_rows(list(range(155, 100, -1)),
+                               start=datetime(2026, 9, 1, tzinfo=timezone.utc))
 
     falling = runner._daily_direction_gate(
         FallingExchange(),
@@ -942,8 +1047,8 @@ def test_daily_direction_gate_uses_only_completed_utc_candles():
 
 def test_daily_direction_gate_blocks_insufficient_history_and_equal_ema():
     class Exchange:
-        def __init__(self, closes):
-            self.rows = _daily_rows(closes)
+        def __init__(self, closes, *, start=datetime(2026, 9, 5, tzinfo=timezone.utc)):
+            self.rows = _daily_rows(closes, start=start)
 
         def fetch_ohlcv(self, *_args, **_kwargs):
             return self.rows
@@ -953,7 +1058,8 @@ def test_daily_direction_gate_blocks_insufficient_history_and_equal_ema():
         Exchange(list(range(100, 150))), "APR/USDT:USDT", signal_at, 50,
     )
     equal = runner._daily_direction_gate(
-        Exchange([100.0] * 51), "APR/USDT:USDT", signal_at, 50,
+        Exchange([100.0] * 55, start=datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        "APR/USDT:USDT", signal_at, 50,
     )
 
     assert short_history["reason"] == "daily_history_insufficient"
@@ -991,7 +1097,8 @@ def test_demo_entry_daily_gate_blocks_counter_direction_before_funding(monkeypat
         def fetch_ohlcv(self, requested_symbol, timeframe, *, limit):
             assert requested_symbol == symbol
             assert timeframe == "1d"
-            return _daily_rows(list(range(100, 151)) + [1.0])
+            return _daily_rows(list(range(100, 155)) + [1.0],
+                               start=datetime(2026, 9, 1, tzinfo=timezone.utc))
 
         @staticmethod
         def fetch_funding_rate(_symbol):
@@ -1019,7 +1126,7 @@ def test_demo_entry_daily_gate_blocks_counter_direction_before_funding(monkeypat
     assert not state.portfolio.positions
     assert state.symbol_status[symbol]["reason"] == "daily_direction_long_only"
     assert state.symbol_status[symbol]["daily_direction"] == "long"
-    assert state.symbol_status[symbol]["daily_bars"] == 51
+    assert state.symbol_status[symbol]["daily_bars"] == 55
     assert any(event.get("event") == "entry_signal_blocked"
                and event.get("reason") == "daily_direction_long_only" for event in state.events)
 
@@ -1092,7 +1199,7 @@ def test_8767_uses_closed_h1_entry_with_daily_gate_and_keeps_live_stop(monkeypat
         lambda _exchange, _symbol, signal_at, span, **_kwargs: (
             gate_calls.append((signal_at, span))
             or {"ready": True, "direction": "long", "reason": None,
-                "daily_bars": 51, "daily_close": 101.0, "daily_ema50": 100.0,
+                "daily_bars": 55, "daily_close": 101.0, "daily_ema50": 100.0,
                 "daily_bar_close_time": "2026-10-26T00:00:00+00:00",
                 "signal_at": signal_at.isoformat()}
         ),
