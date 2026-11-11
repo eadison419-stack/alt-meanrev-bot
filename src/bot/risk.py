@@ -287,7 +287,7 @@ def assess_entry(
         return RiskDecision(False, "market_risk_state_invalid")
     if risk_multiplier == 0:
         return RiskDecision(False, "market_risk_paused")
-    funding_rejection = funding_rate_rejection_reason(funding_rate, settings)
+    funding_rejection = funding_rate_rejection_reason(funding_rate, intent.side, settings)
     if funding_rejection is not None:
         return RiskDecision(False, funding_rejection)
     previous_exit = portfolio.last_exit_at.get(intent.symbol)
@@ -436,11 +436,19 @@ def assess_entry(
     })
 
 
-def funding_rate_rejection_reason(funding_rate: float | None, settings) -> str | None:
-    """Return the shared fail-closed funding gate reason for an opening order."""
+def funding_rate_rejection_reason(
+    funding_rate: float | None, side: Side | None, settings,
+) -> str | None:
+    """Reject missing rates or rates above the adverse threshold for the order side."""
     if funding_rate is None or not math.isfinite(funding_rate):
         return "funding_rate_missing"
-    if abs(funding_rate) >= settings.risk.funding_abs_block:
+    try:
+        direction = Side(side)
+    except (TypeError, ValueError):
+        return "funding_direction_missing"
+    limit = float(settings.risk.funding_abs_block)
+    if ((direction is Side.LONG and funding_rate > limit)
+            or (direction is Side.SHORT and funding_rate < -limit)):
         return "funding_rate_blocked"
     return None
 

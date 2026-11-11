@@ -4189,7 +4189,7 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
         if _utc_now() > context.bar_close_at + max_delay:
             return reject("hourly_bar_stale", "signal_expiry")
         funding_rate = _fetch_entry_funding_rate(exchange, symbol, fail_on_market_error=True)
-        funding_reason = funding_rate_rejection_reason(funding_rate, settings)
+        funding_reason = funding_rate_rejection_reason(funding_rate, side, settings)
         if funding_reason is not None:
             _record_funding_entry_block(state, symbol, side, regime_value,
                                         funding_rate, funding_reason, settings, _utc_now())
@@ -4492,7 +4492,7 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
         funding_rate = _fetch_entry_funding_rate(
             exchange, symbol, fail_on_market_error=daily_direction_gate,
         )
-        funding_reason = funding_rate_rejection_reason(funding_rate, settings)
+        funding_reason = funding_rate_rejection_reason(funding_rate, side, settings)
         if funding_reason is not None:
             _record_funding_entry_block(state, symbol, side, regime_value,
                                         funding_rate, funding_reason, settings, now)

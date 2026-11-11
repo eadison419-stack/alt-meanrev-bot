@@ -14,6 +14,7 @@ from bot.data.klines import TIMEFRAME_MS, normalize_symbol
 from bot.indicators import atr, validate_ohlcv
 from bot.market_risk import classify_market_risk
 from bot.regime import classify_regimes
+from bot.risk import funding_rate_rejection_reason
 from bot.signals import Action, Signal, generate_signal, with_signal_context
 from bot.strategy_router import MEAN_REVERSION, TREND, apply_entry_route, resolve_strategy_route
 from bot.symbol_regime import SymbolRegimeState, classify_symbol_regime
@@ -262,18 +263,19 @@ def run_routing_audit(
             rejection = None
             if signal.action is Action.OPEN and not accepted_candidate:
                 rejection = routed_signal.reason
-            if accepted_candidate and funding_rate is None:
-                accepted_candidate = False
-                rejection = "funding_rate_missing"
-            elif (accepted_candidate and abs(funding_rate) >= settings.risk.funding_abs_block):
-                accepted_candidate = False
-                rejection = "funding_rate_blocked"
+            if accepted_candidate:
+                rejection = funding_rate_rejection_reason(
+                    funding_rate, routed_signal.side, settings,
+                )
+                if rejection is not None:
+                    accepted_candidate = False
             if rejection is None and route.entry_block_reason:
                 rejection = route.entry_block_reason
             execution_state = "no_entry_signal"
             if signal.action is Action.OPEN and not accepted_candidate:
                 execution_state = "rejected"
-            if rejection in {"funding_rate_missing", "funding_rate_blocked"}:
+            if rejection in {"funding_rate_missing", "funding_rate_blocked",
+                             "funding_direction_missing"}:
                 execution_state = "risk_rejected"
             elif accepted_candidate and route.source == TREND:
                 execution_state = "not_filled_by_decision_audit"

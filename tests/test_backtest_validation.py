@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from bot.backtest import validation
 from bot.config import load_settings
@@ -83,7 +84,18 @@ def test_routing_audit_uses_closed_bars_and_pause_rejects_entry(monkeypatch):
     assert result.summary["invariants"]["no_open_candidate_during_pause_new"] is True
 
 
-def test_routing_audit_tracks_strategy_source_and_excludes_btc_eth(monkeypatch):
+@pytest.mark.parametrize(
+    ("side", "funding_rate", "accepted"),
+    [
+        (Side.LONG, 0.0011, False),
+        (Side.SHORT, 0.0011, True),
+        (Side.LONG, -0.0011, True),
+        (Side.SHORT, -0.0011, False),
+    ],
+)
+def test_routing_audit_tracks_strategy_source_and_applies_directional_funding(
+    monkeypatch, side, funding_rate, accepted,
+):
     settings = load_settings(env_file=None)
     settings.universe.min_quote_volume_24h = 0.1
     index_1h = pd.date_range("2026-01-01T00:00:00Z", periods=90, freq="1h")
@@ -110,11 +122,11 @@ def test_routing_audit_tracks_strategy_source_and_excludes_btc_eth(monkeypatch):
                         lambda symbol, _bars, _settings, *, now: _assessment(
                             SymbolRegimeState.RANGE, "range_confirmed", pd.Timestamp(now)))
     monkeypatch.setattr(validation, "generate_signal",
-                        lambda *_args, **_kwargs: Signal(Side.LONG, Action.OPEN, "fixture_long", 1.0))
+                        lambda *_args, **_kwargs: Signal(side, Action.OPEN, "fixture_signal", 1.0))
     monkeypatch.setattr(validation, "evaluate_time_filter",
                         lambda *_args, **_kwargs: TimeFilterFlags(True, True, False, False))
     funding = pd.DataFrame(
-        {"funding_rate": [0.0, 0.5], "mark_price": [100.0, 100.0]},
+        {"funding_rate": [funding_rate, 0.5], "mark_price": [100.0, 100.0]},
         index=pd.DatetimeIndex([index_1h[0], start]),
     )
 
@@ -128,10 +140,19 @@ def test_routing_audit_tracks_strategy_source_and_excludes_btc_eth(monkeypatch):
     assert result.rows[0]["signal_source"] == "MEAN_REVERSION"
     assert result.rows[0]["source"] == "MEAN_REVERSION"
     assert result.rows[0]["signal_action"] == "OPEN"
-    assert result.rows[0]["execution_state"] == "baseline_fill_engine_required"
-    assert result.rows[0]["funding_rate_asof"] == 0.0
+    assert result.rows[0]["signal_direction"] == side.value
+    assert result.rows[0]["accepted_candidate"] is accepted
+    assert result.rows[0]["execution_state"] == (
+        "baseline_fill_engine_required" if accepted else "risk_rejected"
+    )
+    assert result.rows[0]["reject_reason"] == (
+        None if accepted else "funding_rate_blocked"
+    )
+    assert result.rows[0]["funding_rate_asof"] == funding_rate
     assert result.rows[0]["funding_observed_at"] == index_1h[0].isoformat()
-    assert result.summary["accepted_signal_candidates_by_source"] == {"MEAN_REVERSION": 1}
+    assert result.summary["accepted_signal_candidates_by_source"] == (
+        {"MEAN_REVERSION": 1} if accepted else {}
+    )
 
 
 def test_trend_audit_passes_only_closed_prefix_and_never_counts_plan_as_fill(monkeypatch):

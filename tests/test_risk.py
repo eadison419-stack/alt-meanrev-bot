@@ -171,19 +171,35 @@ def test_valid_entry_passes_and_open_position_blocks_duplicate_symbol():
 
 
 @pytest.mark.parametrize(
-    ("funding_rate", "reason"),
-    [(None, "funding_rate_missing"), (float("nan"), "funding_rate_missing"), (0.001, "funding_rate_blocked"), (-0.001, "funding_rate_blocked")],
+    "funding_rate",
+    [None, float("nan")],
 )
-def test_funding_filter_blocks_missing_or_abs_rate_at_limit(funding_rate, reason):
+def test_funding_filter_still_fails_closed_when_rate_is_missing(funding_rate):
     settings = load_settings(env_file=None)
     decision = assess_entry(intent(), PortfolioState(), 1000, funding_rate, NOW, settings)
     assert not decision.allowed
-    assert decision.reason == reason
+    assert decision.reason == "funding_rate_missing"
 
 
-def test_funding_rate_below_absolute_limit_passes():
+@pytest.mark.parametrize(
+    ("side", "funding_rate", "allowed"),
+    [
+        (Side.LONG, 0.0011, False),
+        (Side.SHORT, -0.0011, False),
+        (Side.LONG, -0.0011, True),
+        (Side.SHORT, 0.0011, True),
+        (Side.LONG, 0.001, True),
+        (Side.SHORT, -0.001, True),
+    ],
+)
+def test_funding_filter_only_blocks_adverse_rates_strictly_over_limit(side, funding_rate, allowed):
     settings = load_settings(env_file=None)
-    assert assess_entry(intent(), PortfolioState(), 1000, -0.0009, NOW, settings).allowed
+    decision = assess_entry(
+        intent(side=side), PortfolioState(), 1000, funding_rate, NOW, settings,
+    )
+    assert decision.allowed is allowed
+    if not allowed:
+        assert decision.reason == "funding_rate_blocked"
 
 
 def test_cooldown_blocks_reentry_until_configured_hours_have_elapsed():
