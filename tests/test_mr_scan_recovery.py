@@ -34,6 +34,10 @@ def scan_env(monkeypatch, tmp_path):
                        index=pd.date_range(end=NOW.replace(second=0)-timedelta(hours=1), periods=60, freq="h"))
     four = pd.DataFrame({"close": 100.}, index=pd.date_range(end=NOW, periods=100, freq="4h"))
     monkeypatch.setattr(runner, "_utc_now", lambda: clock[0])
+    monkeypatch.setattr(
+        runner, "_ema9_reclaim_side",
+        lambda frame: "long" if float(frame["close"].iloc[-1]) >= float(frame["open"].iloc[-1]) else "short",
+    )
     monkeypatch.setattr(runner, "evaluate_time_filter", lambda *a, **kw: TimeFilterFlags(True, True, False, False))
     monkeypatch.setattr(runner, "_cached_daily_direction_gate", lambda *a, **kw: {"ready": True, "direction": "long"})
 
@@ -46,6 +50,11 @@ def scan_env(monkeypatch, tmp_path):
 
         def fetch_funding_rate(self, symbol):
             return {"fundingRate": 0.0}
+
+        def fetch_funding_rate_history(self, symbol, limit=2):
+            stamp = int(clock[0].timestamp() * 1000)
+            return [{"timestamp": stamp - 8 * 60 * 60 * 1000, "fundingRate": 0.0001},
+                    {"timestamp": stamp, "fundingRate": -0.0001}]
 
     class Execution:
         exchange = Client()

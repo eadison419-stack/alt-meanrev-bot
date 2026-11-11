@@ -20,7 +20,7 @@ def checkpoint(save):
 
 def unresolved_attempts(state):
     return [row for row in state.mr_entry_attempts.values()
-            if row.get("status") in {"submitting", "uncertain", "protected"}]
+            if row.get("status") in {"submitting", "uncertain", "protected", "limit_pending"}]
 
 
 def scan_for(state, bar, symbols, delay_seconds, save=None):

@@ -39,7 +39,7 @@ def lead_entry_exposure(state, settings, now):
     live = snapshot["positions"]
     if set(live) != set(state.portfolio.positions):
         raise ValueError("lead_risk_positions_mismatch")
-    if any(row.get("status") in {"submitting", "uncertain", "protected"}
+    if any(row.get("status") in {"submitting", "uncertain", "protected", "limit_pending"}
            for row in state.mr_entry_attempts.values()):
         raise ValueError("lead_risk_pending_entry")
     audit = state.protective_stop_audit

@@ -180,7 +180,7 @@ def test_replay_open_gap_exits_at_adverse_open_before_stop_can_move():
     assert event["price"] == pytest.approx(90 * (1 - .0003))
 
 
-def test_same_input_candidate_regime_stop_quantity_and_fill_reconciliation():
+def test_same_input_candidate_regime_stop_quantity_and_fill_reconciliation(monkeypatch):
     now = pd.Timestamp("2026-10-01T00:00:01Z")
     symbol, public = _public(now)
     hourly = public.frames[symbol]["contract_1h"]
@@ -191,6 +191,8 @@ def test_same_input_candidate_regime_stop_quantity_and_fill_reconciliation():
     settings = settings_for_execution(load_settings(env_file=None), "lead_usdm")
     state = MultiPaperState(execution_mode="lead_usdm", execution_status="synchronized")
     execution = ReplayExecution(public, state, settings, 1000)
+    monkeypatch.setattr(runner, "_ema9_reclaim_side", lambda _frame: "long")
+    monkeypatch.setattr(runner, "_funding_flip_side", lambda *_args, **_kwargs: ("long", {}))
     saved_clock = active_clock()
     activate_clock(public.clock)
     try:

@@ -20,6 +20,14 @@ from bot.time_filter import TimeFilterFlags
 from scripts import run_mr_candidate_paper as runner
 
 
+@pytest.fixture(autouse=True)
+def legacy_candidate_cases_have_explicit_ema9_confirmation(monkeypatch):
+    monkeypatch.setattr(
+        runner, "_ema9_reclaim_side",
+        lambda frame: "long" if float(frame["close"].iloc[-1]) >= float(frame["open"].iloc[-1]) else "short",
+    )
+
+
 UNAVAILABLE_PNL_VALUES = [
     pytest.param(None, id="missing"),
     pytest.param(float("nan"), id="nan"),
@@ -203,6 +211,12 @@ class _FundingExchange:
     @staticmethod
     def fetch_funding_rate(_symbol):
         return {"fundingRate": 0.0}
+
+    @staticmethod
+    def fetch_funding_rate_history(_symbol, limit=2):
+        stamp = int(datetime(2026, 10, 26, 5, tzinfo=timezone.utc).timestamp() * 1000)
+        return [{"timestamp": stamp - 8 * 60 * 60 * 1000, "fundingRate": 0.0001},
+                {"timestamp": stamp, "fundingRate": -0.0001}]
 
 
 def _daily_rows(closes, *, start=datetime(2026, 9, 5, tzinfo=timezone.utc)):
@@ -1014,6 +1028,7 @@ def test_8767_uses_closed_h1_entry_with_daily_gate_and_keeps_live_stop(monkeypat
     now = datetime(2026, 10, 26, 5, 5, tzinfo=timezone.utc)
     one_hour, four_hour = _frames()
     one_hour.loc[one_hour.index[-1], ["open", "high", "low", "close"]] = [98.2, 98.8, 98.0, 98.6]
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
     flags = TimeFilterFlags(True, True, False, False)
     gate_calls = []
     monkeypatch.setattr(runner, "atr", lambda frame, _period: pd.Series(1.0, index=frame.index))

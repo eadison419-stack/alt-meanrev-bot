@@ -85,6 +85,10 @@ FOUR_H_MS = 4 * HOUR_MS
 DAY_MS = 24 * HOUR_MS
 TOP_N = 20
 DEV_PCT = 0.01
+EMA9_RECLAIM_PERIOD = 9
+DYNAMIC_LIMIT_RANGE_ATR = 1.8
+DYNAMIC_LIMIT_BODY_RETRACE = 0.441
+DYNAMIC_LIMIT_TTL_HOURS = 3
 MID_PERIOD = 20
 BAR_KEY = "__mr_bar__"  # reserved key in exit_management_by_symbol for the last processed 1H bar
 HOTLIST_CACHE_KEY = "__mr_hotlist_cache__"
@@ -535,7 +539,8 @@ def _record_atr_deviation_shadow(state, symbol, frame1, frame4, bar_close_time,
 def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, leverage,
                    fee_rate, slip_rate, reason, regime_value, at, *,
                    entry_preflight=None, submission_deadline=None, entry_audit=None,
-                   scan_row=None, checkpoint=None, recovery_meta=None):
+                   scan_row=None, checkpoint=None, recovery_meta=None,
+                   order_type="market", limit_expires_at=None):
     if is_demo:
         intent = OrderIntent(symbol, side, Action.OPEN, qty, price, reason,
                              Regime(regime_value), stop, MEAN_REVERSION)
@@ -550,6 +555,9 @@ def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, le
                 "symbol": symbol, "side": side.value, "bar": scan_row["bar"],
                 "clientOrderId": client_id, "status": "prepared", "reason": reason,
                 "regime": regime_value, "meta": recovery_meta,
+                "order_type": order_type, "expires_at": limit_expires_at,
+                "stop_client_algo_id": (f"mrb_s_{client_id[-24:]}"
+                                        if order_type == "limit" else None),
             })
             if scan_row.get("atr_deviation_shadow_key"):
                 attempt["atr_deviation_shadow_key"] = scan_row["atr_deviation_shadow_key"]
@@ -571,15 +579,24 @@ def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, le
                 if quote_deadline and _utc_now() > datetime.fromisoformat(quote_deadline):
                     raise EntryPreflightRejected("entry_quote_stale")
 
+            def on_protection(stop_order):
+                attempt["preprotected_stop"] = dict(stop_order)
+                mr_scan.checkpoint(checkpoint)
+
         try:
             kwargs = ({"before_submit": entry_preflight,
                        "submission_deadline": submission_deadline}
                       if entry_preflight is not None else {})
             if attempt is not None:
                 kwargs.update(client_order_id=client_id, on_submit=on_submit)
+            if order_type == "limit":
+                if attempt is None:
+                    raise mr_scan.ScanCheckpointError("dynamic live limit requires a durable scan checkpoint")
+                kwargs.update(limit_expires_at=limit_expires_at, on_protection=on_protection)
             if state.execution_mode == "lead_usdm" and entry_audit is not None:
                 kwargs["on_safety_plan"] = lambda plan: entry_audit.update(capital_safety=dict(plan))
-            result = execution.open(intent, stop_price=stop, **kwargs)
+            submit = execution.open_limit if order_type == "limit" else execution.open
+            result = submit(intent, stop_price=stop, **kwargs)
         except EntryPreflightRejected as exc:
             if attempt is not None:
                 attempt["status"] = "not_submitted"
@@ -610,6 +627,22 @@ def _open_position(is_demo, execution, state, symbol, side, price, stop, qty, le
                 )
                 mr_scan.checkpoint(checkpoint)
             raise
+        if result.get("pending_limit"):
+            attempt.update(status="limit_pending", order_id=result.get("order_id"),
+                           preprotected_stop=result.get("stop"),
+                           limit_price=result.get("price"))
+            scan_row.update(phase="limit_order_pending", order_may_have_been_sent=True)
+            mr_scan.attempt_outcome(state, attempt, "limit_pending", _utc_now(),
+                                    phase=scan_row["phase"], order_may_have_been_sent=True)
+            mr_scan.checkpoint(checkpoint)
+            return {"pending_limit": True, "clientOrderId": client_id,
+                    "order_id": result.get("order_id"), "price": result.get("price")}
+        if result.get("not_filled"):
+            attempt.update(status="not_filled")
+            mr_scan.attempt_outcome(state, attempt, "not_filled", _utc_now(),
+                                    phase="limit_order_terminal", order_may_have_been_sent=True)
+            mr_scan.checkpoint(checkpoint)
+            return None
         if attempt is not None:
             attempt.update(status="protected", result=result)
             mr_scan.checkpoint(checkpoint)
@@ -667,6 +700,78 @@ def _open_local_position(state, symbol, side, price, stop, qty, leverage,
     return position
 
 
+def _process_local_dynamic_limits(state, current_prices, settings, now, fee_rate, slip_rate):
+    """Simulate resting pullback limits from fresh public ticks in local Paper."""
+    for key, attempt in list(state.mr_entry_attempts.items()):
+        if attempt.get("status") != "paper_limit_pending":
+            continue
+        symbol = attempt["symbol"]
+        try:
+            expires_at = datetime.fromisoformat(
+                str(attempt["expires_at"]).replace("Z", "+00:00"),
+            )
+            side = Side(attempt["side"])
+            limit_price = float(attempt["limit_price"])
+            stop_price = float(attempt["stop_price"])
+            quantity = float(attempt["quantity"])
+            entry_atr = float(attempt["meta"]["entry_atr"])
+            structure_low = float(attempt["meta"]["structure_low"])
+            structure_high = float(attempt["meta"]["structure_high"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            # Keep the attempt pending, which blocks further local entries, until
+            # its persisted order intent can be read safely.
+            continue
+        if expires_at.tzinfo is None:
+            continue
+        if now >= expires_at:
+            attempt["status"] = "paper_limit_expired"
+            state.events.append({"event": "dynamic_limit_entry_expired", "at": now.isoformat(),
+                                 "symbol": symbol, "side": side.value,
+                                 "limit_price": limit_price, "expires_at": expires_at.isoformat(),
+                                 "execution_mode": state.execution_mode})
+            continue
+        price = current_prices.get(symbol)
+        if price is None or not math.isfinite(float(price)) or float(price) <= 0:
+            continue
+        price = float(price)
+        touched = price <= limit_price if side is Side.LONG else price >= limit_price
+        if not touched:
+            continue
+        if symbol in state.portfolio.positions:
+            attempt["status"] = "paper_limit_position_conflict"
+            state.events.append({"event": "dynamic_limit_entry_conflict", "at": now.isoformat(),
+                                 "symbol": symbol, "reason": "position_already_exists"})
+            continue
+        opened = _open_local_position(
+            state, symbol, side, limit_price, stop_price, quantity,
+            int(settings.sizing.leverage), fee_rate, 0.0,
+            attempt["reason"], attempt["regime"], now,
+        )
+        if opened is None:
+            attempt["status"] = "paper_limit_rejected"
+            continue
+        _initialize_entry_metadata(
+            state, symbol, opened, False, limit_price, stop_price,
+            entry_atr, structure_low, structure_high,
+        )
+        attempt["status"] = "paper_limit_filled"
+        attempt["filled_at"] = now.isoformat()
+        attempt["fill_price"] = opened.entry_price
+        state.events.append({"event": "dynamic_limit_entry_filled", "at": now.isoformat(),
+                             "symbol": symbol, "side": side.value,
+                             "limit_price": limit_price, "observed_price": price,
+                             "fill_price": opened.entry_price,
+                             "clientOrderId": key,
+                             "fill_model": "fresh_tick_touch_at_limit",
+                             "ema9_reclaim_side": attempt.get("ema9_reclaim_side"),
+                             "funding_flip": attempt.get("funding_flip")})
+        stop_touched = (price <= stop_price if side is Side.LONG
+                        else price >= stop_price)
+        if stop_touched:
+            _close_position(False, None, state, symbol, price, "protective_stop",
+                            now, fee_rate, slip_rate)
+
+
 def _fill_timestamp(fill, fallback):
     return _verified_fill_timestamp(fill) or fallback
 
@@ -705,7 +810,7 @@ def _record_entry_rejection(state, symbol, side, reason, phase, at, *,
 
 def _entry_preflight(exchange, execution, state, settings, market, context, flags,
                      funding_rate, market_risk, audit, *, propagate_read_errors=False,
-                     scan_row=None):
+                     scan_row=None, limit_entry_price=None):
     """Build a guard run by the executor after account/contract preparation."""
     deadline = context.bar_close_at + timedelta(seconds=settings.execution.confirm_delay_sec_max)
     audit.update({
@@ -772,9 +877,15 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
             datetime.fromisoformat(demo_quote["quoted_at"])
             + timedelta(seconds=settings.execution.entry_quote_max_age_sec)
         ).isoformat()
-        price = demo_quote["price"]
+        quote_price = demo_quote["price"]
+        price = quote_price if limit_entry_price is None else float(limit_entry_price)
+        if limit_entry_price is not None:
+            already_touched = (quote_price <= price if context.side is Side.LONG
+                               else quote_price >= price)
+            if already_touched:
+                reject("dynamic_limit_price_already_touched")
         direction = 1 if context.side is Side.LONG else -1
-        adverse_atr = direction * (price - context.signal_close) / context.atr
+        adverse_atr = direction * (quote_price - context.signal_close) / context.atr
         audit.update({
             "adverse_quote_atr": adverse_atr,
             "observe_only": True,
@@ -784,14 +895,14 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
             ],
         })
         if structure_invalid_triggered(
-                context.side, price, context.structure_low, context.structure_high,
+                context.side, quote_price, context.structure_low, context.structure_high,
                 context.atr, buffer_atr=settings.exits.structure_invalid_buffer_atr):
             reject("entry_structure_invalid")
-        if ((context.side is Side.LONG and price <= planned_stop)
-                or (context.side is Side.SHORT and price >= planned_stop)):
+        if ((context.side is Side.LONG and quote_price <= planned_stop)
+                or (context.side is Side.SHORT and quote_price >= planned_stop)):
             reject("entry_price_beyond_planned_stop")
         signal = deviation_entry_signal_at_ema(
-            context.closed_ema, context.signal_open, price, settings, flags,
+            context.closed_ema, context.signal_open, quote_price, settings, flags,
             deviation_pct=DEV_PCT,
         )
         if signal.action is not Action.OPEN or signal.side is not context.side:
@@ -2637,12 +2748,83 @@ def _fetch_entry_funding_rate(exchange, symbol, *, fail_on_market_error=False):
         funding = exchange.fetch_funding_rate(symbol)
         return (float(funding["fundingRate"])
                 if funding and funding.get("fundingRate") is not None else None)
-    except (ccxt.BaseError, KeyError, TypeError, ValueError, OverflowError) as exc:
+    except (ccxt.BaseError, AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
         if isinstance(exc, ccxt.BaseError):
             _raise_market_error_if_needed(exc, fail_on_market_error)
         logger.warning("funding rate unavailable for {}; entry will fail closed: {}",
                        symbol, type(exc).__name__)
         return None
+
+
+def _funding_flip_side(exchange, symbol, now, *, fail_on_market_error=False):
+    """Return the side confirmed by the two latest fresh settled funding rates."""
+    try:
+        rows = exchange.fetch_funding_rate_history(symbol, limit=2)
+        if not isinstance(rows, list) or len(rows) < 2:
+            return None, {"reason": "funding_flip_history_unavailable"}
+        rows = sorted(rows, key=lambda row: int(row.get("timestamp") or 0))
+        previous, current = rows[-2], rows[-1]
+        previous_rate = float(previous["fundingRate"])
+        current_rate = float(current["fundingRate"])
+        previous_at = int(previous["timestamp"])
+        current_at = int(current["timestamp"])
+        if (not all(math.isfinite(value) for value in (previous_rate, current_rate))
+                or previous_at <= 0 or current_at <= previous_at):
+            return None, {"reason": "funding_flip_history_invalid"}
+        interval_ms = current_at - previous_at
+        age_ms = int(now.timestamp() * 1000) - current_at
+        if age_ms < 0 or age_ms > interval_ms + HOUR_MS:
+            return None, {"reason": "funding_flip_history_stale"}
+        side = ("long" if previous_rate > 0 and current_rate < 0
+                else "short" if previous_rate < 0 and current_rate > 0 else None)
+        return side, {
+            "previous_rate": previous_rate, "current_rate": current_rate,
+            "previous_at": previous_at, "current_at": current_at,
+            "age_ms": age_ms, "side": side,
+        }
+    except (ccxt.BaseError, AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+        if isinstance(exc, ccxt.BaseError):
+            _raise_market_error_if_needed(exc, fail_on_market_error)
+        return None, {"reason": f"funding_flip_history_error:{type(exc).__name__}"}
+
+
+def _ema9_reclaim_side(frame1):
+    if frame1 is None or len(frame1) < EMA9_RECLAIM_PERIOD + 1:
+        return None
+    closes = frame1["close"].astype(float)
+    ema9 = closes.ewm(span=EMA9_RECLAIM_PERIOD, adjust=False,
+                      min_periods=EMA9_RECLAIM_PERIOD).mean()
+    previous_close, current_close = float(closes.iloc[-2]), float(closes.iloc[-1])
+    previous_ema, current_ema = float(ema9.iloc[-2]), float(ema9.iloc[-1])
+    if not all(math.isfinite(value) for value in
+               (previous_close, current_close, previous_ema, current_ema)):
+        return None
+    if previous_close <= previous_ema and current_close > current_ema:
+        return "long"
+    if previous_close >= previous_ema and current_close < current_ema:
+        return "short"
+    return None
+
+
+def _entry_execution_plan(candle, atr_value, bar_close_at, side):
+    candle_range = float(candle["high"]) - float(candle["low"])
+    candle_range_atr = candle_range / atr_value if atr_value > 0 else float("inf")
+    close = float(candle["close"])
+    body = abs(close - float(candle["open"]))
+    limit_price = None
+    expires_at = None
+    if candle_range_atr > DYNAMIC_LIMIT_RANGE_ATR:
+        direction = 1 if side is Side.LONG else -1
+        limit_price = close - direction * DYNAMIC_LIMIT_BODY_RETRACE * body
+        expires_at = bar_close_at + timedelta(hours=DYNAMIC_LIMIT_TTL_HOURS)
+    return {
+        "candle_range_atr": candle_range_atr,
+        "order_type": "limit" if limit_price is not None else "market",
+        "limit_price": limit_price,
+        "limit_expires_at": expires_at.isoformat() if expires_at else None,
+        "limit_body_retrace": DYNAMIC_LIMIT_BODY_RETRACE if limit_price is not None else None,
+        "signal_bar": bar_close_at.isoformat(),
+    }
 
 
 def _record_funding_entry_block(state, symbol, side, regime, funding_rate, reason,
@@ -2843,6 +3025,8 @@ def _reconcile_pending_entries(execution, state, checkpoint):
                 attempt["status"] = "completed"
         elif status == "not_filled" and symbol not in state.portfolio.positions:
             attempt["status"] = "not_filled"
+        elif status == "pending":
+            attempt["status"] = "limit_pending"
         reconciliation = {"status": status, "error": report.get("error")}
         for field in ("reason", "evidence"):
             if field in report:
@@ -2881,6 +3065,11 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
     resume_symbols = (state.mr_entry_scan.get("symbols", [])
                       if is_demo and state.mr_entry_scan
                       and not mr_scan.expired(state.mr_entry_scan, _utc_now()) else [])
+    local_pending_symbols = sorted({
+        row.get("symbol") for row in state.mr_entry_attempts.values()
+        if state.execution_mode == "local_paper"
+        and row.get("status") == "paper_limit_pending" and row.get("symbol")
+    })
 
     if position_monitor is not None:
         position_monitor()
@@ -2909,7 +3098,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             hotlist = state.watchlist
 
         top_symbols = [row["symbol"] for row in hotlist]
-        track = sorted(set(top_symbols) | set(state.portfolio.positions) | set(resume_symbols))
+        track = sorted(set(top_symbols) | set(state.portfolio.positions)
+                       | set(resume_symbols) | set(local_pending_symbols))
         hour_key = now_ms // HOUR_MS
         hour_offset_ms = now_ms % HOUR_MS
         hour_changed = market_cache.bars_hour_key != hour_key
@@ -2948,7 +3138,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
         tickers = exchange.fetch_tickers()
         hotlist = state.watchlist
         top_symbols = [row["symbol"] for row in hotlist]
-        track = sorted(set(top_symbols) | set(state.portfolio.positions) | set(resume_symbols))
+        track = sorted(set(top_symbols) | set(state.portfolio.positions)
+                       | set(resume_symbols) | set(local_pending_symbols))
         one_hour, current_hour, four_hour, regimes = _fetch_selected_bars(
             exchange, track, settings, now_ms, fail_on_market_error=True,
         )
@@ -2960,7 +3151,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             **batch_kwargs,
         )
         top_symbols = [row["symbol"] for row in hotlist]
-        track = sorted(set(top_symbols) | set(state.portfolio.positions) | set(resume_symbols))
+        track = sorted(set(top_symbols) | set(state.portfolio.positions)
+                       | set(resume_symbols) | set(local_pending_symbols))
         four_hour: dict[str, pd.DataFrame] = {}
         regimes: dict[str, pd.DataFrame] = {}
         prefetched = {}
@@ -3006,6 +3198,14 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             if position_monitor is not None:
                 position_monitor()
 
+    if local_pending_symbols:
+        for symbol in local_pending_symbols:
+            try:
+                tickers[symbol] = exchange.fetch_ticker(symbol)
+            except ccxt.BaseError as exc:
+                logger.warning("Local dynamic limit quote unavailable for {}: {}",
+                               symbol, type(exc).__name__)
+
     ranked_hotlist = hotlist
     if state.execution_mode == "lead_usdm":
         hotlist = _filter_lead_candidates(hotlist, markets, execution)
@@ -3032,6 +3232,10 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
         symbol: _ticker_price(tickers, symbol, decision_ms, max_age_ms=max_quote_age_ms)
         for symbol in track
     }
+    if not is_demo and local_pending_symbols:
+        _process_local_dynamic_limits(
+            state, current_prices, settings, now, fee_rate, slip_rate,
+        )
     if is_demo:
         for symbol, position in state.portfolio.positions.items():
             price = current_prices.get(symbol)
@@ -3603,10 +3807,21 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
                 failures, latest_loss_at,
             )
             return None
+    ema9_side = _ema9_reclaim_side(frame1)
+    if ema9_side != sig.side.value:
+        _record_entry_rejection(
+            state, symbol, sig.side, "ema9_reclaim_unconfirmed", "entry_confirmation", now,
+            bar_close_at=bar_close_time,
+            details={"ema9_reclaim_side": ema9_side, "required_side": sig.side.value},
+            scan_row=scan_row,
+        )
+        return None
     context = EntrySignalContext(
         symbol, sig.side, bar_close_time, now, evaluated_at,
         float(candle["open"]), close, closed_ema, entry_atr, swing_low, swing_high,
     ) if is_demo else None
+    execution_plan = _entry_execution_plan(candle, entry_atr, bar_close_time, sig.side)
+    execution_plan["ema9_reclaim_side"] = ema9_side
     if state.execution_mode == "lead_usdm" and scan_row is not None:
         try:
             _record_atr_deviation_shadow(
@@ -3618,7 +3833,7 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
             logger.warning("Lead ATR deviation shadow unavailable: {}", type(exc).__name__)
     return (symbol, strength, sig.side, close, stop, entry_atr,
                        swing_low, swing_high, regime_value, sig.reason, daily_gate,
-                       context, flags)
+                       context, flags, execution_plan)
 
 
 def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
@@ -3663,8 +3878,14 @@ def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
 def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candidate,
                             settings, max_pos, fee_rate, slip_rate, now, market_risk, *,
                             position_monitor=None, scan_row=None, checkpoint=None):
+    if len(candidate) == 14:
+        if isinstance(candidate[-1], dict):
+            candidate = (*candidate, None)
+        else:
+            # Older callers supplied the funding value but had no execution plan.
+            candidate = (*candidate[:13], {"order_type": "market"}, candidate[-1])
     (symbol, _strength, side, close, stop, entry_atr, swing_low, swing_high,
-     regime_value, reason, daily_gate, context, flags, funding_rate) = candidate
+     regime_value, reason, daily_gate, context, flags, execution_plan, funding_rate) = candidate
     max_delay = timedelta(seconds=settings.execution.confirm_delay_sec_max)
     market_risk_state = market_risk.state.value
     def reject(reason, phase, details=None):
@@ -3672,6 +3893,21 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
                                 bar_close_at=context.bar_close_at if context else None,
                                 details=details, scan_row=scan_row)
         return None
+    order_type = execution_plan.get("order_type", "market")
+    limit_entry_price = execution_plan.get("limit_price") if order_type == "limit" else None
+    limit_expires_at = execution_plan.get("limit_expires_at") if order_type == "limit" else None
+    if order_type == "limit":
+        try:
+            close = float(limit_entry_price)
+            structure = swing_low if side is Side.LONG else swing_high
+            stop, _ = calculate_adaptive_stop(side, close, entry_atr, structure, settings)
+        except (TypeError, ValueError, OverflowError):
+            return reject("dynamic_limit_stop_invalid", "signal_stop")
+        if (not math.isfinite(close) or close <= 0
+                or (side is Side.LONG and stop >= close)
+                or (side is Side.SHORT and stop <= close)):
+            return reject("dynamic_limit_stop_invalid", "signal_stop")
+        stop = float(stop)
     if is_demo:
         try:
             _require_entry_clock()
@@ -3698,6 +3934,12 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
             _record_funding_entry_block(state, symbol, side, regime_value,
                                         funding_rate, funding_reason, settings, _utc_now())
             return None
+        funding_flip_side, funding_flip = _funding_flip_side(
+            exchange, symbol, _utc_now(), fail_on_market_error=True,
+        )
+        if funding_flip_side != side.value:
+            return reject("funding_flip_unconfirmed", "entry_confirmation", funding_flip)
+        execution_plan["funding_flip"] = funding_flip
     step_size = 1e-8
     minimum_quantity = 0.0
     if is_demo:
@@ -3737,19 +3979,66 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
     if not approval.allowed:
         return reject(approval.reason, "risk_approval",
                       {"quantity_risk": quantity_audit, "approval": approval.details})
+    if order_type == "limit" and not is_demo:
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+        except ccxt.BaseError as exc:
+            _raise_market_error_if_needed(exc, False)
+            return reject("dynamic_limit_quote_unavailable", "entry_confirmation")
+        quote_price = _ticker_price(
+            {symbol: ticker}, int(_utc_now().timestamp() * 1000),
+        )
+        if quote_price is None:
+            return reject("dynamic_limit_quote_stale", "entry_confirmation")
+        already_touched = (quote_price <= close if side is Side.LONG
+                           else quote_price >= close)
+        if already_touched:
+            return reject("dynamic_limit_price_already_touched", "entry_confirmation",
+                          {"quote_price": quote_price, "limit_price": close})
+        pending_key = "paper_limit|{}|{}|{}".format(
+            symbol, side.value, execution_plan.get("signal_bar") or "unknown",
+        )
+        state.mr_entry_attempts[pending_key] = {
+            "symbol": symbol, "side": side.value, "status": "paper_limit_pending",
+            "order_type": "limit", "signal_bar": execution_plan.get("signal_bar"),
+            "reason": reason, "regime": regime_value,
+            "limit_price": float(close), "stop_price": float(stop),
+            "quantity": float(qty), "expires_at": limit_expires_at,
+            "ema9_reclaim_side": execution_plan.get("ema9_reclaim_side"),
+            "funding_flip": execution_plan.get("funding_flip"),
+            "meta": {"entry_atr": float(entry_atr),
+                     "structure_low": float(swing_low),
+                     "structure_high": float(swing_high)},
+            "created_at": _utc_now().isoformat(),
+        }
+        state.events.append({"event": "dynamic_limit_entry_pending", "at": _utc_now().isoformat(),
+                             "symbol": symbol, "side": side.value,
+                             "price": float(close), "stop_price": float(stop),
+                             "expires_at": limit_expires_at, "clientOrderId": pending_key,
+                             "source": MEAN_REVERSION, "execution_mode": state.execution_mode,
+                             "funding_flip": execution_plan.get("funding_flip")})
+        return {"pending_limit": True, "clientOrderId": pending_key,
+                "price": float(close), "expires_at": limit_expires_at}
     execution_kwargs = {}
     if is_demo:
         if scan_row is not None:
             scan_row.update(phase="demo_prepare", endpoint="demo")
         audit = {}
+        audit.update({"order_type": order_type,
+                      "limit_price": limit_entry_price,
+                      "limit_expires_at": limit_expires_at,
+                      "ema9_reclaim_side": execution_plan.get("ema9_reclaim_side"),
+                      "funding_flip": funding_flip if "funding_flip" in locals() else None,
+                      "signal_range_atr": execution_plan.get("candle_range_atr")})
         guard, deadline = _entry_preflight(
             exchange, execution, state, settings, markets.get(symbol) or {},
             context, flags, funding_rate, market_risk, audit,
             propagate_read_errors=scan_row is not None,
-            scan_row=scan_row,
+            scan_row=scan_row, limit_entry_price=limit_entry_price,
         )
         execution_kwargs = {"entry_preflight": guard, "submission_deadline": deadline,
-                            "entry_audit": audit}
+                            "entry_audit": audit, "order_type": order_type,
+                            "limit_expires_at": limit_expires_at}
         if scan_row is not None:
             execution_kwargs.update(scan_row=scan_row, checkpoint=checkpoint,
                                     recovery_meta={"entry_atr": entry_atr, "structure_low": swing_low,
@@ -3757,6 +4046,13 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
     opened = _open_position(is_demo, execution, state, symbol, side, close, stop, qty,
                             int(settings.sizing.leverage), fee_rate, slip_rate, reason,
                             regime_value, now, **execution_kwargs)
+    if isinstance(opened, dict) and opened.get("pending_limit"):
+        state.events.append({"event": "dynamic_limit_entry_pending", "at": _utc_now().isoformat(),
+                             "symbol": symbol, "side": side.value, "price": close,
+                             "stop_price": stop, "expires_at": limit_expires_at,
+                             "clientOrderId": opened.get("clientOrderId"),
+                             "source": MEAN_REVERSION})
+        return opened
     if opened is not None:
         _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
                                    entry_atr, swing_low, swing_high)
@@ -3875,14 +4171,17 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                         max_pos, fee_rate, slip_rate, now, market_risk,
                         position_monitor=position_monitor, scan_row=row, checkpoint=checkpoint,
                     )
-                    if opened is not None:
+                    if opened is not None and not (isinstance(opened, dict)
+                                                   and opened.get("pending_limit")):
                         client_id = mr_scan.client_order_id(symbol, candidate[2].value, scan["bar"])
                         state.mr_entry_attempts[client_id]["status"] = "completed"
                         mr_scan.attempt_outcome(
                             state, state.mr_entry_attempts[client_id], "completed", _utc_now(),
                             phase="fill_confirmed", order_may_have_been_sent=True,
                         )
-                    finish(symbol, "opened" if opened is not None else "rejected")
+                    finish(symbol, "pending_limit" if isinstance(opened, dict)
+                           and opened.get("pending_limit")
+                           else "opened" if opened is not None else "rejected")
                 except mr_scan.ScanCheckpointError:
                     raise
                 except Exception as exc:
@@ -3907,6 +4206,9 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
     if market_risk.state is MarketRiskState.PAUSE_NEW:
         logger.warning("New entries paused by BTC market risk gate: {}", market_risk.reason)
         return
+    if any(row.get("status") == "paper_limit_pending"
+           for row in state.mr_entry_attempts.values()):
+        return
 
     open_count = len(state.portfolio.positions)
     slots = max(0, max_pos - open_count)
@@ -3930,7 +4232,7 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
         if len(eligible_candidates) >= slots:
             break
         (symbol, _strength, side, _close, _stop, _entry_atr, _low, _high,
-         regime_value, _reason, _daily_gate, _context, _flags) = candidate
+         regime_value, _reason, _daily_gate, _context, _flags, _execution_plan) = candidate
         funding_rate = _fetch_entry_funding_rate(
             exchange, symbol, fail_on_market_error=daily_direction_gate,
         )
@@ -3939,12 +4241,26 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
             _record_funding_entry_block(state, symbol, side, regime_value,
                                         funding_rate, funding_reason, settings, now)
             continue
+        funding_flip_side, funding_flip = _funding_flip_side(
+            exchange, symbol, _utc_now(), fail_on_market_error=daily_direction_gate,
+        )
+        if funding_flip_side != side.value:
+            _record_entry_rejection(
+                state, symbol, side, "funding_flip_unconfirmed", "entry_confirmation", _utc_now(),
+                details=funding_flip,
+            )
+            continue
+        candidate[13]["funding_flip"] = funding_flip
         eligible_candidates.append((*candidate, funding_rate))
 
     for candidate in eligible_candidates:
-        _submit_entry_candidate(exchange, state, execution, is_demo, markets, candidate,
-                                settings, max_pos, fee_rate, slip_rate, now, market_risk,
-                                position_monitor=position_monitor)
+        opened = _submit_entry_candidate(
+            exchange, state, execution, is_demo, markets, candidate,
+            settings, max_pos, fee_rate, slip_rate, now, market_risk,
+            position_monitor=position_monitor,
+        )
+        if isinstance(opened, dict) and opened.get("pending_limit"):
+            break
 
 
 def main() -> int:

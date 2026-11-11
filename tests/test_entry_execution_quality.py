@@ -428,6 +428,7 @@ def test_rejected_first_candidate_does_not_consume_slot_and_fill_has_quote_audit
     one, four = _entry_frames()
     first, second = "FIRST/USDT:USDT", "SECOND/USDT:USDT"
     monkeypatch.setattr(runner, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(runner, "_ema9_reclaim_side", lambda _frame: "long")
     monkeypatch.setattr(runner, "evaluate_time_filter", lambda *args, **kwargs: TimeFilterFlags(True, True, False, False))
     monkeypatch.setattr(runner, "_cached_daily_direction_gate", lambda *args, **kwargs: {"ready": True, "direction": "long"})
 
@@ -441,6 +442,11 @@ def test_rejected_first_candidate_does_not_consume_slot_and_fill_has_quote_audit
 
         def fetch_funding_rate(self, symbol):
             return {"fundingRate": 0.0}
+
+        def fetch_funding_rate_history(self, symbol, limit=2):
+            stamp = int(NOW.timestamp() * 1000)
+            return [{"timestamp": stamp - 8 * 60 * 60 * 1000, "fundingRate": 0.0001},
+                    {"timestamp": stamp, "fundingRate": -0.0001}]
 
     class Execution:
         exchange = Client()

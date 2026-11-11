@@ -525,24 +525,31 @@ class DemoExecutionService:
         rows = self.exchange.fetch_positions([symbol])
         return next((parsed for row in rows if (parsed := parse_live_position(row)) is not None), None)
 
-    def _place_stop(self, symbol: str, side: str, amount: float, stop_price: float) -> dict[str, Any]:
+    def _place_stop(self, symbol: str, side: str, amount: float, stop_price: float, *,
+                    close_all: bool = False, client_order_id: str | None = None) -> dict[str, Any]:
         if not math.isfinite(stop_price) or stop_price <= 0:
             raise ValueError("a valid protective stop is required before order submission")
         self._verify_urls()
         close_side = "sell" if side == "long" else "buy"
-        amount = float(self.exchange.amount_to_precision(symbol, amount))
         stop_price = float(self.exchange.price_to_precision(symbol, stop_price))
-        client_id = f"{BOT_ORDER_PREFIX}_s_{uuid4().hex[:24]}"
+        amount = (None if close_all else
+                  float(self.exchange.amount_to_precision(symbol, amount)))
+        client_id = client_order_id or f"{BOT_ORDER_PREFIX}_s_{uuid4().hex[:24]}"
+        params = {"stopPrice": stop_price, "workingType": "CONTRACT_PRICE",
+                  "clientOrderId": client_id}
+        if close_all:
+            params["closePosition"] = True
+        else:
+            params["reduceOnly"] = True
         order = self.exchange.create_order(
             symbol, "STOP_MARKET", close_side, amount, None,
-            {"stopPrice": stop_price, "reduceOnly": True, "workingType": "CONTRACT_PRICE",
-             "clientOrderId": client_id},
+            params,
         )
         order_id = order.get("id") or (order.get("info") or {}).get("algoId")
         if not order_id:
             raise RuntimeError("USDⓈ-M protective stop returned no orderId")
         return {"id": str(order_id), "clientOrderId": client_id, "stop_price": stop_price,
-                "amount": amount, "info": order.get("info", {})}
+                "amount": amount, "close_all": close_all, "info": order.get("info", {})}
 
     def _cancel_stop(self, symbol: str, stop: dict[str, Any] | None) -> None:
         if not stop or not stop.get("id"):
@@ -581,6 +588,9 @@ class DemoExecutionService:
         client_id = str(row.get("clientAlgoId") or "")
         is_owned = self._is_bot_reduce_stop(row)
         is_adopted = bool(stop.get("external")) and client_id == str(stop.get("clientOrderId") or "")
+        close_all = bool(stop.get("close_all"))
+        row_close_all = str(row.get("closePosition")).strip().lower() in {"true", "1"}
+        reduce_only = str(row.get("reduceOnly")).strip().lower() in {"true", "1"}
         try:
             expected_price = float(self.exchange.price_to_precision(symbol, float(stop["stop_price"])))
         except (KeyError, TypeError, ValueError, OverflowError):
@@ -592,8 +602,9 @@ class DemoExecutionService:
             and str(row.get("orderType") or "").upper() == "STOP_MARKET"
             and str(row.get("algoStatus") or "").upper() == "NEW"
             and str(row.get("side") or "").upper() == expected_side
-            and str(row.get("reduceOnly")).strip().lower() in {"true", "1"}
-            and abs(_number(row.get("quantity")) - quantity) <= max(step, 1e-10)
+            and ((close_all and row_close_all and not reduce_only)
+                 or (not close_all and reduce_only and not row_close_all
+                     and abs(_number(row.get("quantity")) - quantity) <= max(step, 1e-10)))
             and math.isclose(_number(row.get("triggerPrice")), expected_price,
                              rel_tol=1e-9, abs_tol=max(expected_price * 1e-9, 1e-12))
         )
@@ -701,7 +712,8 @@ class DemoExecutionService:
     def _is_bot_reduce_stop(row: dict[str, Any]) -> bool:
         return (str(row.get("clientAlgoId") or "").startswith(f"{BOT_ORDER_PREFIX}_s_")
                 and str(row.get("orderType") or "").upper() == "STOP_MARKET"
-                and str(row.get("reduceOnly")).strip().lower() in {"true", "1"})
+                and (str(row.get("reduceOnly")).strip().lower() in {"true", "1"}
+                     or str(row.get("closePosition")).strip().lower() in {"true", "1"}))
 
     def _retire_superseded_stops(self, symbol: str, side: str, active_stop: dict[str, Any] | None,
                                  expected_quantity: float) -> list[dict[str, Any]]:
@@ -723,7 +735,10 @@ class DemoExecutionService:
                 and (active is None or not self._is_bot_reduce_stop(active)
                      or str(active.get("side") or "").upper() != close_side
                      or str(active.get("algoStatus") or "").upper() != "NEW"
-                     or abs(_number(active.get("quantity")) - expected_quantity) > max(step, 1e-10))):
+                     or (bool(active_stop.get("close_all"))
+                         and str(active.get("closePosition")).strip().lower() not in {"true", "1"})
+                     or (not active_stop.get("close_all")
+                         and abs(_number(active.get("quantity")) - expected_quantity) > max(step, 1e-10)))):
             raise RuntimeError("remaining position protective stop is not confirmed at the actual quantity")
 
         for row in rows:
@@ -817,11 +832,17 @@ class DemoExecutionService:
             expected_price = float(self.exchange.price_to_precision(symbol, expected_price))
         except (TypeError, ValueError, OverflowError):
             expected_price = float("nan")
+        close_all = bool(stop.get("close_all"))
+        row_close_all = str(match.get("closePosition")).strip().lower() in {"true", "1"}
+        row_reduce_only = str(match.get("reduceOnly")).strip().lower() in {"true", "1"}
         if (not (is_bot or is_adopted)
                 or str(match.get("symbol") or "").upper() != expected_symbol
                 or str(match.get("orderType") or "").upper() != "STOP_MARKET"
                 or str(match.get("algoStatus") or "").upper() != "NEW"
-                or str(match.get("reduceOnly")).strip().lower() not in {"true", "1"}
+                or (close_all and (not row_close_all or row_reduce_only))
+                or (not close_all and not row_reduce_only)
+                or (not close_all and not is_adopted
+                    and abs(_number(match.get("quantity")) - expected_quantity) > max(step, 1e-10))
                 or (stop.get("order_side") and str(match.get("side") or "").upper()
                     != str(stop["order_side"]).upper())
                 or (is_adopted and (
@@ -883,6 +904,7 @@ class DemoExecutionService:
         market_id = self.exchange.market(symbol)["id"]
         algo = self.exchange.fapiPrivateGetAlgoOrder({"algoId": str(stop["id"])})
         reduce_only = str(algo.get("reduceOnly")).strip().lower() in {"true", "1"}
+        close_all = str(algo.get("closePosition")).strip().lower() in {"true", "1"}
         client_id = str(algo.get("clientAlgoId") or "")
         tracked_client = (client_id.startswith(f"{BOT_ORDER_PREFIX}_s_")
                           or (bool(stop.get("external"))
@@ -893,7 +915,8 @@ class DemoExecutionService:
                 or (algo_symbol is not None and str(algo_symbol).upper() != str(market_id).upper())
                 or (stop.get("external") and algo_symbol is None)
                 or not tracked_client
-                or not reduce_only
+                or (not reduce_only and not close_all)
+                or (bool(stop.get("close_all")) != close_all)
                 or str(algo.get("orderType") or "").upper() != "STOP_MARKET"):
             return None
         trades = self.exchange.fapiPrivateGetUserTrades({
@@ -1081,8 +1104,198 @@ class DemoExecutionService:
             "open_order_count": 0, "open_algo_order_count": 0, "flat_position_checks": 2,
         }}
 
+    def inspect_limit_entry_attempt(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        """Reconcile a durable GTD limit entry and its stop-first protection."""
+        self._verify_urls()
+        symbol = attempt["symbol"]
+        market_id = self.exchange.market(symbol)["id"]
+        client_id = str(attempt.get("clientOrderId") or "")
+        expected_side = "BUY" if attempt.get("side") == "long" else "SELL"
+        expected_close_side = "SELL" if attempt.get("side") == "long" else "BUY"
+        stop_client_id = str(attempt.get("stop_client_algo_id") or "")
+        if (attempt.get("order_type") != "limit"
+                or not client_id.startswith(f"{BOT_ORDER_PREFIX}_")
+                or attempt.get("side") not in {"long", "short"}):
+            return {"status": "identity_mismatch"}
+
+        def query_order():
+            return self.exchange.fapiPrivateGetOrder({
+                "symbol": market_id, "origClientOrderId": client_id,
+            })
+
+        def recover_preprotected_stop():
+            saved = attempt.get("preprotected_stop") or {}
+            if saved.get("id"):
+                return saved
+            algo_rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+            if not isinstance(algo_rows, list):
+                raise RuntimeError("preprotected stop query invalid")
+            row = next((item for item in algo_rows
+                        if str(item.get("clientAlgoId") or "") == stop_client_id), None)
+            if row is None:
+                return None
+            if (str(row.get("orderType") or "").upper() != "STOP_MARKET"
+                    or str(row.get("algoStatus") or "").upper() != "NEW"
+                    or str(row.get("side") or "").upper() != expected_close_side
+                    or str(row.get("closePosition")).strip().lower() not in {"true", "1"}
+                    or str(row.get("reduceOnly")).strip().lower() in {"true", "1"}):
+                raise RuntimeError("preprotected stop identity mismatch")
+            return {"id": str(row.get("algoId")), "clientOrderId": stop_client_id,
+                    "stop_price": _number(row.get("triggerPrice")),
+                    "amount": _number(attempt.get("quantity")), "close_all": True}
+
+        try:
+            order = query_order()
+        except OrderNotFound:
+            live = self._position(symbol)
+            if live is not None:
+                return {"status": "position_without_entry_order"}
+            try:
+                submitted = datetime.fromisoformat(
+                    str(attempt["submitted_at"]).replace("Z", "+00:00"),
+                )
+                if submitted.tzinfo is None or _utc_now() - submitted < timedelta(minutes=5):
+                    return {"status": "order_not_visible"}
+                start = submitted - timedelta(minutes=1)
+                history = self.exchange.fapiPrivateGetAllOrders({
+                    "symbol": market_id, "startTime": int(start.timestamp() * 1000),
+                    "endTime": int(_utc_now().timestamp() * 1000), "limit": 1000,
+                })
+                if not isinstance(history, list) or len(history) >= 1000:
+                    return {"status": "entry_history_inconclusive"}
+                if any(row.get("clientOrderId") == client_id for row in history):
+                    return {"status": "order_history_requires_requery"}
+                open_rows = self.exchange.fapiPrivateGetOpenOrders({"symbol": market_id})
+                if not isinstance(open_rows, list):
+                    return {"status": "open_order_query_invalid"}
+                if any(row.get("clientOrderId") == client_id for row in open_rows):
+                    return {"status": "order_open_after_missing_query"}
+                self.cancel_saved_stop_if_open(symbol, recover_preprotected_stop())
+                return {"status": "not_filled", "evidence": {
+                    "kind": "limit_client_order_absent", "clientOrderId": client_id,
+                    "checked_at": _utc_now().isoformat(),
+                    "history_start_at": start.isoformat(),
+                }}
+            except Exception as exc:
+                return {"status": "missing_order_unconfirmed", "error": type(exc).__name__}
+
+        if (not isinstance(order, dict)
+                or str(order.get("clientOrderId") or "") != client_id
+                or str(order.get("symbol") or "").upper() != str(market_id).upper()
+                or str(order.get("side") or "").upper() != expected_side
+                or str(order.get("type") or "").upper() != "LIMIT"
+                or str(order.get("reduceOnly")).strip().lower() not in {"false", "0"}):
+            return {"status": "identity_mismatch"}
+
+        stop_data = recover_preprotected_stop() or {}
+        rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+        if not isinstance(rows, list):
+            return {"status": "stop_query_invalid"}
+        stop_row = next((row for row in rows
+                         if str(row.get("clientAlgoId") or "") == stop_client_id), None)
+        order_status = str(order.get("status") or "").upper()
+        filled = _number(order.get("executedQty"))
+        expires_at = datetime.fromisoformat(str(attempt["expires_at"]).replace("Z", "+00:00"))
+        expired = _utc_now() >= expires_at
+
+        side_identity = SimpleNamespace(side=Side(attempt["side"]))
+        if order_status in {"NEW", "PARTIALLY_FILLED"}:
+            protection_ok = (stop_row is not None and stop_data
+                             and self._saved_stop_matches(
+                                 symbol, side_identity, stop_data, stop_row,
+                                 float(attempt["quantity"]),
+                             ))
+            if not protection_ok:
+                expired = True
+            if not expired and filled <= 0:
+                return {"status": "pending", "orderId": str(order.get("orderId")),
+                        "filled": filled}
+            try:
+                self.exchange.fapiPrivateDeleteOrder({
+                    "symbol": market_id, "origClientOrderId": client_id,
+                })
+                order = query_order()
+            except OrderNotFound:
+                order = query_order()
+            except Exception as exc:
+                return {"status": "cancel_uncertain", "error": type(exc).__name__}
+            order_status = str(order.get("status") or "").upper()
+            filled = _number(order.get("executedQty"))
+            if order_status in {"NEW", "PARTIALLY_FILLED"}:
+                return {"status": "cancel_unconfirmed"}
+
+        if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"} and filled <= 0:
+            if self._position(symbol) is not None:
+                return {"status": "position_after_zero_fill"}
+            self.cancel_saved_stop_if_open(symbol, stop_data or recover_preprotected_stop())
+            return {"status": "not_filled", "orderId": str(order.get("orderId"))}
+        if order_status not in {"FILLED", "CANCELED", "CANCELLED", "EXPIRED"} or filled <= 0:
+            return {"status": "order_not_terminal"}
+
+        live = self._position(symbol)
+        if live is None:
+            return {"status": "filled_then_flat", "orderId": str(order.get("orderId"))}
+        step, _, _ = self._market_rules(symbol)
+        tolerance = max(step, filled * 1e-8, 1e-12)
+        if (live["side"] != attempt["side"]
+                or abs(float(live["quantity"]) - filled) > tolerance):
+            return {"status": "position_mismatch"}
+        rows = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+        if not isinstance(rows, list):
+            return {"status": "stop_query_invalid"}
+        trades = self.exchange.fapiPrivateGetUserTrades({
+            "symbol": market_id, "orderId": str(order.get("orderId")), "limit": 1000,
+        })
+        trades = [row for row in trades if str(row.get("orderId")) == str(order.get("orderId"))]
+        if not trades or abs(sum(_number(row.get("qty")) for row in trades) - filled) > tolerance:
+            return {"status": "trades_unconfirmed"}
+
+        stop_price = _number(attempt.get("stop_price"), float("nan"))
+        saved_stop = dict(stop_data)
+        stop_row = next((row for row in rows
+                         if str(row.get("clientAlgoId") or "") == stop_client_id), None)
+        valid_stop = (stop_row is not None and saved_stop
+                      and self._saved_stop_matches(
+                          symbol, side_identity, saved_stop, stop_row, live["quantity"],
+                      ))
+        if not valid_stop:
+            # The close-all trigger may have been consumed during a rapid move.
+            # Reinstall sized protection before accepting the live position.
+            saved_stop = self._place_stop(symbol, attempt["side"], live["quantity"], stop_price)
+            refreshed = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
+            stop_row = next((row for row in refreshed
+                             if str(row.get("algoId")) == str(saved_stop.get("id"))), None)
+            position_identity = SimpleNamespace(side=Side(attempt["side"]), quantity=live["quantity"])
+            if stop_row is None or not self._saved_stop_matches(
+                    symbol, position_identity, saved_stop, stop_row, live["quantity"]):
+                raise RuntimeError("filled dynamic limit has no verified protective stop")
+        saved_stop["amount"] = float(live["quantity"])
+        average = _number(order.get("avgPrice"))
+        if average <= 0 or not math.isclose(live["entry_price"], average,
+                                            rel_tol=1e-7, abs_tol=1e-12):
+            return {"status": "entry_price_mismatch"}
+        safety = (attempt.get("audit") or {}).get("capital_safety")
+        if self.mode == "lead" and safety is not None:
+            identity = SimpleNamespace(symbol=symbol, side=Side(attempt["side"]))
+            live = self._check_or_exit_new_position(identity, saved_stop, dict(safety))
+            safety["verified"] = True
+        fill = {"id": str(order["orderId"]), "clientOrderId": client_id,
+                "filled": filled, "average": average, "trade_data_verified": True}
+        if all(row.get("commission") is not None and row.get("commissionAsset") == "USDT"
+               for row in trades):
+            fill["fee_cost"] = sum(_number(row["commission"]) for row in trades)
+        times = [int(row.get("time") or 0) for row in trades]
+        if times and all(value > 0 for value in times):
+            fill["closed_at"] = datetime.fromtimestamp(max(times) / 1000, timezone.utc).isoformat()
+        return {"status": "protected", "result": {
+            "fill": fill, "position": live, "stop": saved_stop,
+            "capital_safety": safety, "order_submitted_at": attempt["submitted_at"],
+        }}
+
     def inspect_entry_attempt(self, attempt: dict[str, Any]) -> dict[str, Any]:
         """Read-only recovery by the exact saved order identity; never resend."""
+        if attempt.get("order_type") == "limit":
+            return self.inspect_limit_entry_attempt(attempt)
         self._verify_urls()
         symbol = attempt["symbol"]
         market_id = self.exchange.market(symbol)["id"]
@@ -1248,6 +1461,109 @@ class DemoExecutionService:
                 "order_submitted_at": submitted_at.isoformat(),
                 "host": self.host, "reason": intent.reason, "regime": intent.regime.value}
 
+    def open_limit(self, intent, *, stop_price: float,
+                   limit_expires_at: str | datetime,
+                   before_submit: Callable | None = None,
+                   submission_deadline: datetime | None = None,
+                   client_order_id: str,
+                   on_submit: Callable,
+                   on_protection: Callable,
+                   on_safety_plan: Callable | None = None) -> dict[str, Any]:
+        """Place a durable GTD limit only after a verified close-all stop is active."""
+        _require_entry_clock()
+        if intent.action is not Action.OPEN or not client_order_id:
+            raise ValueError("dynamic limit requires an OPEN intent and durable client order id")
+        if stop_price is None or not math.isfinite(stop_price) or stop_price <= 0:
+            raise ValueError("opening intent has no valid protective stop")
+        expires_at = (limit_expires_at if isinstance(limit_expires_at, datetime)
+                      else datetime.fromisoformat(str(limit_expires_at).replace("Z", "+00:00")))
+        if expires_at.tzinfo is None:
+            raise ValueError("dynamic limit expiry must be timezone-aware")
+        self._verify_urls()
+        self._ensure_one_way()
+        if self._position(intent.symbol) is not None:
+            raise EntryPreflightRejected("exchange_position_already_exists")
+        preparation = self._prepare_entry(intent)
+        if before_submit is not None:
+            original = (intent.symbol, intent.side, intent.action, intent.source)
+            intent, stop_price = before_submit(intent, stop_price)
+            if (intent.symbol, intent.side, intent.action, intent.source) != original:
+                raise ValueError("entry preflight cannot change the order identity")
+            if stop_price is None or not math.isfinite(stop_price) or stop_price <= 0:
+                raise ValueError("entry preflight returned no valid protective stop")
+        step, minimum, minimum_notional = self._market_rules(intent.symbol)
+        amount = float(intent.quantity)
+        if step > 0:
+            amount = math.floor((amount + step * 1e-10) / step) * step
+        amount = float(self.exchange.amount_to_precision(intent.symbol, amount))
+        limit_price = float(self.exchange.price_to_precision(intent.symbol, intent.price))
+        stop_price = float(self.exchange.price_to_precision(intent.symbol, stop_price))
+        if (amount <= 0 or amount < minimum
+                or limit_price * amount < minimum_notional
+                or (intent.side is Side.LONG and stop_price >= limit_price)
+                or (intent.side is Side.SHORT and stop_price <= limit_price)):
+            raise EntryPreflightRejected("dynamic_limit_order_invalid")
+        submitted_at = _utc_now()
+        if (submission_deadline is not None and submitted_at > submission_deadline):
+            raise EntryPreflightRejected("entry_signal_expired")
+        good_till_date = int(expires_at.timestamp() * 1000)
+        if good_till_date <= int((submitted_at + timedelta(seconds=600)).timestamp() * 1000):
+            raise EntryPreflightRejected("dynamic_limit_expiry_too_close")
+        safety = self._finalize_entry(
+            replace(intent, quantity=amount, price=limit_price, stop_price=stop_price), preparation,
+        )
+        if safety is not None and on_safety_plan is not None:
+            on_safety_plan(safety)
+        on_submit(amount, stop_price, submitted_at)
+        stop_client_id = f"{BOT_ORDER_PREFIX}_s_{client_order_id[-24:]}"
+        stop = self._place_stop(intent.symbol, intent.side.value, amount, stop_price,
+                                close_all=True, client_order_id=stop_client_id)
+        on_protection(stop)
+        market_id = self.exchange.market(intent.symbol)["id"]
+        active_stops = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
+        active = next((row for row in active_stops
+                       if str(row.get("clientAlgoId") or "") == stop_client_id), None)
+        stop_identity = SimpleNamespace(side=intent.side)
+        if (active is None or not self._saved_stop_matches(
+                intent.symbol, stop_identity, stop, active, amount)):
+            raise RuntimeError("dynamic limit protective stop is not confirmed before entry submit")
+        params = {
+            "timeInForce": "GTD", "goodTillDate": good_till_date,
+            "clientOrderId": client_order_id, "newOrderRespType": "ACK",
+        }
+        side = "buy" if intent.side is Side.LONG else "sell"
+        try:
+            response = self.exchange.create_order(
+                intent.symbol, "limit", side, amount, limit_price, params,
+            )
+        except (RequestTimeout, OrderNotFound):
+            response = self.exchange.fapiPrivateGetOrder({
+                "symbol": market_id, "origClientOrderId": client_order_id,
+            })
+        order_id = response.get("id") or (response.get("info") or {}).get("orderId")
+        if not order_id:
+            order_id = (response.get("orderId") if isinstance(response, dict) else None)
+        if not order_id:
+            raise RuntimeError("dynamic limit returned no orderId; reconciliation required")
+        report = self.inspect_limit_entry_attempt({
+            "symbol": intent.symbol, "side": intent.side.value,
+            "clientOrderId": client_order_id, "order_type": "limit",
+            "submitted_at": submitted_at.isoformat(), "expires_at": expires_at.isoformat(),
+            "quantity": amount, "stop_price": stop_price,
+            "stop_client_algo_id": stop_client_id, "preprotected_stop": stop,
+            "audit": {"capital_safety": safety} if safety is not None else {},
+        })
+        if report["status"] == "protected":
+            return {**report["result"], "host": self.host,
+                    "reason": intent.reason, "regime": intent.regime.value}
+        if report["status"] == "pending":
+            return {"pending_limit": True, "order_id": str(order_id),
+                    "clientOrderId": client_order_id, "price": limit_price,
+                    "stop": stop}
+        if report["status"] == "not_filled":
+            return {"not_filled": True, "clientOrderId": client_order_id}
+        raise RuntimeError(f"dynamic limit needs reconciliation: {report['status']}")
+
     def close(self, position, *, stop: dict[str, Any] | None = None,
               reason: str | None = None) -> dict[str, Any]:
         symbol = position.symbol
@@ -1391,6 +1707,9 @@ class DemoExecutionService:
             actual_price = _number(current.get("triggerPrice"), float("nan"))
             saved_price = _number(stop.get("stop_price"), float("nan"))
             saved_price = float(self.exchange.price_to_precision(symbol, saved_price))
+            close_all = bool(stop.get("close_all"))
+            row_close_all = str(current.get("closePosition")).strip().lower() in {"true", "1"}
+            row_reduce_only = str(current.get("reduceOnly")).strip().lower() in {"true", "1"}
             valid = (
                 str(current.get("algoId")) == str(stop["id"])
                 and str(current.get("symbol") or "").upper() == self.exchange.market(symbol)["id"].upper()
@@ -1401,9 +1720,10 @@ class DemoExecutionService:
                 and str(current.get("orderType") or "").upper() == "STOP_MARKET"
                 and str(current.get("algoStatus") or "").upper() == "NEW"
                 and str(current.get("side") or "").upper() == expected_side
-                and str(current.get("reduceOnly")).strip().lower() in {"true", "1"}
-                and abs(_number(current.get("quantity")) - float(live_position["quantity"]))
-                <= max(step, 1e-10)
+                and ((close_all and row_close_all and not row_reduce_only)
+                     or (not close_all and row_reduce_only and not row_close_all
+                         and abs(_number(current.get("quantity")) - float(live_position["quantity"]))
+                         <= max(step, 1e-10)))
                 and math.isfinite(actual_price) and actual_price > 0
                 and math.isfinite(saved_price)
                 and math.isclose(actual_price, saved_price, rel_tol=1e-9,

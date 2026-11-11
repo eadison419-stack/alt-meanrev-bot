@@ -119,6 +119,8 @@ def test_initial_entry_zero_quantity_persists_xmr_like_risk_reason(settings, mon
     state.exchange_orders_by_symbol[old] = {"stop": {"id": "stop", "amount": 1, "stop_price": 95}}
     state.protective_stop_audit["position_count"] = 1
     monkeypatch.setattr(runner, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(runner, "_ema9_reclaim_side", lambda _frame: "long")
+    monkeypatch.setattr(runner, "_funding_flip_side", lambda *_args, **_kwargs: ("long", {}))
     context = EntrySignalContext(SYMBOL, Side.LONG, NOW, NOW, NOW, 98, 99, 101, 1, 97, 103)
     candidate = (SYMBOL, .02, Side.LONG, 99, 97, 1, 97, 103, "MID", "test", None,
                  context, TimeFilterFlags(True, True, False, False), 0)
@@ -455,6 +457,8 @@ def test_next_candidate_refreshes_snapshot_after_prior_fill(settings, monkeypatc
     state.protective_stop_audit["status"] = "pending"
     calls = []
     monkeypatch.setattr(runner, "_utc_now", lambda: NOW)
+    monkeypatch.setattr(runner, "_ema9_reclaim_side", lambda _frame: "long")
+    monkeypatch.setattr(runner, "_funding_flip_side", lambda *_args, **_kwargs: ("long", {}))
 
     def refresh(*args):
         calls.append("account")
