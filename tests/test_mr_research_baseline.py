@@ -192,7 +192,6 @@ def test_same_input_candidate_regime_stop_quantity_and_fill_reconciliation(monke
     state = MultiPaperState(execution_mode="lead_usdm", execution_status="synchronized")
     execution = ReplayExecution(public, state, settings, 1000)
     monkeypatch.setattr(runner, "_ema9_reclaim_side", lambda _frame: "long")
-    monkeypatch.setattr(runner, "_funding_flip_side", lambda *_args, **_kwargs: ("long", {}))
     saved_clock = active_clock()
     activate_clock(public.clock)
     try:

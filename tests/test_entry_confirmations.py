@@ -45,38 +45,3 @@ def test_normal_range_keeps_market_execution():
     assert plan["candle_range_atr"] == 1.5
     assert plan["order_type"] == "market"
     assert plan["limit_price"] is None and plan["limit_expires_at"] is None
-
-
-def test_funding_flip_uses_latest_fresh_settled_pair():
-    now = datetime(2026, 11, 1, 8, tzinfo=timezone.utc)
-    stamp = int(now.timestamp() * 1000)
-
-    class Exchange:
-        def fetch_funding_rate_history(self, _symbol, limit=2):
-            assert limit == 2
-            return [
-                {"timestamp": stamp - 8 * 60 * 60 * 1000, "fundingRate": 0.0001},
-                {"timestamp": stamp - 60_000, "fundingRate": -0.0001},
-            ]
-
-    side, details = runner._funding_flip_side(Exchange(), "ADA/USDT:USDT", now)
-
-    assert side == Side.LONG.value
-    assert details["previous_rate"] > 0 > details["current_rate"]
-
-
-def test_stale_funding_flip_is_not_accepted():
-    now = datetime(2026, 11, 1, 8, tzinfo=timezone.utc)
-    stamp = int((now - timedelta(hours=20)).timestamp() * 1000)
-
-    class Exchange:
-        def fetch_funding_rate_history(self, _symbol, limit=2):
-            return [
-                {"timestamp": stamp - 8 * 60 * 60 * 1000, "fundingRate": -0.0001},
-                {"timestamp": stamp, "fundingRate": 0.0001},
-            ]
-
-    side, details = runner._funding_flip_side(Exchange(), "ADA/USDT:USDT", now)
-
-    assert side is None
-    assert details["reason"] == "funding_flip_history_stale"

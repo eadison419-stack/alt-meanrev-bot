@@ -192,7 +192,7 @@ def _local_attempt(now, *, expires_at=None):
         "reason": "synthetic_entry", "regime": Regime.MID.value,
         "limit_price": 99.0, "stop_price": 95.0, "quantity": 1.0,
         "expires_at": (expires_at or now + timedelta(hours=3)).isoformat(),
-        "ema9_reclaim_side": "long", "funding_flip": {"side": "long"},
+        "ema9_reclaim_side": "long",
         "meta": {"entry_atr": 1.0, "structure_low": 95.2, "structure_high": 101.0},
     }
 

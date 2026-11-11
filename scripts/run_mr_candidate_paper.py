@@ -783,8 +783,7 @@ def _process_local_dynamic_limits(state, current_prices, settings, now, fee_rate
                              "fill_price": opened.entry_price,
                              "clientOrderId": key,
                              "fill_model": "fresh_tick_touch_at_limit",
-                             "ema9_reclaim_side": attempt.get("ema9_reclaim_side"),
-                             "funding_flip": attempt.get("funding_flip")})
+                             "ema9_reclaim_side": attempt.get("ema9_reclaim_side")})
         stop_touched = (price <= stop_price if side is Side.LONG
                         else price >= stop_price)
         if stop_touched:
@@ -2973,38 +2972,6 @@ def _fetch_entry_funding_rate(exchange, symbol, *, fail_on_market_error=False):
         return None
 
 
-def _funding_flip_side(exchange, symbol, now, *, fail_on_market_error=False):
-    """Return the side confirmed by the two latest fresh settled funding rates."""
-    try:
-        rows = exchange.fetch_funding_rate_history(symbol, limit=2)
-        if not isinstance(rows, list) or len(rows) < 2:
-            return None, {"reason": "funding_flip_history_unavailable"}
-        rows = sorted(rows, key=lambda row: int(row.get("timestamp") or 0))
-        previous, current = rows[-2], rows[-1]
-        previous_rate = float(previous["fundingRate"])
-        current_rate = float(current["fundingRate"])
-        previous_at = int(previous["timestamp"])
-        current_at = int(current["timestamp"])
-        if (not all(math.isfinite(value) for value in (previous_rate, current_rate))
-                or previous_at <= 0 or current_at <= previous_at):
-            return None, {"reason": "funding_flip_history_invalid"}
-        interval_ms = current_at - previous_at
-        age_ms = int(now.timestamp() * 1000) - current_at
-        if age_ms < 0 or age_ms > interval_ms + HOUR_MS:
-            return None, {"reason": "funding_flip_history_stale"}
-        side = ("long" if previous_rate > 0 and current_rate < 0
-                else "short" if previous_rate < 0 and current_rate > 0 else None)
-        return side, {
-            "previous_rate": previous_rate, "current_rate": current_rate,
-            "previous_at": previous_at, "current_at": current_at,
-            "age_ms": age_ms, "side": side,
-        }
-    except (ccxt.BaseError, AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
-        if isinstance(exc, ccxt.BaseError):
-            _raise_market_error_if_needed(exc, fail_on_market_error)
-        return None, {"reason": f"funding_flip_history_error:{type(exc).__name__}"}
-
-
 def _ema9_reclaim_side(frame1):
     if frame1 is None or len(frame1) < EMA9_RECLAIM_PERIOD + 1:
         return None
@@ -4227,12 +4194,6 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
             _record_funding_entry_block(state, symbol, side, regime_value,
                                         funding_rate, funding_reason, settings, _utc_now())
             return None
-        funding_flip_side, funding_flip = _funding_flip_side(
-            exchange, symbol, _utc_now(), fail_on_market_error=True,
-        )
-        if funding_flip_side != side.value:
-            return reject("funding_flip_unconfirmed", "entry_confirmation", funding_flip)
-        execution_plan["funding_flip"] = funding_flip
     step_size = 1e-8
     minimum_quantity = 0.0
     if is_demo:
@@ -4298,7 +4259,6 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
             "limit_price": float(close), "stop_price": float(stop),
             "quantity": float(qty), "expires_at": limit_expires_at,
             "ema9_reclaim_side": execution_plan.get("ema9_reclaim_side"),
-            "funding_flip": execution_plan.get("funding_flip"),
             "deviation_threshold_pct": execution_plan.get("deviation_threshold_pct"),
             "meta": {"entry_atr": float(entry_atr),
                      "structure_low": float(swing_low),
@@ -4309,8 +4269,7 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
                              "symbol": symbol, "side": side.value,
                              "price": float(close), "stop_price": float(stop),
                              "expires_at": limit_expires_at, "clientOrderId": pending_key,
-                             "source": MEAN_REVERSION, "execution_mode": state.execution_mode,
-                             "funding_flip": execution_plan.get("funding_flip")})
+                             "source": MEAN_REVERSION, "execution_mode": state.execution_mode})
         return {"pending_limit": True, "clientOrderId": pending_key,
                 "price": float(close), "expires_at": limit_expires_at}
     execution_kwargs = {}
@@ -4322,7 +4281,6 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
                       "limit_price": limit_entry_price,
                       "limit_expires_at": limit_expires_at,
                       "ema9_reclaim_side": execution_plan.get("ema9_reclaim_side"),
-                      "funding_flip": funding_flip if "funding_flip" in locals() else None,
                       "signal_range_atr": execution_plan.get("candle_range_atr")})
         guard, deadline = _entry_preflight(
             exchange, execution, state, settings, markets.get(symbol) or {},
@@ -4539,16 +4497,6 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
             _record_funding_entry_block(state, symbol, side, regime_value,
                                         funding_rate, funding_reason, settings, now)
             continue
-        funding_flip_side, funding_flip = _funding_flip_side(
-            exchange, symbol, _utc_now(), fail_on_market_error=daily_direction_gate,
-        )
-        if funding_flip_side != side.value:
-            _record_entry_rejection(
-                state, symbol, side, "funding_flip_unconfirmed", "entry_confirmation", _utc_now(),
-                details=funding_flip,
-            )
-            continue
-        candidate[13]["funding_flip"] = funding_flip
         eligible_candidates.append((*candidate, funding_rate))
 
     for candidate in eligible_candidates:
