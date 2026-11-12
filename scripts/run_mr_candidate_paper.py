@@ -53,7 +53,7 @@ from bot.data.klines import (filter_tradable_crypto_universe, hot_activity_metri
                              score_hot_candidates)
 from bot.exchange.binance_usdm import (create_demo_usdm, create_lead_usdm,
                                        resolve_execution_mode)
-from bot.exchange.network import configure_system_proxy
+from bot.exchange.network import configure_system_proxy, rate_limit_cooldown_remaining
 from bot.exchange.clock import ExchangeClock, ExchangeClockError, active_clock, activate_clock
 from bot.exchange.public_candles import CandleBatchReader, prefetched_read
 from bot.entry_quality import EntrySignalContext, entry_liquidity_observation, execution_quote
@@ -4840,6 +4840,22 @@ def main() -> int:
                                  "max_directional_notional_pct": settings.sizing.max_directional_notional_pct,
                                  "max_symbols": settings.sizing.max_symbols})
         if is_exchange_execution:
+            cooldown_event_recorded = False
+            while rate_limit_cooldown_remaining() > 0:
+                remaining = rate_limit_cooldown_remaining()
+                now = _utc_now()
+                if not cooldown_event_recorded:
+                    state.events.append({
+                        "event": "exchange_rate_limit_cooldown",
+                        "at": now.isoformat(),
+                        "until_ms": int((now.timestamp() + remaining) * 1000),
+                    })
+                    cooldown_event_recorded = True
+                state.record_equity(now)
+                checkpoint.try_save()
+                logger.warning("Binance IP rate-limit cooldown active; startup paused for {}s",
+                               int(max(1, remaining)))
+                time.sleep(min(max(1.0, float(args.poll)), max(1.0, remaining)))
             if mode.name == "lead_usdm":
                 account_exchange = create_lead_usdm(settings.runtime)
                 execution = LeadPortfolioExecutionService(account_exchange, settings)
@@ -4901,7 +4917,8 @@ def main() -> int:
 
         def monitor_demo_positions(*, force=False):
             nonlocal last_position_monitor_at
-            if not is_demo or not state.portfolio.positions:
+            if (not is_demo or not state.portfolio.positions
+                    or rate_limit_cooldown_remaining() > 0):
                 return False
             monotonic_now = time.monotonic()
             if (not force and monotonic_now - last_position_monitor_at
@@ -4948,6 +4965,13 @@ def main() -> int:
             return dirty
 
         while True:
+            cooldown_remaining = rate_limit_cooldown_remaining() if is_exchange_execution else 0.0
+            if cooldown_remaining > 0:
+                now = _utc_now()
+                state.record_equity(now)
+                checkpoint.try_save()
+                time.sleep(min(max(1.0, float(args.poll)), max(1.0, cooldown_remaining)))
+                continue
             if clock is not None:
                 _refresh_exchange_clock(clock, account_exchange, state)
                 _wait_for_closed_hour()
@@ -5010,7 +5034,8 @@ def main() -> int:
                                    getattr(exc, "mr_endpoint", "unidentified"), type(exc).__name__)
             except mr_scan.ScanCheckpointError:
                 logger.error("MR entry checkpoint failed; entries paused until storage recovers")
-            if is_demo and not checkpoint.failed and _background_reads_allowed(_utc_now()):
+            if (is_demo and not checkpoint.failed and rate_limit_cooldown_remaining() <= 0
+                    and _background_reads_allowed(_utc_now())):
                 _reconcile_demo_funding(execution, state, _utc_now(),
                                        position_monitor=monitor_demo_positions)
             state.record_equity(now)

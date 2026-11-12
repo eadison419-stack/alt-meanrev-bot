@@ -714,6 +714,9 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
     }
 
 
+MULTI_DASHBOARD_TICKER_CACHE_SECONDS = 30
+
+
 class DashboardService:
     def __init__(self, state_path: str | Path, symbol: str | None, exchange, settings=None):
         self.state_path = Path(state_path)
@@ -724,6 +727,9 @@ class DashboardService:
         self._cache_lock = threading.Lock()
         self._cached_at = 0.0
         self._cached: dict[str, Any] | None = None
+        self._tickers_cached_at = 0.0
+        self._cached_tickers: dict[str, dict] = {}
+        self._ticker_error: str | None = None
         self._display_mfe_prices: dict[str, tuple[str, str, float]] = {}
         self._equity_history: list[dict[str, Any]] = []
         self._last_equity_history_key: str | None = None
@@ -763,12 +769,18 @@ class DashboardService:
             state_stat = self.state_path.stat()
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
             if state.get("version") == 2:
-                try:
-                    tickers = self.exchange.fetch_tickers()
-                    error = None
-                except Exception as exc:  # keep ledger visible during transient market-data outages
-                    tickers = {}
-                    error = f"public tickers unavailable: {type(exc).__name__}"
+                if (not self._tickers_cached_at
+                        or time.monotonic() - self._tickers_cached_at
+                        >= MULTI_DASHBOARD_TICKER_CACHE_SECONDS):
+                    try:
+                        self._cached_tickers = self.exchange.fetch_tickers()
+                        self._ticker_error = None
+                    except Exception as exc:  # keep ledger visible during transient market-data outages
+                        self._cached_tickers = {}
+                        self._ticker_error = f"public tickers unavailable: {type(exc).__name__}"
+                    self._tickers_cached_at = time.monotonic()
+                tickers = self._cached_tickers
+                error = self._ticker_error
                 self._merge_display_mfe(state, tickers)
                 self._cached = build_multi_snapshot(state, tickers=tickers, market_error=error,
                                                     state_updated_at=state_stat.st_mtime, settings=self.settings)

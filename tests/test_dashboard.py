@@ -439,6 +439,41 @@ def test_dashboard_service_records_one_equity_point_per_new_account_snapshot(tmp
     }
 
 
+def test_multi_dashboard_caches_tickers_longer_than_portfolio_snapshots(tmp_path, monkeypatch):
+    state_path = tmp_path / "portfolio.json"
+    state_path.write_text(json.dumps({
+        "version": 2, "account_type": "multi_symbol_paper", "execution_mode": "demo_usdm",
+        "execution_status": "synchronized", "initial_equity": 1000.0, "cash": 1000.0,
+        "positions": {}, "exchange_snapshot": {
+            "at": "2026-09-29T12:00:00+00:00", "host": "https://demo-fapi.binance.com",
+            "equity": 1000.0, "positions": {},
+        }, "watchlist": [], "events": [],
+    }), encoding="utf-8")
+
+    class CountingExchange:
+        calls = 0
+
+        def fetch_tickers(self):
+            self.calls += 1
+            return {}
+
+    clock = [100.0]
+    monkeypatch.setattr("bot.live.dashboard.time.monotonic", lambda: clock[0])
+    exchange = CountingExchange()
+    service = DashboardService(state_path, None, exchange)
+
+    service.snapshot()
+    clock[0] += 4
+    service._cached_at = 0
+    service.snapshot()
+    assert exchange.calls == 1
+
+    clock[0] += 27
+    service._cached_at = 0
+    service.snapshot()
+    assert exchange.calls == 2
+
+
 def test_dashboard_service_records_one_equity_point_per_new_account_snapshot(tmp_path):
     state_path = tmp_path / "portfolio.json"
     state = {
@@ -498,7 +533,7 @@ def test_dashboard_mfe_includes_newer_ticker_price(side, entry, stop, stored_bes
     assert observation["mfe_r"] == observation["current_r"]
 
 
-def test_dashboard_preserves_mfe_peak_after_ticker_retraces(tmp_path):
+def test_dashboard_preserves_mfe_peak_after_ticker_retraces(tmp_path, monkeypatch):
     symbol = "AAA/USDT:USDT"
     state = {
         "version": 2, "account_type": "multi_symbol_paper", "initial_equity": 1000.0, "cash": 900.0,
@@ -520,11 +555,14 @@ def test_dashboard_preserves_mfe_peak_after_ticker_retraces(tmp_path):
             return {symbol: {"last": self.price}}
 
     exchange = ChangingExchange()
+    clock = [100.0]
+    monkeypatch.setattr("bot.live.dashboard.time.monotonic", lambda: clock[0])
     service = DashboardService(state_path, None, exchange, load_settings(env_file=None))
     first = service.snapshot()["positions"][0]["time_observation"]
     assert first["mfe_r"] == 0.3
 
     exchange.price = 102.0
+    clock[0] += 31
     service._cached_at = 0
     after_retrace = service.snapshot()["positions"][0]["time_observation"]
 
