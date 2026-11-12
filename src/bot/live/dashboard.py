@@ -117,7 +117,7 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
         elif event.get("action") == "CLOSE":
             trade = active.pop(symbol, {
                 "symbol": symbol, "side": event.get("side"), "quantity": event.get("quantity"),
-                "entry_price": None, "opened_at": None, "entry_fee": 0.0,
+                "entry_price": event.get("entry_price"), "opened_at": event.get("opened_at"), "entry_fee": 0.0,
             })
             trade.update({"closed_at": (event.get("closed_at", at.isoformat())
                                           if exchange_mode else at.isoformat()),
@@ -138,6 +138,8 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
                               "strategy_sample_eligible", trade.get("strategy_sample_eligible", True)),
                           "sample_exclusion_reason": event.get(
                               "sample_exclusion_reason", trade.get("sample_exclusion_reason"))})
+            if event.get("sample_exclusion_reason") == "manual_position_changed":
+                trade.update(quantity=event.get("quantity"), entry_price=event.get("entry_price"))
             if exchange_mode:
                 trade.update({
                     "exit_time_verified": event.get("exit_time_verified"),

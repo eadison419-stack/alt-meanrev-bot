@@ -403,15 +403,16 @@ class DemoExecutionService:
         except Exception:
             return None
 
-    def reconstruct_open_position(self, symbol: str, expected: dict[str, Any], *,
-                                  at: datetime | None = None) -> dict[str, Any]:
-        """Rebuild the current one-way position from bounded, verified USD-M fills."""
+    def _manual_position_trades(self, symbol, *, at, since=None):
+        """Read complete bounded fill windows; never accept a truncated history."""
         self._verify_urls()
         at = at or _utc_now()
         if at.tzinfo is None:
             raise ValueError("position reconstruction time must be timezone-aware")
         market_id = self.exchange.market(symbol)["id"]
         start_ms = int((at.timestamp() - 90 * 24 * 60 * 60) * 1000)
+        if since is not None:
+            start_ms = max(start_ms, int(since))
         end_ms = int(at.timestamp() * 1000)
         rows_by_id = {}
         window_start = start_ms
@@ -469,6 +470,38 @@ class DemoExecutionService:
         trades.sort(key=lambda item: (item[0], item[1]))
         if not trades:
             raise RuntimeError("manual position trade history is empty")
+        return trades
+
+    def reconcile_manual_position(self, position, expected, *, at, cursor=None, entry_fee=None):
+        from bot.live.manual_positions import replay_position_changes
+
+        trades = self._manual_position_trades(
+            position.symbol, at=at, since=cursor["time"] if cursor else None,
+        )
+        step, _, _ = self._market_rules(position.symbol)
+        plan = replay_position_changes(
+            position, trades, expected, cursor=cursor, entry_fee=entry_fee,
+            quantity_tolerance=max(step * 1e-6, position.quantity * 1e-8, 1e-12),
+        )
+        self._verify_manual_position_snapshot(position.symbol, expected)
+        return plan
+
+    def _verify_manual_position_snapshot(self, symbol, expected):
+        live = self._position(symbol)
+        step, _, _ = self._market_rules(symbol)
+        if live is None and expected is None:
+            return
+        if (live is None or expected is None or live["side"] != expected["side"]
+                or abs(float(live["quantity"]) - float(expected["quantity"]))
+                > max(step * 1e-6, float(expected["quantity"]) * 1e-8, 1e-12)
+                or not math.isclose(float(live["entry_price"]), float(expected["entry_price"]),
+                                    rel_tol=1e-6, abs_tol=1e-10)):
+            raise RuntimeError("manual_sync_position_changed_during_reconciliation")
+
+    def reconstruct_open_position(self, symbol: str, expected: dict[str, Any], *,
+                                  at: datetime | None = None) -> dict[str, Any]:
+        """Rebuild the current one-way position from bounded, verified USD-M fills."""
+        trades = self._manual_position_trades(symbol, at=at or _utc_now())
 
         signed_quantity = 0.0
         average_entry = 0.0
@@ -512,13 +545,14 @@ class DemoExecutionService:
         if (expected_side not in {"long", "short"} or expected_quantity <= 0
                 or expected_entry <= 0 or not math.isfinite(expected_quantity)
                 or not math.isfinite(expected_entry) or opened_at is None
-                or abs(abs(signed_quantity) - expected_quantity) > max(step, expected_quantity * 1e-8)
+                or abs(abs(signed_quantity) - expected_quantity) > max(step * 1e-6, expected_quantity * 1e-8, 1e-12)
                 or ("long" if signed_quantity > 0 else "short") != expected_side
                 or abs(average_entry - expected_entry) > max(expected_entry * 1e-6, 1e-10)):
             raise RuntimeError("replayed fills do not match the current exchange position")
         return {"side": expected_side, "quantity": expected_quantity,
                 "entry_price": average_entry, "opened_at": opened_at,
-                "entry_fee": entry_fee}
+                "entry_fee": entry_fee,
+                "cursor": {"time": trades[-1][0], "id": trades[-1][1]}}
 
     def _position(self, symbol: str) -> dict[str, Any] | None:
         self._verify_urls()
@@ -706,6 +740,81 @@ class DemoExecutionService:
                 remaining = self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
                 if any(str(row.get("algoId")) == str(old_stop["id"]) for row in remaining):
                     raise RuntimeError("existing protective stop cancellation was not confirmed")
+        return saved
+
+    def reconcile_manual_position_stop(self, position, previous_position, stop, *,
+                                       stop_price, market_price, new_cycle=False):
+        """Protect the verified new net position before retiring its previous stop.
+
+        Discover a previously placed replacement on retry, so a cancellation or
+        persistence failure cannot create an unbounded set of duplicate stops.
+        """
+        symbol = position.symbol
+        expected = {"side": position.side.value, "quantity": position.quantity,
+                    "entry_price": position.entry_price}
+        self._verify_manual_position_snapshot(symbol, expected)
+        candidate = float(self.exchange.price_to_precision(symbol, stop_price))
+        if (not math.isfinite(candidate) or candidate <= 0 or not math.isfinite(market_price)
+                or (position.side is Side.LONG and candidate >= market_price)
+                or (position.side is Side.SHORT and candidate <= market_price)):
+            raise RuntimeError("manual_sync_stop_invalid_or_crossed")
+        if not new_cycle and previous_position.side is position.side and stop:
+            previous_price = float(stop["stop_price"])
+            if ((position.side is Side.LONG and candidate < previous_price)
+                    or (position.side is Side.SHORT and candidate > previous_price)):
+                raise RuntimeError("manual_sync_stop_would_loosen")
+        market_id = self.exchange.market(symbol)["id"]
+
+        def active_rows():
+            return self.exchange.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []
+
+        rows = active_rows()
+        old_id = str((stop or {}).get("id") or "")
+        old_row = next((row for row in rows if str(row.get("algoId")) == old_id), None)
+        if old_row is not None and not self._saved_stop_matches(
+                symbol, previous_position, stop, old_row, previous_position.quantity):
+            raise RuntimeError("manual_sync_previous_stop_changed")
+        replacements = []
+        for row in rows:
+            saved = {"id": str(row.get("algoId")), "stop_price": candidate,
+                     "clientOrderId": row.get("clientAlgoId"), "amount": position.quantity,
+                     "order_side": "SELL" if position.side is Side.LONG else "BUY"}
+            if self._is_bot_reduce_stop(row) and self._saved_stop_matches(
+                    symbol, position, saved, row, position.quantity):
+                replacements.append(saved)
+        if any(
+                str(row.get("algoId")) != old_id and not self._is_bot_reduce_stop(row)
+                and str(row.get("algoStatus") or "").upper() == "NEW"
+                and str(row.get("orderType") or "").upper() == "STOP_MARKET"
+                for row in rows):
+            raise RuntimeError("manual_sync_ambiguous_protective_stops")
+        saved = replacements[0] if replacements else {
+            **self._place_stop(symbol, position.side.value, position.quantity, candidate),
+            "external": False, "order_side": "SELL" if position.side is Side.LONG else "BUY",
+        }
+        rows = active_rows()
+        new_row = next((row for row in rows if str(row.get("algoId")) == str(saved["id"])), None)
+        if new_row is None or not self._saved_stop_matches(
+                symbol, position, saved, new_row, position.quantity):
+            raise RuntimeError("manual_sync_replacement_stop_not_verified")
+        self._verify_manual_position_snapshot(symbol, expected)
+        if old_row is not None and old_id != str(saved["id"]):
+            self.cancel_saved_stop_if_open(symbol, stop)
+        # A further manual fill may have arrived after a previous replacement
+        # was installed. Retire those bot-owned intermediate quantities only
+        # after the newest quantity is verified and the snapshot is still stable.
+        for row in active_rows():
+            if (str(row.get("algoId")) != str(saved["id"])
+                    and str(row.get("algoStatus") or "").upper() == "NEW"
+                    and self._is_bot_reduce_stop(row)):
+                self._verify_manual_position_snapshot(symbol, expected)
+                self.exchange.fapiPrivateDeleteAlgoOrder({"algoId": str(row["algoId"])})
+        rows = active_rows()
+        if any(str(row.get("algoId")) != str(saved["id"])
+               and str(row.get("algoStatus") or "").upper() == "NEW"
+               and str(row.get("orderType") or "").upper() == "STOP_MARKET" for row in rows):
+            raise RuntimeError("manual_sync_previous_stop_cleanup_pending")
+        self._verify_manual_position_snapshot(symbol, expected)
         return saved
 
     @staticmethod
@@ -1591,6 +1700,11 @@ class DemoExecutionService:
             return {"already_flat": True, "position": None, "host": self.host}
         if live_position["side"] != position.side.value:
             raise RuntimeError("exchange side differs from local position; account is inconsistent")
+        if attempt is None and (
+                not math.isclose(float(live_position["quantity"]), position.quantity, rel_tol=1e-8)
+                or (live_position.get("entry_price") is not None and not math.isclose(
+                    float(live_position["entry_price"]), position.entry_price, rel_tol=1e-6))):
+            raise RuntimeError("manual_sync_required_before_strategy_close")
         if attempt is None:
             attempt = {"clientOrderId": f"{BOT_ORDER_PREFIX}_{uuid4().hex[:28]}",
                        "quantity": live_position["quantity"], "side": position.side.value,

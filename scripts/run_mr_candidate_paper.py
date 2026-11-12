@@ -1408,6 +1408,10 @@ def _demo_close_values(execution, state, position, fill, closed_at):
     funding = _finite_pnl_value(funding)
     fees = (_finite_pnl_value(entry_fee + exit_fee)
             if entry_fee is not None and exit_fee is not None else None)
+    previous = (getattr(state, "exit_management_by_symbol", {}).get(position.symbol) or {}).get("manual_realized", {})
+    if previous:
+        gross = gross + previous["gross_pnl"] if gross is not None else None
+        fees = fees + previous["fees"] if fees is not None else None
     net = (_finite_pnl_value(gross - fees + funding)
            if gross is not None and fees is not None and funding is not None else None)
     return gross, fees, funding, net
@@ -1534,6 +1538,8 @@ def _reconcile_demo_funding(execution, state, now, *, position_monitor=None):
         opened = active.pop(symbol, {})
         start = _aware_datetime(event.get("opened_at") or opened.get("at"))
         end = _aware_datetime(event.get("closed_at") or event.get("at"))
+        if end is not None and event.get("funding_end_exclusive"):
+            end -= timedelta(milliseconds=1)
         gross, fees = _finite_pnl_value(event.get("gross_pnl")), _finite_pnl_value(event.get("fees"))
         if start is None or end is None or end < start or gross is None or fees is None:
             continue
@@ -1600,11 +1606,26 @@ def _reconcile_demo_funding(execution, state, now, *, position_monitor=None):
     return True
 
 
+def _manual_close_event_totals(event, position, meta):
+    if not meta.get("manual_position_changed") and position.reason != "manual_position_adopted":
+        return
+    previous = meta.get("manual_realized", {})
+    quantity = float(event["quantity"]) + previous.get("quantity", 0.0)
+    price, gross = _finite_pnl_value(event.get("price")), _finite_pnl_value(event.get("gross_pnl"))
+    notional = float(event["quantity"]) * price + previous.get("notional", 0.0) if price is not None else None
+    event.update(strategy_sample_eligible=False, sample_exclusion_reason="manual_position_changed",
+                 final_fill_quantity=event["quantity"], quantity=quantity,
+                 price=notional / quantity if notional is not None else None,
+                 entry_price=((notional - (1 if position.side is Side.LONG else -1) * gross) / quantity)
+                 if notional is not None and gross is not None else None)
+
+
 def _close_position(is_demo, execution, state, symbol, price, reason, at, fee_rate, slip_rate):
     position = state.portfolio.positions.get(symbol)
     if position is None:
         return None
     if is_demo:
+        manual_meta = dict(state.exit_management_by_symbol.get(symbol) or {})
         stop = state.exchange_orders_by_symbol.get(symbol, {}).get("stop")
         try:
             result = execution.close(position, stop=stop, reason=reason)
@@ -1639,6 +1660,7 @@ def _close_position(is_demo, execution, state, symbol, price, reason, at, fee_ra
                        **observations}
         if fees is not None:
             close_event["fees"] = fees
+        _manual_close_event_totals(close_event, position, manual_meta)
         state.events.append(close_event)
         state.portfolio.last_exit_at[symbol] = closed_at
         state.portfolio.last_exit_source[symbol] = MEAN_REVERSION
@@ -1696,6 +1718,11 @@ def _demo_sync_stopped(execution, state, at):
             state.inconsistencies = ["account equity snapshot is stale or invalid"]
             return False
     state.exchange_snapshot = snapshot
+    if (state.execution_mode == "lead_usdm" and getattr(execution, "adopt_manual_positions", False)
+            and callable(getattr(execution, "reconcile_manual_position", None))):
+        if not _sync_lead_position_changes(execution, state, snapshot,
+                                           _aware_datetime(snapshot.get("at")) or at):
+            return False
     live = set(snapshot["positions"])
     for symbol in list(state.portfolio.positions):
         if symbol not in live:
@@ -1753,6 +1780,7 @@ def _demo_sync_stopped(execution, state, at):
                 state, position, closed_at=verified_closed_at,
                 reconciled_at=at if verified_closed_at is None else None,
             )
+            manual_meta = dict(state.exit_management_by_symbol.get(symbol) or {})
             state.portfolio.positions.pop(symbol, None)
             state.exchange_orders_by_symbol.pop(symbol, None)
             state.exit_management_by_symbol.pop(symbol, None)
@@ -1783,6 +1811,7 @@ def _demo_sync_stopped(execution, state, at):
                            **observations}
             if fees is not None:
                 close_event["fees"] = fees
+            _manual_close_event_totals(close_event, position, manual_meta)
             if external_fill:
                 close_event["external_order_ids"] = list(external_fill.get("order_ids") or [])
             elif strategy_fill is None:
@@ -1814,14 +1843,15 @@ def _demo_sync_stopped(execution, state, at):
                     "at": at.isoformat(), "status": "error",
                     "position_count": len(state.portfolio.positions),
                     "mismatch_count": 1, "mismatches": [reason],
+                    "scope": "manual_position_change", "blocked_symbols": [symbol],
                 }
                 state.events.append({
                     "event": "manual_position_adoption_blocked", "at": at.isoformat(),
-                    "symbol": symbol, "reason": type(exc).__name__,
+                    "symbol": symbol, "reason": _manual_sync_error(exc),
                     "execution_source": _execution_source(state),
                 })
                 logger.error("Lead manual position adoption blocked for {}: {}",
-                             symbol, type(exc).__name__)
+                             symbol, _manual_sync_error(exc))
                 return False
         local = set(state.portfolio.positions)
     if (live - local) - pending_symbols or local - live:
@@ -1952,18 +1982,15 @@ def _adoption_closed_frame(exchange, symbol, opened_at, timeframe, timeframe_ms,
     return frame
 
 
-def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at):
-    if not getattr(execution, "adopt_manual_positions", False):
-        raise RuntimeError("manual adoption is disabled")
-    if state.execution_mode != "lead_usdm" or symbol in state.portfolio.positions:
-        raise RuntimeError("manual adoption is restricted to untracked Lead positions")
+def _prepare_lead_manual_position(execution, symbol, exchange_position, at, *,
+                                  recovered=None, previous_position=None, previous_stop=None):
     settings = execution.settings
     if not execution.exchange.markets:
         execution.exchange.load_markets()
     market_id = str(execution.exchange.market(symbol).get("id") or "").upper()
     if not market_id or market_id not in getattr(execution, "lead_market_ids", set()):
         raise RuntimeError("manual position is outside the verified Lead contract whitelist")
-    recovered = execution.reconstruct_open_position(symbol, exchange_position, at=at)
+    recovered = recovered or execution.reconstruct_open_position(symbol, exchange_position, at=at)
     side = Side(recovered["side"])
     opened_at = recovered["opened_at"]
     atr_required = settings.lookback.atr_len + 1
@@ -2014,13 +2041,25 @@ def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at)
         symbol, side, float(recovered["quantity"]), float(recovered["entry_price"]),
         float(strategy_stop), opened_at, "manual_position_adopted", regime_value, MEAN_REVERSION,
     )
-    stop = execution.adopt_manual_position_stop(
-        candidate_position, strategy_stop=strategy_stop, market_price=market_price,
-    )
+    if previous_position is None:
+        stop = execution.adopt_manual_position_stop(
+            candidate_position, strategy_stop=strategy_stop, market_price=market_price,
+        )
+    else:
+        stop = execution.reconcile_manual_position_stop(
+            candidate_position, previous_position, previous_stop,
+            stop_price=strategy_stop, market_price=market_price, new_cycle=True,
+        )
     position = Position(
         symbol, side, float(recovered["quantity"]), float(recovered["entry_price"]),
         float(stop["stop_price"]), opened_at, "manual_position_adopted", regime_value, MEAN_REVERSION,
     )
+    return (position, stop, recovered, entry_atr, swing_low, swing_high, market_price, observed_at)
+
+
+def _install_lead_manual_position(execution, state, symbol, at, prepared):
+    position, stop, recovered, entry_atr, swing_low, swing_high, market_price, observed_at = prepared
+    opened_at, regime_value, side = position.opened_at, position.regime, position.side
     state.portfolio.positions[symbol] = position
     state.exchange_orders_by_symbol[symbol] = {"stop": stop}
     state.entry_costs[symbol] = {"entry_fee": float(recovered["entry_fee"])}
@@ -2030,11 +2069,14 @@ def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at)
         entry_atr, swing_low, swing_high, observed_price=market_price,
         observed_at=observed_at, telemetry_history_complete=False,
     )
+    if recovered.get("cursor"):
+        state.exit_management_by_symbol[symbol]["manual_sync"] = dict(recovered["cursor"])
     _invalidate_demo_stop_audit(state)
     state.events.append({
         "event": "manual_position_adopted", "at": at.isoformat(), "symbol": symbol,
         "side": side.value, "quantity": position.quantity,
         "entry_price": position.entry_price, "opened_at": opened_at.isoformat(),
+        "price": position.entry_price,
         "reason": position.reason, "regime": position.regime,
         "fee": float(recovered["entry_fee"]),
         "stop_price": position.stop_price, "entry_history_complete": True,
@@ -2045,6 +2087,169 @@ def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at)
     logger.warning("Lead adopted manual position {} {} quantity={} entry={} stop={}",
                    symbol, side.value, position.quantity, position.entry_price,
                    position.stop_price)
+
+
+def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at):
+    if not getattr(execution, "adopt_manual_positions", False):
+        raise RuntimeError("manual adoption is disabled")
+    if state.execution_mode != "lead_usdm" or symbol in state.portfolio.positions:
+        raise RuntimeError("manual adoption is restricted to untracked Lead positions")
+    _install_lead_manual_position(
+        execution, state, symbol, at,
+        _prepare_lead_manual_position(execution, symbol, exchange_position, at),
+    )
+
+
+def _manual_sync_error(exc):
+    message = str(exc)
+    safe = ("manual_sync_", "manual position trade history", "stop_too_",
+            "strategy stop is invalid", "structure level is on the wrong side",
+            "insufficient completed", "entry-time ")
+    return message if message.startswith(safe) else type(exc).__name__
+
+
+def _sync_lead_position_changes(execution, state, snapshot, at):
+    """Commit verified manual changes only after the resulting position is protected."""
+    blocked = []
+    pending = {row["symbol"] for row in mr_scan.unresolved_attempts(state)}
+    for symbol, position in list(state.portfolio.positions.items()):
+        orders = state.exchange_orders_by_symbol.get(symbol, {})
+        if symbol in pending or orders.get("close_attempt"):
+            continue  # Existing durable bot order reconciliation owns these fills.
+        meta = state.exit_management_by_symbol.setdefault(symbol, {})
+        expected = snapshot["positions"].get(symbol)
+        cursor = meta.get("manual_sync")
+        stage = "fills"
+        try:
+            plan = execution.reconcile_manual_position(
+                position, expected, at=at, cursor=cursor,
+                entry_fee=(state.entry_costs.get(symbol) or {}).get("entry_fee"),
+            )
+            prepared = None
+            remaining = plan["remaining"]
+            if plan["changes"]:
+                stage = "protection"
+                if remaining is None:
+                    execution._verify_manual_position_snapshot(symbol, None)
+                    execution.cancel_saved_stop_if_open(symbol, orders.get("stop"))
+                    execution._verify_manual_position_snapshot(symbol, None)
+                elif plan["closed_cycles"]:
+                    recovered = {**remaining, "cursor": plan["cursor"]}
+                    prepared = _prepare_lead_manual_position(
+                        execution, symbol, expected, at, recovered=recovered,
+                        previous_position=position, previous_stop=orders.get("stop"),
+                    )
+                else:
+                    ticker = execution.exchange.fetch_ticker(symbol)
+                    checked_ms = int(_utc_now().timestamp() * 1000)
+                    price = _ticker_price({symbol: ticker}, symbol, checked_ms,
+                                          max_age_ms=DEMO_POSITION_QUOTE_MAX_AGE_MS)
+                    if price is None:
+                        raise RuntimeError("manual_sync_fresh_price_unavailable")
+                    tracked_price = float((orders.get("stop") or {}).get("stop_price", position.stop_price))
+                    recorded_price = float(meta.get("protective_stop", tracked_price))
+                    current_stop = (max(tracked_price, recorded_price) if position.side is Side.LONG
+                                    else min(tracked_price, recorded_price))
+                    # Position.stop_price is an initial risk reference; the active
+                    # trailing stop may already be on the profitable side of cost.
+                    risk = float(meta.get("initial_risk") or abs(position.entry_price - position.stop_price))
+                    reference = remaining["entry_price"] + (risk if position.side is Side.SHORT else -risk)
+                    updated = replace(position, quantity=remaining["quantity"],
+                                      entry_price=remaining["entry_price"], stop_price=reference)
+                    saved_stop = execution.reconcile_manual_position_stop(
+                        updated, position, orders.get("stop"), stop_price=current_stop, market_price=price,
+                    )
+                    prepared = (updated, saved_stop, price)
+            # No mutation above this line: failures retain the previous ledger and
+            # cursor, making a retry replay exactly the same confirmed changes.
+            previous_realized = dict(meta.get("manual_realized", {}))
+            for index, cycle in enumerate(plan["closed_cycles"]):
+                totals = dict(cycle)
+                reason = "external_close_exchange_trades_verified"
+                resolver = getattr(execution, "resolve_protective_stop_algo_fill", None)
+                if index == 0 and callable(resolver):
+                    try:
+                        stop_fill = resolver(symbol, orders.get("stop"), cycle["quantity"])
+                        if stop_fill and _verified_fill_timestamp(stop_fill) == _aware_datetime(cycle["closed_at"]):
+                            reason = "protective_stop_exchange_algo"
+                    except Exception:
+                        pass  # Fills are verified; an unavailable stop lookup cannot invent ownership.
+                if index == 0:
+                    for key in ("gross_pnl", "fees", "quantity", "notional"):
+                        totals[key] += previous_realized.get(key, 0.0)
+                funding_start = _aware_datetime(cycle["opened_at"])
+                funding_end = _aware_datetime(cycle["closed_at"]) - timedelta(milliseconds=1)
+                funding = (0.0 if funding_end < funding_start else _finite_pnl_value(
+                    execution.funding_fee(symbol, funding_start, funding_end)))
+                net = totals["gross_pnl"] - totals["fees"] + funding if funding is not None else None
+                state.events.append({
+                    "event": "paper_fill", "action": "CLOSE", "symbol": symbol,
+                    "side": cycle["side"], "at": cycle["closed_at"], "closed_at": cycle["closed_at"],
+                    "opened_at": cycle["opened_at"], "exit_time_verified": True,
+                    "reason": reason, "quantity": totals["quantity"],
+                    "price": totals["notional"] / totals["quantity"], "gross_pnl": totals["gross_pnl"],
+                    "entry_price": ((totals["notional"] - (1 if cycle["side"] == "long" else -1)
+                                     * totals["gross_pnl"]) / totals["quantity"]),
+                    "fees": totals["fees"], "funding_paid": funding, "net_pnl": net,
+                    "funding_end_exclusive": True,
+                    "pnl_recorded": net is not None, "source": MEAN_REVERSION,
+                    "execution_source": _execution_source(state), "strategy_sample_eligible": False,
+                    "sample_exclusion_reason": "manual_position_changed",
+                })
+                state.portfolio.last_exit_at[symbol] = _aware_datetime(cycle["closed_at"])
+                state.portfolio.last_exit_category[symbol] = _mr_exit_category(reason, net)
+                state.portfolio.last_exit_source[symbol] = MEAN_REVERSION
+                state.exit_management_by_symbol.setdefault("__manual_entry_blocks__", {})[symbol] = cycle["closed_at"]
+            for change in plan["changes"]:
+                state.events.append({"event": "manual_position_changed", "symbol": symbol,
+                                     **change, "execution_source": _execution_source(state),
+                                     "strategy_sample_eligible": False})
+            if remaining is None:
+                state.portfolio.positions.pop(symbol, None)
+                state.exchange_orders_by_symbol.pop(symbol, None)
+                state.exit_management_by_symbol.pop(symbol, None)
+                state.entry_costs.pop(symbol, None)
+            elif plan["closed_cycles"]:
+                _install_lead_manual_position(execution, state, symbol, at, prepared)
+                meta = state.exit_management_by_symbol[symbol]
+            elif plan["changes"]:
+                updated, saved_stop, price = prepared
+                state.portfolio.positions[symbol] = updated
+                state.exchange_orders_by_symbol[symbol] = {"stop": saved_stop}
+                state.entry_costs[symbol] = {"entry_fee": remaining["entry_fee"]}
+                meta.update(protective_stop=float(saved_stop["stop_price"]),
+                            best_price=max(updated.entry_price, price) if updated.side is Side.LONG else min(updated.entry_price, price),
+                            worst_price=min(updated.entry_price, price) if updated.side is Side.LONG else max(updated.entry_price, price),
+                            telemetry_history_complete=False, manual_position_changed=True)
+            if remaining is not None:
+                realized = dict(plan["realized"])
+                if not plan["closed_cycles"]:
+                    for key in realized:
+                        realized[key] += previous_realized.get(key, 0.0)
+                meta["manual_realized"] = realized
+                meta["manual_sync"] = dict(plan["cursor"])
+                meta.pop("manual_sync_error", None)
+                state.entry_costs[symbol] = {"entry_fee": remaining["entry_fee"]}
+            if plan["changes"]:
+                _invalidate_demo_stop_audit(state)
+        except Exception as exc:
+            reason = _manual_sync_error(exc)
+            if meta.get("manual_sync_error") != (stage, reason):
+                state.events.append({"event": "manual_position_change_blocked", "at": at.isoformat(),
+                                     "symbol": symbol, "stage": stage, "reason": reason,
+                                     "execution_source": _execution_source(state)})
+            meta["manual_sync_error"] = (stage, reason)
+            blocked.append(symbol)
+    if blocked:
+        state.execution_status = "inconsistent"
+        state.inconsistencies = [f"manual position change unresolved: {symbol}" for symbol in blocked]
+        state.protective_stop_audit = {"at": at.isoformat(), "status": "error",
+                                       "scope": "manual_position_change", "blocked_symbols": blocked,
+                                       "mismatch_count": len(blocked), "mismatches": state.inconsistencies}
+        return False
+    if state.protective_stop_audit.get("scope") == "manual_position_change":
+        _invalidate_demo_stop_audit(state)
+    return True
 
 
 def _invalidate_demo_stop_audit(state):
@@ -2138,17 +2343,41 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
     snapshot_fresh = _demo_snapshot_is_fresh(state, now)
     if (not snapshot_fresh or (state.execution_status != "synchronized" and not recent_audit_error)):
         if not _demo_sync_stopped(execution, state, now):
-            logger.error("{} position monitor paused: exchange state is not synchronized",
-                         _execution_label(execution, state))
-            return True
+            if state.protective_stop_audit.get("scope") != "manual_position_change":
+                logger.error("{} position monitor paused: exchange state is not synchronized",
+                             _execution_label(execution, state))
+                return True
 
-    if state.execution_status != "synchronized":
-        if recent_audit_error or not _audit_demo_protective_stops(execution, state, now):
+    blocked_symbols = set(state.protective_stop_audit.get("blocked_symbols", []))
+    isolated = state.protective_stop_audit.get("scope") == "manual_position_change"
+    if isolated:
+        if not _demo_snapshot_is_fresh(state, now):
             return True
-    if _demo_stop_audit_due(state, now) and not _audit_demo_protective_stops(execution, state, now):
-        return True
-    if state.execution_status != "synchronized":
-        return True
+        ready = {symbol: position for symbol, position in state.portfolio.positions.items()
+                 if symbol not in blocked_symbols}
+        for symbol, position in ready.items():
+            observed = state.exchange_snapshot.get("positions", {}).get(symbol)
+            if (observed is None or observed.get("side") != position.side.value
+                    or not math.isclose(float(observed["quantity"]), position.quantity, rel_tol=1e-8)
+                    or not math.isclose(float(observed["entry_price"]), position.entry_price, rel_tol=1e-6)):
+                return True
+        audit = state.protective_stop_audit
+        verified_at = _aware_datetime(audit.get("unaffected_verified_at"))
+        if verified_at is None or (now - verified_at).total_seconds() >= 60:
+            try:
+                if execution.audit_active_protective_stops(ready, state.exchange_orders_by_symbol):
+                    return True
+            except Exception:
+                return True
+            audit["unaffected_verified_at"] = now.isoformat()
+    else:
+        if state.execution_status != "synchronized":
+            if recent_audit_error or not _audit_demo_protective_stops(execution, state, now):
+                return True
+        if _demo_stop_audit_due(state, now) and not _audit_demo_protective_stops(execution, state, now):
+            return True
+        if state.execution_status != "synchronized":
+            return True
 
     dirty = False
     if not state.portfolio.positions:
@@ -2158,6 +2387,8 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
 
     stops = settings.stops
     for symbol, position in list(state.portfolio.positions.items()):
+        if symbol in blocked_symbols:
+            continue
         try:
             ticker = exchange.fetch_ticker(symbol)
             quote_error = None
@@ -3949,6 +4180,13 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
     )
     if bar_rejection is not None:
         _record_entry_bar_rejection(state, symbol, frame1, bar_rejection, evaluated_at)
+        return None
+    manual_closed = _aware_datetime(
+        state.exit_management_by_symbol.get("__manual_entry_blocks__", {}).get(symbol))
+    if manual_closed is not None and bar_close_time <= manual_closed:
+        _record_entry_bar_rejection(state, symbol, frame1, "manual_close_consumed_signal", evaluated_at)
+        if scan_row is not None:
+            scan_row["reason"] = "manual_close_consumed_signal"
         return None
     try:
         validate_ohlcv(frame1)
