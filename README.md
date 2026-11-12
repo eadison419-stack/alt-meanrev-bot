@@ -73,7 +73,7 @@ Demo／Lead 主动策略平仓先保留保护单，发送 `reduceOnly` 市价委
 | [8766 Demo](http://127.0.0.1:8766/) | USDⓈ-M Demo | `data/paper/demo_portfolio.json` |
 | [8769 实盘](http://127.0.0.1:8769/) | Lead 实盘 | `data/live/lead_portfolio.json` |
 
-在项目根目录运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboards.ps1`，会在隐藏后台补启动缺失的 Dashboard，已运行的正确实例保持运行。加 `-CheckOnly` 只检查。启动器固定核对账本模式、端口占用和返回的账户模式，不读取交易凭据或启动交易 Runner。当前电脑已配置 Windows 当前用户登录启动；本机配置、日志及停用方式见 [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md#dashboard-登录后自动启动)。
+登录启动与 `start_dashboards.ps1` 仅管理 8769 Lead Dashboard；8766 Demo Dashboard 不自动启动，若有临时查看需要可按 [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md) 中的手动命令启动。运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start_dashboards.ps1` 会在隐藏后台补启动缺失的 Lead Dashboard，已运行的正确实例保持运行。加 `-CheckOnly` 只检查。启动器核对账本模式、端口占用和返回的账户模式，不读取交易凭据或启动交易 Runner。本机配置、日志及停用方式见 [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md#dashboard-登录后自动启动)。
 
 ## Lead 实盘资金与风险参数
 

@@ -10,11 +10,6 @@ $DashboardScript = Join-Path $ProjectRoot 'scripts\run_dashboard.py'
 $LogDirectory = Join-Path $ProjectRoot 'logs'
 $Dashboards = @(
     [pscustomobject]@{
-        Name = 'Demo'; Port = 8766; Mode = 'demo_usdm'
-        HostUrl = 'https://demo-fapi.binance.com'
-        State = Join-Path $ProjectRoot 'data\paper\demo_portfolio.json'
-    }
-    [pscustomobject]@{
         Name = 'Lead'; Port = 8769; Mode = 'lead_usdm'
         HostUrl = 'https://fapi.binance.com'
         State = Join-Path $ProjectRoot 'data\live\lead_portfolio.json'

@@ -124,8 +124,8 @@ Lead 实盘状态独立保存在 `data/live/lead_portfolio.json`，日志为 `lo
 
 本机当前 Windows 用户的启动文件夹已安装 `AltMeanrevDashboards.lnk`，登录后通过 Windows PowerShell 隐藏运行 `scripts/start_dashboards.ps1`：
 
-- 8766 固定读取 Demo 账本 `data/paper/demo_portfolio.json`。
 - 8769 固定读取 Lead 实盘账本 `data/live/lead_portfolio.json`。
+- 8766 Demo Dashboard 不再由登录启动器启动；如需临时查看，使用上文中的手动命令。
 - 已有正确实例时直接检查，不重复启动；端口由其他程序或错误账本占用时拒绝接管并记录错误。
 - 启动器退出后 Dashboard 独立运行，可关闭启动它的 PowerShell；它不会读取交易凭据或启动 Runner。
 
