@@ -1629,6 +1629,25 @@ def test_blocked_manual_adoption_does_not_skip_other_symbols(monkeypatch):
     assert state.inconsistencies == [f"manual position adoption blocked for {blocked_symbol}: stop_too_wide"]
 
 
+def test_startup_allows_only_isolated_lead_manual_position_errors():
+    state = MultiPaperState()
+    state.execution_mode = "lead_usdm"
+    state.execution_status = "inconsistent"
+    state.protective_stop_audit = {
+        "scope": "manual_position_change", "blocked_symbols": ["PIEVERSE/USDT:USDT"],
+    }
+
+    assert runner._lead_manual_position_isolation_active(state)
+
+    state.protective_stop_audit["scope"] = "position_sync"
+    assert not runner._lead_manual_position_isolation_active(state)
+    state.protective_stop_audit.update(scope="manual_position_change", blocked_symbols=[])
+    assert not runner._lead_manual_position_isolation_active(state)
+    state.execution_mode = "demo_usdm"
+    state.protective_stop_audit["blocked_symbols"] = ["PIEVERSE/USDT:USDT"]
+    assert not runner._lead_manual_position_isolation_active(state)
+
+
 def test_adopt_manual_positions_flag_requires_live_mode(monkeypatch):
     monkeypatch.setattr(runner.sys, "argv", ["run_mr_candidate_paper.py", "--adopt-manual-positions"])
     with pytest.raises(SystemExit) as error:

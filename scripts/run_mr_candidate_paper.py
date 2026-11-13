@@ -1708,6 +1708,16 @@ def _observe_account_equity(state, snapshot, settings, at):
         })
 
 
+def _lead_manual_position_isolation_active(state):
+    audit = state.protective_stop_audit or {}
+    return (
+        state.execution_mode == "lead_usdm"
+        and state.execution_status == "inconsistent"
+        and audit.get("scope") == "manual_position_change"
+        and bool(audit.get("blocked_symbols"))
+    )
+
+
 def _demo_sync_stopped(execution, state, at):
     snapshot = execution.sync_snapshot()
     if isinstance(execution, DemoExecutionService):
@@ -4898,8 +4908,9 @@ def main() -> int:
             except mr_scan.ScanCheckpointError:
                 entries_reconciled = False
             if entries_reconciled and not _demo_sync_stopped(execution, state, _utc_now()):
-                checkpoint.try_save()
-                raise RuntimeError(f"{mode.name} positions do not match the local ledger; refusing to start")
+                if not _lead_manual_position_isolation_active(state):
+                    checkpoint.try_save()
+                    raise RuntimeError(f"{mode.name} positions do not match the local ledger; refusing to start")
             if not state_path_existed:
                 state.initial_equity = float(state.exchange_snapshot["equity"])
                 state.cash = state.initial_equity
