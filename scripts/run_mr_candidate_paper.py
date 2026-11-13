@@ -1820,6 +1820,7 @@ def _demo_sync_stopped(execution, state, at):
     local = set(state.portfolio.positions)
     pending_symbols = {row["symbol"] for row in mr_scan.unresolved_attempts(state)}
     unknown = (live - local) - pending_symbols
+    blocked_adoptions = []
     if unknown and getattr(execution, "adopt_manual_positions", False):
         if state.execution_mode != "lead_usdm" or pending_symbols:
             reason = "manual position adoption requires a synchronized Lead account without pending entries"
@@ -1852,8 +1853,23 @@ def _demo_sync_stopped(execution, state, at):
                 })
                 logger.error("Lead manual position adoption blocked for {}: {}",
                              symbol, _manual_sync_error(exc))
-                return False
+                blocked_adoptions.append({"symbol": symbol, "reason": _manual_sync_error(exc)})
         local = set(state.portfolio.positions)
+    if blocked_adoptions:
+        blocked_symbols = [row["symbol"] for row in blocked_adoptions]
+        mismatches = [
+            f"manual position adoption blocked for {row['symbol']}: {row['reason']}"
+            for row in blocked_adoptions
+        ]
+        state.execution_status = "inconsistent"
+        state.inconsistencies = mismatches
+        state.protective_stop_audit = {
+            "at": at.isoformat(), "status": "error",
+            "position_count": len(state.portfolio.positions),
+            "mismatch_count": len(mismatches), "mismatches": mismatches,
+            "scope": "manual_position_change", "blocked_symbols": blocked_symbols,
+        }
+        return False
     if (live - local) - pending_symbols or local - live:
         state.execution_status = "inconsistent"
         mismatch = "exchange and local position symbols differ"

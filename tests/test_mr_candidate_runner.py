@@ -1583,6 +1583,52 @@ def test_manual_position_adoption_is_explicit_and_lead_only(monkeypatch):
     assert adopted == [symbol]
 
 
+def test_blocked_manual_adoption_does_not_skip_other_symbols(monkeypatch):
+    now = datetime(2026, 11, 13, 11, tzinfo=timezone.utc)
+    blocked_symbol = "PIEVERSE/USDT:USDT"
+    ready_symbol = "SNDK/USDT:USDT"
+    live_positions = {
+        blocked_symbol: {"side": "long", "quantity": 2_000.0, "entry_price": 1.6956875},
+        ready_symbol: {"side": "short", "quantity": 1.0, "entry_price": 932.48},
+    }
+    attempted = []
+
+    class Execution:
+        adopt_manual_positions = True
+
+        @staticmethod
+        def sync_snapshot():
+            return {"at": now.isoformat(), "positions": live_positions}
+
+        @staticmethod
+        def reconcile_manual_position(*args, **kwargs):
+            return None
+
+    def install(_execution, state, symbol, _exchange_position, at):
+        attempted.append(symbol)
+        if symbol == blocked_symbol:
+            raise ValueError("stop_too_wide")
+        position = Position(symbol, Side.SHORT, 1.0, 932.48, 967.98,
+                            at - timedelta(hours=3), "manual_position_adopted", Regime.MID.value)
+        state.portfolio.positions[symbol] = position
+        state.exchange_orders_by_symbol[symbol] = {
+            "stop": {"id": "verified-stop", "stop_price": 967.98},
+        }
+
+    monkeypatch.setattr(runner, "_adopt_lead_manual_position", install)
+    state = MultiPaperState(initial_equity=1_000, cash=1_000)
+    state.execution_mode = "lead_usdm"
+
+    assert not runner._demo_sync_stopped(Execution(), state, now)
+
+    assert attempted == [blocked_symbol, ready_symbol]
+    assert set(state.portfolio.positions) == {ready_symbol}
+    assert state.execution_status == "inconsistent"
+    assert state.protective_stop_audit["scope"] == "manual_position_change"
+    assert state.protective_stop_audit["blocked_symbols"] == [blocked_symbol]
+    assert state.inconsistencies == [f"manual position adoption blocked for {blocked_symbol}: stop_too_wide"]
+
+
 def test_adopt_manual_positions_flag_requires_live_mode(monkeypatch):
     monkeypatch.setattr(runner.sys, "argv", ["run_mr_candidate_paper.py", "--adopt-manual-positions"])
     with pytest.raises(SystemExit) as error:
