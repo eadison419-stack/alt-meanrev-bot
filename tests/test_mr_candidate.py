@@ -72,6 +72,8 @@ def test_live_deviation_requires_reversal_from_current_hour_open(settings):
     )
     assert long_without_reversal.action is Action.NONE
     assert short_without_reversal.action is Action.NONE
+    assert long_without_reversal.reason == "hourly_candle_direction_mismatch"
+    assert short_without_reversal.reason == "hourly_candle_direction_mismatch"
 
 
 def test_hourly_entry_claim_is_once_per_symbol_and_bar():
@@ -107,6 +109,7 @@ def test_deviation_entry_none_within_threshold(settings):
     s = deviation_entry_signal(_ema50_series(100.2), _candle(100.1, 100.3), settings,
                                _flags(), deviation_pct=0.01)
     assert s.action is Action.NONE
+    assert s.reason == "deviation_not_met"
 
 
 def test_deviation_entry_blocks_when_flatten_only(settings):

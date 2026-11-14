@@ -505,12 +505,28 @@ def _candidate_observation(state, row, now, settings):
             or (outcome.get("side") and outcome["side"] != row.get("side"))):
         outcome = {}
     reason_labels = {
-        "no_eligible_signal": "本小时未形成完整入场信号",
-        "ema9_reclaim_unconfirmed": "EMA9 未发生同方向收复／跌破",
+        "no_eligible_signal": "未记录具体拦截原因",
+        "deviation_not_met": "偏离未达到基础入场门槛",
+        "hourly_candle_direction_mismatch": "1H K 线收盘方向与候选方向不符",
+        "ema9_reclaim_unconfirmed": "1H 收盘未发生同方向的 EMA9 穿越",
+        "entry_history_insufficient": "入场所需的 1H 或 4H 行情不足",
+        "ema_unavailable": "已收盘 4H EMA50 不可用",
+        "invalid_ohlcv": "K 线行情无效",
+        "invalid_live_price": "入场价格数据无效",
         "original_signal_deadline": "已超过原 1H 信号有效期",
         "hourly_bar_stale": "1H 信号已过期",
+        "hourly_bar_not_closed": "1H K 线尚未收盘",
+        "hourly_bar_or_clock_unavailable": "1H K 线时间或时钟不可用",
+        "hourly_bar_timestamp_naive": "1H K 线时间缺少时区",
+        "hourly_bar_timestamp_unaligned": "1H K 线时间未对齐整点",
+        "position_already_open": "该合约已有持仓",
+        "manual_close_consumed_signal": "本小时信号已被手动平仓消耗",
         "position_limit": "持仓数量已达上限", "max_positions_reached": "持仓数量已达上限",
         "market_risk_pause": "BTC 风险暂停新开仓",
+        "daily_drawdown_halt": "日内熔断暂停开仓",
+        "portfolio_stop_risk_limit": "组合止损风险额度已用尽",
+        "funding_rate_missing": "资金费率不可用",
+        "funding_rate_blocked": "不利方向的资金费率超限",
         "account_not_synchronized": "账户尚未同步",
         "candidate_structure_unverified": "候选结构待核验",
         "stop_too_wide": "结构止损距离过宽", "stop_too_tight": "结构止损距离过窄",
@@ -518,8 +534,26 @@ def _candidate_observation(state, row, now, settings):
         "entry_deviation_unavailable": "偏离指标不可用",
         "structure_reentry_confirmation_required": "等待结构重新确认",
         "time_filter_data_unavailable": "时段过滤数据不完整",
+        "hourly_history_insufficient": "时段过滤所需的 1H 历史不足",
+        "hourly_history_gap": "时段过滤所需的 1H 行情有缺口",
+        "latest_bar_close_mismatch": "时段过滤所需的 1H 收盘时间不匹配",
+        "atr_unavailable": "时段过滤所需的 ATR 不可用",
+        "night_new_entries_disabled": "夜间暂停新开仓",
+        "morning_up_blocks_long": "早盘冲高，时段规则限制做多",
+        "morning_down_blocks_short": "早盘急跌，时段规则限制做空",
+        "afternoon_up_impulse_blocks_long": "午后上涨过快，时段规则限制做多",
+        "afternoon_dump_blocks_long": "午后急跌，时段规则限制做多",
+        "afternoon_dump_lower10_blocks_short": "午后急跌且价格处于区间低位，时段规则限制做空",
+        "afternoon_upper10_blocks_short": "价格处于午后区间高位，时段规则限制做空",
         "structure_data_unavailable": "结构行情缺失、过期或无效",
         "daily_history_invalid": "日线历史无效或不连续",
+        "daily_history_insufficient": "已收盘日线历史不足",
+        "daily_data_unavailable": "已收盘日线不可用",
+        "daily_data_invalid": "日线数据无效",
+        "daily_data_stale": "最新已收盘日线过期",
+        "daily_close_equals_ema50": "日线收盘价等于 EMA50，方向未成立",
+        "daily_direction_long_only": "日线方向仅允许做多",
+        "daily_direction_short_only": "日线方向仅允许做空",
         "universe_data_missing": "市场列表缺项，保留上次结构",
         "universe_eligibility_unverified": "交易资格待核验",
         "RequestTimeout": "行情请求超时", "NetworkError": "行情网络异常",
@@ -540,6 +574,10 @@ def _candidate_observation(state, row, now, settings):
         reason = row.get("reason") if fresh else "candidate_structure_unverified"
     if row["symbol"] in state.get("positions", {}):
         signal_label = "已有持仓，继续持仓管理"
+    detail = reason_labels.get(reason)
+    if detail is None and reason:
+        detail = ("时段过滤未通过" if status == "active" and outcome.get("phase") == "time_filter"
+                  else "其他已记录原因")
     closed_at = bar + timedelta(hours=1) if bar is not None else None
     deadline = (closed_at + timedelta(seconds=settings.execution.confirm_delay_sec_max)
                 if closed_at is not None else None)
@@ -550,7 +588,7 @@ def _candidate_observation(state, row, now, settings):
         "checked_at": checked.isoformat() if checked else None,
         "age_hours": max(0, (now - first).total_seconds() / 3600) if first else None,
         "signal": {"label": signal_label, "reason": reason,
-                   "detail": reason_labels.get(reason, "其他已记录原因" if reason else ""),
+                   "detail": detail or "",
                    "ema9_confirmed": ema9,
                    "bar_close_at": closed_at.isoformat() if closed_at else None,
                    "window_open": bool(fresh and closed_at <= now <= deadline) if deadline else None},

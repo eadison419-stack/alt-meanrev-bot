@@ -108,7 +108,34 @@ def test_structure_dashboard_does_not_guess_ema9_from_generic_no_signal():
     state["mr_entry_scan"]["outcomes"]["AAA/USDT:USDT"]["reason"] = "no_eligible_signal"
     observation = pool_snapshot(state)["watchlist"][0]["candidate_observation"]
     assert observation["signal"]["ema9_confirmed"] is None
-    assert observation["signal"]["detail"] == "本小时未形成完整入场信号"
+    assert observation["signal"]["detail"] == "未记录具体拦截原因"
+
+
+@pytest.mark.parametrize("reason,detail", [
+    ("deviation_not_met", "偏离未达到基础入场门槛"),
+    ("hourly_candle_direction_mismatch", "1H K 线收盘方向与候选方向不符"),
+    ("hourly_history_gap", "时段过滤所需的 1H 行情有缺口"),
+    ("entry_history_insufficient", "入场所需的 1H 或 4H 行情不足"),
+    ("stop_too_wide", "结构止损距离过宽"),
+])
+def test_structure_dashboard_displays_recorded_entry_reason(reason, detail):
+    state = structure_pool_state()
+    state["mr_entry_scan"]["outcomes"]["AAA/USDT:USDT"]["reason"] = reason
+    signal = pool_snapshot(state)["watchlist"][0]["candidate_observation"]["signal"]
+    assert signal["detail"] == detail
+    assert signal["ema9_confirmed"] is None
+
+
+def test_structure_dashboard_displays_portfolio_risk_after_confirmation():
+    state = structure_pool_state()
+    state["mr_entry_scan"]["outcomes"]["AAA/USDT:USDT"].update(
+        status="rejected", reason="portfolio_stop_risk_limit",
+        side="short", candidate_priority={"deviation_zone": 2},
+    )
+    signal = pool_snapshot(state)["watchlist"][0]["candidate_observation"]["signal"]
+    assert signal["label"] == "执行未放行"
+    assert signal["detail"] == "组合止损风险额度已用尽"
+    assert signal["ema9_confirmed"] is True
 
 
 def test_legacy_dashboard_keeps_ranking_when_structure_pool_is_not_in_use():

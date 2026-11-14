@@ -3557,7 +3557,7 @@ def _time_filter_block_reasons(flags, side, bar_close_time, settings):
 
 
 def _record_time_filter_decision(state, symbol, side, frame1, bar_close_time,
-                                 flags, settings, now):
+                                 flags, settings, now, *, scan_row=None):
     reasons = _time_filter_block_reasons(flags, side, bar_close_time, settings)
     allowed = (flags.data_ready and not flags.flatten_only
                and (flags.allow_long_entry if side is Side.LONG else flags.allow_short_entry))
@@ -3604,6 +3604,8 @@ def _record_time_filter_decision(state, symbol, side, frame1, bar_close_time,
     }
     state.events.append(event)
     if not allowed:
+        if scan_row is not None:
+            scan_row.update(reason=event["reason"], phase="time_filter")
         _set_symbol_status(state, symbol, action="BLOCKED", side=side,
                            reason=event["reason"], at=now)
         state.symbol_status[symbol].update({
@@ -4418,10 +4420,14 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
     if position_monitor is not None:
         position_monitor()
     if symbol in state.portfolio.positions:
+        if scan_row is not None:
+            scan_row["reason"] = "position_already_open"
         return None
     frame1 = one_hour.get(symbol)
     frame4 = four_hour.get(symbol)
     if frame1 is None or frame4 is None or len(frame1) < settings.lookback.atr_len + 1 or len(frame4) < span:
+        if scan_row is not None:
+            scan_row["reason"] = "entry_history_insufficient"
         return None
     evaluated_at = _utc_now() if is_demo else now
     max_delay = (timedelta(seconds=settings.execution.confirm_delay_sec_max)
@@ -4431,6 +4437,8 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
     )
     if bar_rejection is not None:
         _record_entry_bar_rejection(state, symbol, frame1, bar_rejection, evaluated_at)
+        if scan_row is not None:
+            scan_row["reason"] = bar_rejection
         return None
     manual_closed = _aware_datetime(
         state.exit_management_by_symbol.get("__manual_entry_blocks__", {}).get(symbol))
@@ -4443,6 +4451,8 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         validate_ohlcv(frame1)
     except (TypeError, ValueError):
         _record_entry_bar_rejection(state, symbol, frame1, "invalid_ohlcv", now)
+        if scan_row is not None:
+            scan_row["reason"] = "invalid_ohlcv"
         return None
     atr_series = atr(frame1, settings.lookback.atr_len)
     try:
@@ -4464,16 +4474,20 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         frame4["close"], candle, settings, candidate_flags, deviation_pct=DEV_PCT,
     )
     if candidate_signal.action is not Action.OPEN:
+        if scan_row is not None:
+            scan_row["reason"] = candidate_signal.reason
         return None
     if scan_row is not None:
         scan_row["side"] = candidate_signal.side.value
     if not _record_time_filter_decision(
             state, symbol, candidate_signal.side, frame1, bar_close_time, flags,
-            settings, evaluated_at):
+            settings, evaluated_at, scan_row=scan_row):
         return None
     sig = deviation_entry_signal(frame4["close"], candle, settings, flags,
                                  deviation_pct=DEV_PCT)
     if sig.action is not Action.OPEN:
+        if scan_row is not None:
+            scan_row["reason"] = sig.reason
         return None
     entry_atr = float(atr_series.iloc[-1])
     close = float(candle["close"])
@@ -4517,6 +4531,8 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         if daily_reason is not None:
             _record_daily_entry_block(state, symbol, sig.side, regime_value,
                                       daily_gate, daily_reason, now)
+            if scan_row is not None:
+                scan_row["reason"] = daily_reason
             return None
     if is_demo:
         failures, latest_loss_at, waiting = structure_reentry_states.get(
@@ -4527,6 +4543,8 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
                 state, symbol, sig.side, bar_close_time, now,
                 failures, latest_loss_at,
             )
+            if scan_row is not None:
+                scan_row["reason"] = "structure_reentry_confirmation_required"
             return None
     ema9_side = _ema9_reclaim_side(frame1)
     if ema9_side != sig.side.value:
@@ -4682,6 +4700,8 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
         if funding_reason is not None:
             _record_funding_entry_block(state, symbol, side, regime_value,
                                         funding_rate, funding_reason, settings, _utc_now())
+            if scan_row is not None:
+                scan_row["reason"] = funding_reason
             return None
     step_size = 1e-8
     minimum_quantity = 0.0
@@ -4902,8 +4922,11 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                     finish(symbol, "blocked", reason="position_limit")
                     continue
                 attempts = (row or {}).get("attempts", 0) + 1
+                if row is not None:
+                    row.pop("candidate_priority", None)
                 row = finish(symbol, "evaluating", attempts=attempts,
-                             phase="candidate", endpoint="public", order_may_have_been_sent=False)
+                             phase="candidate", endpoint="public", side=None, reason=None,
+                             order_may_have_been_sent=False)
                 try:
                     candidate = _entry_candidate(
                         exchange, state, True, symbol, one_hour, four_hour, regimes, settings,

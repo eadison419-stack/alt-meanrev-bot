@@ -103,6 +103,10 @@ def deviation_entry_signal_at_ema(
         return Signal(Side.LONG, Action.OPEN, "range_deviation_long", 1.0)
     if side is Side.SHORT and bearish and flags.allow_short_entry:
         return Signal(Side.SHORT, Action.OPEN, "range_deviation_short", 1.0)
+    if side is None:
+        return Signal(None, Action.NONE, "deviation_not_met", 0.0)
+    if (side is Side.LONG and not bullish) or (side is Side.SHORT and not bearish):
+        return Signal(None, Action.NONE, "hourly_candle_direction_mismatch", 0.0)
     return Signal(None, Action.NONE, "no_range_deviation", 0.0)
 
 

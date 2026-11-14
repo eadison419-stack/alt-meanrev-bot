@@ -108,14 +108,43 @@ def test_real_cycle_covers_candidate_after_old_top20_and_consumes_signal_once(en
     cycle()
     assert len(e.state.mr_candidate_pool) == 25
     assert len(e.state.mr_entry_scan["symbols"]) == 25
+    first = e.market.symbols[0]
+    outcome = e.state.mr_entry_scan["outcomes"][first]
+    assert outcome["status"] == "evaluated"
+    assert outcome["reason"] == "hourly_candle_direction_mismatch"
+    assert outcome["bar"] == (AT - timedelta(hours=1)).isoformat()
     assert seen == [e.market.symbols[-1]]
     assert monitored
     assert len(e.state.portfolio.positions) == 0
     e.state = MultiPaperState.load(path)
+    assert e.state.mr_entry_scan["outcomes"][first] == outcome
     e.cache = runner.ClosedMarketCache()  # Restart rechecks every pool member.
     cycle()
     assert seen == [e.market.symbols[-1]]
     assert len(e.state.mr_candidate_pool) == 25
+
+
+@pytest.mark.parametrize("data_ready,expected", [
+    (True, "afternoon_dump_blocks_long"),
+    (False, "hourly_history_gap"),
+])
+def test_lead_scan_keeps_time_filter_rejection(env, monkeypatch, data_ready, expected):
+    e = env
+    markets, _, one, *_ = e.refresh()
+    symbol = e.market.symbols[-1]
+    four = {symbol: e.cache.four_hour[symbol][1]}
+    monkeypatch.setattr(runner, "evaluate_time_filter", lambda *a, **kw: TimeFilterFlags(
+        False, True, False, False, afternoon_dump_today=True, data_ready=data_ready,
+        data_reason=None if data_ready else "hourly_history_gap",
+    ))
+    risk = MarketRiskAssessment(MarketRiskState.NORMAL, "normal", e.clock[0], "BTC", "4h", {})
+    runner._evaluate_entries(e.market, e.state, None, True, markets, [symbol], one,
+                             four, {}, e.settings, 5, 0, 0, e.clock[0], risk)
+    outcome = e.state.mr_entry_scan["outcomes"][symbol]
+    assert outcome["status"] == "evaluated"
+    assert outcome["phase"] == "time_filter"
+    assert outcome["reason"] == expected
+    assert "candidate_priority" not in outcome
 
 
 def test_retains_first_seen_across_hours_and_incrementally_reads_hourly_data(env):
