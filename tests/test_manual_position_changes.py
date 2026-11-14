@@ -485,7 +485,9 @@ def test_reversal_prepares_completed_candle_context_and_new_stop(monkeypatch):
     frame = pd.DataFrame({"open": [110.] * 60, "high": [112.] * 60, "low": [108.] * 60,
                           "close": [110.] * 60, "volume": [100.] * 60},
                          index=pd.date_range(end=OPENED - timedelta(hours=1), periods=60, freq="h"))
-    monkeypatch.setattr(runner, "_adoption_closed_frame", lambda *args: frame)
+    four = frame.copy()
+    four.loc[:, ["open", "high", "low", "close"]] -= 10  # short entry retains MR deviation
+    monkeypatch.setattr(runner, "_adoption_closed_frame", lambda *args: frame if args[3] == "1h" else four)
     monkeypatch.setattr(runner, "calculate_adaptive_stop", lambda *args: (115, 1))
     monkeypatch.setattr(runner, "classify_regimes", lambda *args: pd.DataFrame({"regime": [Regime.MID]}))
     assert runner._demo_sync_stopped(service, state, now)

@@ -71,6 +71,11 @@ class PublicMarket:
 
 @pytest.fixture
 def env(monkeypatch):
+    # Existing pool tests isolate MR lifecycle from the new dead-fish filter.
+    # Real channel calculations and exclusive routing are covered in test_vsb.
+    monkeypatch.setattr(runner, "squeeze_context", lambda frame: {
+        "squeeze_on": False, "squeeze_released": False,
+        "sqz_bars": 0, "squeeze_complete": True})
     market = PublicMarket()
     state = MultiPaperState(execution_mode="lead_usdm", execution_status="synchronized")
     settings = load_settings(env_file=None)

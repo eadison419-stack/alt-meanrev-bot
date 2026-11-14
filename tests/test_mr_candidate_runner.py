@@ -189,6 +189,7 @@ def test_manual_adoption_runs_real_ticker_timestamp_helper(monkeypatch):
     state.portfolio.positions.clear()
     state.exit_management_by_symbol.clear()
     _, frame4 = _frames()
+    frame4.loc[:, ["open", "high", "low", "close"]] = [97., 98., 96., 97.]
     monkeypatch.setattr(runner, "_utc_now", lambda: now)
     monkeypatch.setattr(runner, "_adoption_closed_frame",
                         lambda _exchange, _symbol, _opened, timeframe, *args:

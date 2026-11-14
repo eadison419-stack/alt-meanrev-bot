@@ -77,7 +77,8 @@ from bot.lead_risk import lead_entry_exposure, settings_for_execution
 from bot.regime import Regime, classify_regimes
 from bot.risk import (OrderIntent, assess_entry, calculate_adaptive_stop,
                       calculate_order_quantity, funding_rate_rejection_reason)
-from bot.signals import Action, Side
+from bot.signals import Action, Side, Signal
+from bot.vsb import breakout_signal, effective_entry_atr, squeeze_context, strategy_metadata
 from bot.strategy_router import MEAN_REVERSION
 from bot.time_filter import TimeFilterFlags, evaluate_time_filter
 from bot.utils.logging import redact_log_record, redacted_excepthook
@@ -131,6 +132,7 @@ class ClosedMarketCache:
     daily_direction: dict = field(default_factory=dict)
     universe_four_hour: dict = field(default_factory=dict)
     lead_hourly: dict = field(default_factory=dict)
+    lead_squeeze_hourly: dict = field(default_factory=dict)
     lead_universe: tuple | None = None
     lead_universe_at: datetime | None = None
 
@@ -778,6 +780,7 @@ def _process_local_dynamic_limits(state, current_prices, settings, now, fee_rate
             state, symbol, opened, False, limit_price, stop_price,
             entry_atr, structure_low, structure_high,
         )
+        state.exit_management_by_symbol[symbol].update(strategy_metadata(attempt["meta"]))
         attempt["status"] = "paper_limit_filled"
         attempt["filled_at"] = now.isoformat()
         attempt["fill_price"] = opened.entry_price
@@ -927,10 +930,21 @@ def _entry_preflight(exchange, execution, state, settings, market, context, flag
         if ((context.side is Side.LONG and quote_price <= planned_stop)
                 or (context.side is Side.SHORT and quote_price >= planned_stop)):
             reject("entry_price_beyond_planned_stop")
-        signal = deviation_entry_signal_at_ema(
-            context.closed_ema, context.signal_open, quote_price, settings, flags,
-            deviation_pct=context.deviation_pct,
-        )
+        if context.strategy_tag == "VSB":
+            # A resting retracement limit can lie inside the breakout buffer.
+            # Confirm the fresh market still holds the frozen breakout instead.
+            direction = 1 if context.side is Side.LONG else -1
+            adverse_dev = -direction * (quote_price - context.closed_ema) / context.closed_ema
+            valid_breakout = (context.breakout_level is not None
+                              and direction * (quote_price - context.breakout_level) > 0
+                              and -1.2 * context.deviation_pct <= adverse_dev < context.deviation_pct)
+            signal = Signal(context.side if valid_breakout else None,
+                            Action.OPEN if valid_breakout else Action.NONE, "vsb_quote_recheck", 1.0)
+        else:
+            signal = deviation_entry_signal_at_ema(
+                context.closed_ema, context.signal_open, quote_price, settings, flags,
+                deviation_pct=context.deviation_pct,
+            )
         if signal.action is not Action.OPEN or signal.side is not context.side:
             reject("entry_signal_no_longer_valid")
         structure = context.structure_low if context.side is Side.LONG else context.structure_high
@@ -2027,9 +2041,10 @@ def _prepare_lead_manual_position(execution, symbol, exchange_position, at, *,
     frame1 = _adoption_closed_frame(
         execution.exchange, symbol, opened_at, "1h", HOUR_MS,
         max(atr_required, settings.stops.swing_lookback_1h),
-        60,
+        120,
     )
     regime_required = max(
+        settings.symbol_regime.ema_slow_bars,
         settings.lookback.min_regime_bars_4h,
         settings.regime.atrpct_lookback,
         settings.lookback.range_bars_4h + 1,
@@ -2040,8 +2055,31 @@ def _prepare_lead_manual_position(execution, symbol, exchange_position, at, *,
         execution.exchange, symbol, opened_at, "4h", FOUR_H_MS, regime_required,
         max(regime_required, 100),
     )
+    ema4 = float(frame4["close"].ewm(span=settings.symbol_regime.ema_slow_bars,
+                 adjust=False, min_periods=settings.symbol_regime.ema_slow_bars).mean().iloc[-1])
+    _, _, threshold = _atr_deviation_threshold(frame4, settings)
+    if threshold is None or not math.isfinite(ema4) or ema4 <= 0:
+        raise RuntimeError("entry-time deviation context is unavailable")
+    entry_price = float(recovered["entry_price"])
+    adverse = (ema4 - entry_price) / ema4 if side is Side.LONG else (entry_price - ema4) / ema4
+    tag = "MR" if adverse >= threshold else "VSB"
+    frozen_strategy = {"strategy_tag": tag}
+    if tag == "VSB":
+        # A retracement entry may fill up to three hours after the signal.
+        for offset in range(4):
+            squeeze = squeeze_context(frame1.iloc[:len(frame1) - offset])
+            if squeeze["squeeze_complete"] and 6 <= squeeze["sqz_bars"] <= 36:
+                frozen_strategy.update(strategy_metadata({"strategy_tag": tag, **squeeze}))
+                break
+        else:
+            raise RuntimeError("entry-time VSB squeeze box is unavailable")
+    else:
+        frame1 = frame1.tail(60)  # Preserve the original adoption ATR seed.
+    recovered = {**recovered, **frozen_strategy}
     atr_series = atr(frame1, settings.lookback.atr_len)
     entry_atr = float(atr_series.iloc[-1])
+    if tag == "VSB":
+        entry_atr = effective_entry_atr(frame1, entry_atr)
     if not math.isfinite(entry_atr) or entry_atr <= 0:
         raise RuntimeError("entry-time ATR is unavailable")
     swing = frame1.tail(settings.stops.swing_lookback_1h)
@@ -2101,6 +2139,7 @@ def _install_lead_manual_position(execution, state, symbol, at, prepared):
     )
     if recovered.get("cursor"):
         state.exit_management_by_symbol[symbol]["manual_sync"] = dict(recovered["cursor"])
+    state.exit_management_by_symbol[symbol].update(strategy_metadata(recovered))
     _invalidate_demo_stop_audit(state)
     state.events.append({
         "event": "manual_position_adopted", "at": at.isoformat(), "symbol": symbol,
@@ -2966,6 +3005,7 @@ def _lead_structure(frame1, frame4, gate, settings, at):
         atr4, atr_pct, threshold = _atr_deviation_threshold(frame4, settings)
         if threshold is None or not math.isfinite(ema) or ema <= 0:
             raise ValueError("structure indicators unavailable")
+        squeeze = squeeze_context(frame1)
     except (AttributeError, KeyError, TypeError, ValueError, IndexError, OverflowError):
         return {"status": "pending", "reason": "structure_data_unavailable"}
     if gate.get("daily_history_valid") is False:
@@ -2974,15 +3014,28 @@ def _lead_structure(frame1, frame4, gate, settings, at):
         reason = gate.get("reason") or "daily_data_unavailable"
         return {"status": "removed" if reason == "daily_close_equals_ema50" else "pending",
                 "reason": reason}
-    side = deviation_structure_side(ema, close, settings, deviation_pct=threshold)
+    side = Side(gate["direction"])
+    adverse = (ema - close) / ema if side is Side.LONG else (close - ema) / ema
     details = {"close": close, "closed_ema50": ema, "deviation_pct": close / ema - 1,
                "closed_4h_atr": atr4, "closed_4h_atr_pct": atr_pct,
-               "deviation_threshold_pct": threshold, **_daily_gate_status_fields(gate)}
-    if side is None:
-        return {**details, "status": "removed", "reason": "deviation_structure_not_met"}
-    if _daily_direction_rejection_reason(gate, side) is not None:
+               "deviation_threshold_pct": threshold, "adverse_dev": adverse,
+               **squeeze, **_daily_gate_status_fields(gate)}
+    if not getattr(settings.signals, f"allow_{side.value}"):
         return {**details, "status": "removed", "reason": "daily_structure_direction_changed"}
-    return {**details, "status": "active", "side": side.value, "reason": None}
+    # A released candle has zero *current* squeeze bars. Its preceding box is
+    # retained for this signal hour only, then disappears on the next scan.
+    current_sqz = squeeze["sqz_bars"] if squeeze["squeeze_on"] else 0
+    mr_side = deviation_structure_side(ema, close, settings, deviation_pct=threshold)
+    near_ema = (close <= ema * (1 + 1.2 * threshold) if side is Side.LONG
+                else close >= ema * (1 - 1.2 * threshold))
+    if mr_side is side and current_sqz < 6:
+        tag = "MR"
+    elif (mr_side is not side and near_ema and squeeze["squeeze_complete"]
+          and 6 <= squeeze["sqz_bars"] <= 36):
+        tag = "VSB"
+    else:
+        return {**details, "status": "removed", "reason": "deviation_structure_not_met"}
+    return {**details, "status": "active", "side": side.value, "strategy_tag": tag, "reason": None}
 
 
 def _update_lead_pool(state, observations, at):
@@ -2995,13 +3048,15 @@ def _update_lead_pool(state, observations, at):
         old = previous.get(symbol)
         result = observations.get(symbol, {"status": "pending", "reason": "universe_data_missing"})
         status = result["status"]
-        changed = old and status == "active" and old.get("side") != result.get("side")
+        changed = old and status == "active" and (
+            old.get("side") != result.get("side")
+            or old.get("strategy_tag", "MR") != result.get("strategy_tag", "MR"))
         if old and (status == "removed" or changed):
             counts["removed"] += 1
             state.events.append({"event": "mr_candidate_removed", "at": at.isoformat(),
                                  "symbol": symbol, "side": old.get("side"),
                                  "first_seen_at": old.get("first_seen_at"),
-                                 "bar": bar, "reason": "direction_changed" if changed else result["reason"]})
+                                 "bar": bar, "reason": "route_or_direction_changed" if changed else result["reason"]})
         if status == "removed":
             continue
         if status == "pending":
@@ -3013,7 +3068,7 @@ def _update_lead_pool(state, observations, at):
                 continue
         base = {} if changed or old is None else old
         first = base.get("first_seen_at") or at.isoformat()
-        pool[symbol] = {**base, **result, "symbol": symbol,
+        pool[symbol] = {**base, **result, "strategy_tag": result.get("strategy_tag", base.get("strategy_tag", "MR")), "symbol": symbol,
                         "first_seen_at": first, "checked_at": at.isoformat(), "bar": bar,
                         "pool_age_hours": max(0, (at - datetime.fromisoformat(first)).total_seconds() / 3600)}
         if status == "active":
@@ -3077,9 +3132,9 @@ def _build_lead_universe(exchange, state, settings, now, *, lead_market_ids,
     daily_key = (now_ms // DAY_MS, span, settings.lookback.atr_len, MIN_DAILY_UNIVERSE_BARS)
     requests, hourly_limits = [], {}
     for symbol, _ in candidates:
-        saved = cache.lead_hourly.get(symbol)
-        limit = (2 if saved is not None and len(saved) >= 59
-                 and saved.index[-1] == pd.Timestamp(at - timedelta(hours=2)) else 60)
+        saved = cache.lead_squeeze_hourly.get(symbol)
+        limit = (2 if saved is not None and len(saved) >= 119
+                 and saved.index[-1] == pd.Timestamp(at - timedelta(hours=2)) else 120)
         hourly_limits[symbol] = limit
         requests.append((symbol, "1h", limit))
         if cache.daily_direction.get(symbol, (None,))[0] != daily_key:
@@ -3102,10 +3157,12 @@ def _build_lead_universe(exchange, state, settings, now, *, lead_market_ids,
             rows = prefetched_read(prefetched, (symbol, "1h", limit),
                                    lambda: exchange.fetch_ohlcv(symbol, "1h", limit=limit))
             frame1 = ohlcv_frame(_closed(rows, HOUR_MS, now_ms))
+            has_unfinished = any(int(row[0]) >= now_ms for row in rows)
             if limit == 2:
-                frame1 = pd.concat([cache.lead_hourly[symbol], frame1])
-                closed_count = 59 if any(int(row[0]) >= now_ms for row in rows) else 60
+                frame1 = pd.concat([cache.lead_squeeze_hourly[symbol], frame1])
+                closed_count = 119 if has_unfinished else 120
                 frame1 = frame1.loc[~frame1.index.duplicated(keep="last")].sort_index().tail(closed_count)
+            frame1.attrs["mr_window_bars"] = 59 if has_unfinished else 60
             frame4 = _cached_four_hour(exchange, symbol, now_ms, cache, prefetched=prefetched)
             gate = _cached_daily_direction_gate(exchange, symbol, at, span, cache,
                                                 prefetched=prefetched, atr_period=settings.lookback.atr_len,
@@ -3116,8 +3173,11 @@ def _build_lead_universe(exchange, state, settings, now, *, lead_market_ids,
             if not gate.get("ready"):
                 cache.daily_direction.pop(symbol, None)
             if result["reason"] != "structure_data_unavailable":
-                cache.lead_hourly[symbol] = frame1
-            one_hour[symbol] = frame1
+                cache.lead_squeeze_hourly[symbol] = frame1
+                # Preserve Wilder ATR and EMA seeds of the existing MR window.
+                cache.lead_hourly[symbol] = frame1.tail(59 if has_unfinished else 60)
+            one_hour[symbol] = (frame1 if result.get("strategy_tag") == "VSB"
+                                else frame1.tail(59 if has_unfinished else 60))
             observations[symbol] = {**result, "quote_volume_24h": volume}
         except ccxt.BaseError as exc:
             if isinstance(exc, (ccxt.RateLimitExceeded, ccxt.DDoSProtection, ccxt.AuthenticationError)):
@@ -3673,6 +3733,7 @@ def _reconcile_pending_entries(execution, state, checkpoint):
                         state, symbol, local, True, meta["last_close"], attempt["stop_price"],
                         meta["entry_atr"], meta["structure_low"], meta["structure_high"],
                     )
+                    state.exit_management_by_symbol[symbol].update(strategy_metadata(meta))
                     state.exit_management_by_symbol[symbol]["telemetry_history_complete"] = False
                 state.exchange_orders_by_symbol[symbol] = {"stop": result["stop"]}
                 attempt["status"] = "completed"
@@ -4164,6 +4225,9 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
             continue
         meta = state.exit_management_by_symbol.get(symbol) or {}
         meta.setdefault("enabled", True)
+        is_vsb = meta.get("strategy_tag", "MR") == "VSB"
+        if not is_vsb:
+            frame = frame.tail(frame.attrs.get("mr_window_bars", len(frame)))
         bar = frame.iloc[-1]
         current_close = float(bar["close"])
         current_open = float(bar["open"])
@@ -4246,7 +4310,8 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
         ms = MidExitState(reached_mid=bool(meta.get("mid_reached")),
                           hold_count=int(meta.get("mid_hold", 0)),
                           fired=bool(meta.get("mid_fired")))
-        fire, ms = mid_exit_check(side, entry, mid, current_close, buffer=0.0, hold_bars=0, state=ms)
+        fire, ms = ((False, ms) if is_vsb else mid_exit_check(
+            side, entry, mid, current_close, buffer=0.0, hold_bars=0, state=ms))
         meta["mid_reached"] = ms.reached_mid
         meta["mid_hold"] = ms.hold_count
         meta["mid_fired"] = ms.fired
@@ -4301,6 +4366,9 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
             in_hotlist=symbol in hotlist_ranks,
             hotlist_rank=hotlist_ranks.get(symbol),
         )
+        if is_vsb:
+            fade_event.update(triggered=False, decision="skipped", skip_reason="vsb_strategy_exempt",
+                              reason="vsb_regime_fade_exempt", strategy_tag="VSB")
         state.events.append(fade_event)
         logger.info("Regime fade evaluation {}", fade_event)
         if fade_event["triggered"]:
@@ -4325,6 +4393,23 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
             if symbol not in state.portfolio.positions:
                 logger.info("Regime fade exit fill recorded for {} reason={}", symbol, reason)
             continue
+
+        # Early VSB falsification uses distinct post-fill hourly closes, including
+        # the first partial holding hour. Frozen metadata survives limit recovery.
+        closed_at = frame.index[-1].to_pydatetime() + timedelta(hours=1)
+        if (is_vsb and position.opened_at < closed_at <= now
+                and meta.get("vsb_last_check_bar") != closed_at.isoformat()):
+            checks = int(meta.get("vsb_hourly_checks", 0)) + 1
+            meta.update(vsb_hourly_checks=checks, vsb_last_check_bar=closed_at.isoformat())
+            box_mid = meta.get("box_mid")
+            holding_hour = (closed_at - position.opened_at.replace(
+                minute=0, second=0, microsecond=0)).total_seconds() / 3600
+            if (checks <= 4 and 1 <= holding_hour <= 4 and box_mid is not None
+                    and (current_close < float(box_mid) if side is Side.LONG
+                         else current_close > float(box_mid))):
+                _close_position(is_demo, execution, state, symbol, current_close,
+                                "vsb_false_breakout", now, fee_rate, slip_rate)
+                continue
 
         # 6. no progress
         favorable = (best_price - entry) if side is Side.LONG else (entry - best_price)
@@ -4371,6 +4456,9 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
 
 def _entry_priority_sort_key(candidate):
     priority = candidate[1]
+    if "tier_bucket" in priority:
+        return tuple(-float(priority[key]) for key in (
+            "tier_bucket", "is_market_order", "bar_quality", "space_r")) + (candidate[0],)
     return (
         -int(priority["deviation_zone"]),
         -float(priority["reversal_score"]),
@@ -4425,6 +4513,11 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         return None
     frame1 = one_hour.get(symbol)
     frame4 = four_hour.get(symbol)
+    route = state.mr_candidate_pool.get(symbol, {})
+    strategy_tag = route.get("strategy_tag", "MR")
+    is_vsb = strategy_tag == "VSB"
+    if frame1 is not None and not is_vsb:
+        frame1 = frame1.tail(frame1.attrs.get("mr_window_bars", len(frame1)))
     if frame1 is None or frame4 is None or len(frame1) < settings.lookback.atr_len + 1 or len(frame4) < span:
         if scan_row is not None:
             scan_row["reason"] = "entry_history_insufficient"
@@ -4470,9 +4563,18 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         )
     candidate_flags = replace(flags, allow_long_entry=True, allow_short_entry=True,
                                flatten_only=False, data_ready=True, data_reason=None)
-    candidate_signal = deviation_entry_signal(
-        frame4["close"], candle, settings, candidate_flags, deviation_pct=DEV_PCT,
-    )
+    squeeze = {}
+    if is_vsb:
+        try:
+            squeeze = squeeze_context(frame1)
+            candidate_signal = breakout_signal(frame1, Side(route["side"]), squeeze,
+                                                float(atr_series.iloc[-1]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            candidate_signal = Signal(None, Action.NONE, "vsb_data_unavailable", 0.0)
+    else:
+        candidate_signal = deviation_entry_signal(
+            frame4["close"], candle, settings, candidate_flags, deviation_pct=DEV_PCT,
+        )
     if candidate_signal.action is not Action.OPEN:
         if scan_row is not None:
             scan_row["reason"] = candidate_signal.reason
@@ -4483,13 +4585,20 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
             state, symbol, candidate_signal.side, frame1, bar_close_time, flags,
             settings, evaluated_at, scan_row=scan_row):
         return None
-    sig = deviation_entry_signal(frame4["close"], candle, settings, flags,
-                                 deviation_pct=DEV_PCT)
+    sig = (candidate_signal if is_vsb else deviation_entry_signal(
+        frame4["close"], candle, settings, flags, deviation_pct=DEV_PCT))
     if sig.action is not Action.OPEN:
         if scan_row is not None:
             scan_row["reason"] = sig.reason
         return None
     entry_atr = float(atr_series.iloc[-1])
+    if is_vsb:
+        try:
+            entry_atr = effective_entry_atr(frame1, entry_atr)
+        except ValueError:
+            if scan_row is not None:
+                scan_row["reason"] = "vsb_atr60_unavailable"
+            return None
     close = float(candle["close"])
     swing_low = float(frame1["low"].tail(settings.stops.swing_lookback_1h).min())
     swing_high = float(frame1["high"].tail(settings.stops.swing_lookback_1h).max())
@@ -4546,7 +4655,7 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
             if scan_row is not None:
                 scan_row["reason"] = "structure_reentry_confirmation_required"
             return None
-    ema9_side = _ema9_reclaim_side(frame1)
+    ema9_side = sig.side.value if is_vsb else _ema9_reclaim_side(frame1)
     if ema9_side != sig.side.value:
         _record_entry_rejection(
             state, symbol, sig.side, "ema9_reclaim_unconfirmed", "entry_confirmation", now,
@@ -4558,7 +4667,7 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
     atr4, atr4_pct, atr_threshold = _atr_deviation_threshold(frame4, settings)
     # The explicit override is used only by frozen offline research hypotheses.
     threshold = atr_threshold if deviation_pct is None else deviation_pct
-    if state.execution_mode == "lead_usdm" and scan_row is not None:
+    if state.execution_mode == "lead_usdm" and scan_row is not None and not is_vsb:
         try:
             _record_atr_deviation_shadow(
                 state, symbol, frame1, frame4, bar_close_time, evaluated_at,
@@ -4576,10 +4685,10 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
             bar_close_at=bar_close_time, scan_row=scan_row, details=deviation_details,
         )
         return None
-    active_signal = deviation_entry_signal_at_ema(
-        closed_ema, float(candle["open"]), close, settings, flags,
-        deviation_pct=threshold,
-    )
+    adverse = (closed_ema - close) / closed_ema if sig.side is Side.LONG else (close - closed_ema) / closed_ema
+    active_signal = (sig if -1.2 * threshold <= adverse < threshold else
+                     Signal(None, Action.NONE, "vsb_deviation_not_met", 0.0)) if is_vsb else deviation_entry_signal_at_ema(
+        closed_ema, float(candle["open"]), close, settings, flags, deviation_pct=threshold)
     if active_signal.action is not Action.OPEN or active_signal.side is not sig.side:
         _record_entry_rejection(
             state, symbol, sig.side, "atr_deviation_not_met", "entry_deviation", now,
@@ -4590,14 +4699,29 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         symbol, sig.side, bar_close_time, now, evaluated_at,
         float(candle["open"]), close, closed_ema, entry_atr, swing_low, swing_high,
         threshold,
+        strategy_tag,
+        ((squeeze["box_high"] + 0.15 * float(atr_series.iloc[-1])) if sig.side is Side.LONG
+         else (squeeze["box_low"] - 0.15 * float(atr_series.iloc[-1]))) if is_vsb else None,
     ) if is_demo else None
     execution_plan = _entry_execution_plan(candle, entry_atr, bar_close_time, sig.side)
     priority = _entry_priority_metrics(
         sig.side, candle, close, stop, closed_ema, dev, atr4_pct,
     )
+    if state.execution_mode == "lead_usdm" or is_vsb:
+        z_dev = adverse / threshold
+        tier = (2 if 1.2 <= z_dev <= 2.2 else 1 if 1 <= z_dev < 1.2 else 0)
+        if is_vsb:
+            tier = 2 if 10 <= squeeze["sqz_bars"] <= 24 and abs(adverse) <= 0.5 * threshold else 1
+        baseline_volume = (squeeze["squeeze_volume_mean"] if is_vsb else
+                           float(frame1["volume"].iloc[:-1].tail(20).mean()))
+        volume = float(candle["volume"])
+        volume_ratio = volume / baseline_volume if baseline_volume > 0 and math.isfinite(volume) else 0.0
+        priority.update(tier_bucket=tier, is_market_order=int(execution_plan["order_type"] == "market"),
+                        bar_quality=(priority["candle_close_location"] + min(1.0, volume_ratio / 3.0)) / 2,
+                        space_r=2.5 * atr4 / abs(close - stop) if is_vsb else priority["ema_space_r"])
     execution_plan["candidate_priority"] = priority
     execution_plan.update(ema9_reclaim_side=ema9_side, deviation_threshold_pct=threshold,
-                          closed_4h_atr_pct=atr4_pct)
+                          closed_4h_atr_pct=atr4_pct, **strategy_metadata({"strategy_tag": strategy_tag, **squeeze}))
     return (symbol, priority, sig.side, close, stop, entry_atr,
                        swing_low, swing_high, regime_value, sig.reason, daily_gate,
                        context, flags, execution_plan)
@@ -4612,6 +4736,7 @@ def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
     initial_risk = (abs(opened.entry_price - opened.stop_price)
                     if is_demo else abs(close - stop))
     state.exit_management_by_symbol[symbol] = {
+        "strategy_tag": "MR",
         "entry_atr": entry_atr,
         "enabled": True,
         "protective_stop": float(opened.stop_price),
@@ -4769,7 +4894,7 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
             "quantity": float(qty), "expires_at": limit_expires_at,
             "ema9_reclaim_side": execution_plan.get("ema9_reclaim_side"),
             "deviation_threshold_pct": execution_plan.get("deviation_threshold_pct"),
-            "meta": {"entry_atr": float(entry_atr),
+            "meta": {**strategy_metadata(execution_plan), "entry_atr": float(entry_atr),
                      "structure_low": float(swing_low),
                      "structure_high": float(swing_high)},
             "created_at": _utc_now().isoformat(),
@@ -4786,6 +4911,7 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
         if scan_row is not None:
             scan_row.update(phase="demo_prepare", endpoint="demo")
         audit = {}
+        audit.update(strategy_metadata(execution_plan))
         audit.update({"order_type": order_type,
                       "limit_price": limit_entry_price,
                       "limit_expires_at": limit_expires_at,
@@ -4802,7 +4928,8 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
                             "limit_expires_at": limit_expires_at}
         if scan_row is not None:
             execution_kwargs.update(scan_row=scan_row, checkpoint=checkpoint,
-                                    recovery_meta={"entry_atr": entry_atr, "structure_low": swing_low,
+                                    recovery_meta={**strategy_metadata(execution_plan),
+                                                   "entry_atr": entry_atr, "structure_low": swing_low,
                                                    "structure_high": swing_high, "last_close": close})
     opened = _open_position(is_demo, execution, state, symbol, side, close, stop, qty,
                             int(settings.sizing.leverage), fee_rate, slip_rate, reason,
@@ -4817,6 +4944,7 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
     if opened is not None:
         _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
                                    entry_atr, swing_low, swing_high)
+        state.exit_management_by_symbol[symbol].update(strategy_metadata(execution_plan))
         if daily_gate is not None:
             _set_symbol_status(state, symbol, action="OPEN", side=side,
                                reason=reason, at=now, regime=regime_value)

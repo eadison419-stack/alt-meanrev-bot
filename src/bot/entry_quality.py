@@ -21,6 +21,8 @@ class EntrySignalContext:
     structure_low: float
     structure_high: float
     deviation_pct: float
+    strategy_tag: str = "MR"
+    breakout_level: float | None = None
 
 
 def execution_quote(book, side, observed_at, *, max_age_sec):
