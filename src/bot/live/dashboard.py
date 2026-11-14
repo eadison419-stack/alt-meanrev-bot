@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
-from bot.config import load_settings
+from bot.config import PROJECT_ROOT, load_settings
 from bot.live.manual_close import ManualCloseCommandStore, command_directory_for_state
 from bot.live.paper import effective_max_hold_hours, runner_tail_is_exempt
 
@@ -491,16 +491,24 @@ def _candidate_time(raw):
         return None
 
 
-def _candidate_observation(state, row, now, settings):
+def _candidate_observation(state, row, now, settings, shadow_pool):
     """Describe recorded evidence only; never fetch candles or infer a signal."""
     bar = _candidate_time(row.get("bar"))
     target = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
     fresh = bar == target
     first = _candidate_time(row.get("first_seen_at"))
     checked = _candidate_time(row.get("checked_at"))
+    tag = row.get("strategy_tag", "MR")
+    is_vsb = tag == "VSB"
+    shadow = shadow_pool.get(row["symbol"], {}) if is_vsb else {}
+    shadow_matches = (shadow.get("strategy_tag") == "VSB" and bar is not None and checked is not None
+                      and _candidate_time(shadow.get("bar")) == bar
+                      and _candidate_time(shadow.get("checked_at")) == checked)
     scan = state.get("mr_entry_scan", {})
+    live_scan_matches = (fresh and _candidate_time(scan.get("bar")) == bar
+                         and row["symbol"] in scan.get("symbols", []))
     outcome = (scan.get("outcomes", {}).get(row["symbol"], {})
-               if fresh and _candidate_time(scan.get("bar")) == bar else {})
+               if fresh and _candidate_time(scan.get("bar")) == bar and (not is_vsb or live_scan_matches) else {})
     if ((outcome.get("bar") and _candidate_time(outcome["bar"]) != bar)
             or (outcome.get("side") and outcome["side"] != row.get("side"))):
         outcome = {}
@@ -557,6 +565,13 @@ def _candidate_observation(state, row, now, settings):
         "universe_data_missing": "市场列表缺项，保留上次结构",
         "universe_eligibility_unverified": "交易资格待核验",
         "RequestTimeout": "行情请求超时", "NetworkError": "行情网络异常",
+        "vsb_release_unconfirmed": "挤压尚未释放或持续根数不符",
+        "vsb_ema9_direction_unconfirmed": "收盘方向或 EMA9 斜率未确认",
+        "vsb_breakout_buffer_not_met": "收盘未突破箱体及 ATR 缓冲",
+        "vsb_volume_unconfirmed": "突破成交量不足",
+        "vsb_clv_unconfirmed": "突破收盘位置不够强",
+        "vsb_atr60_unavailable": "ATR60 不可用",
+        "vsb_data_unavailable": "挤压行情不可用",
     }
     labels = {"evaluating": "正在核验", "retry": "等待读取重试", "evaluated": "本小时未触发",
               "candidate": "完整信号已确认", "rejected": "执行未放行", "blocked": "新开仓受限",
@@ -565,14 +580,26 @@ def _candidate_observation(state, row, now, settings):
               "uncertain": "委托结果待确认", "error": "核验异常"}
     status = row.get("status") if fresh else "pending"
     reason = outcome.get("reason")
-    ema9 = (False if reason == "ema9_reclaim_unconfirmed" else
+    ema9 = (None if is_vsb else False if reason == "ema9_reclaim_unconfirmed" else
             True if isinstance(outcome.get("candidate_priority"), dict)
             and outcome["candidate_priority"] else None)
     signal_label = labels.get(outcome.get("status"), "本小时尚未评估")
+    execution_label = "实盘候选" if tag == "MR" else "执行模式待核验"
+    if is_vsb:
+        if shadow_matches:
+            execution_label = "影子观察"
+            signal_label, reason = "影子观察", None
+        elif live_scan_matches:
+            execution_label = "实盘扫描"
+        if not outcome or shadow_matches:
+            if row.get("squeeze_on"):
+                signal_label = "挤压中，等待释放"
+            elif row.get("squeeze_released"):
+                signal_label = "挤压已释放"
     if status != "active":
         signal_label, ema9 = "暂停该币新开仓", None
         reason = row.get("reason") if fresh else "candidate_structure_unverified"
-    if row["symbol"] in state.get("positions", {}):
+    if not shadow_matches and row["symbol"] in state.get("positions", {}):
         signal_label = "已有持仓，继续持仓管理"
     detail = reason_labels.get(reason)
     if detail is None and reason:
@@ -583,6 +610,8 @@ def _candidate_observation(state, row, now, settings):
                 if closed_at is not None else None)
     return {
         "side": row.get("side"), "daily_direction": row.get("daily_direction"),
+        "strategy_tag": tag if tag in ("MR", "VSB") else None,
+        "execution_label": execution_label,
         "status": status or "pending", "structure_fresh": fresh,
         "first_seen_at": first.isoformat() if first else None,
         "checked_at": checked.isoformat() if checked else None,
@@ -597,7 +626,7 @@ def _candidate_observation(state, row, now, settings):
 
 def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], market_error: str | None = None,
                          state_updated_at: float | None = None, settings=None,
-                         now: datetime | None = None) -> dict[str, Any]:
+                         now: datetime | None = None, shadow_pool: dict | None = None) -> dict[str, Any]:
     if state.get("version") != 2 or state.get("account_type") != "multi_symbol_paper":
         raise ValueError("unsupported multi-symbol paper state")
     settings = settings or load_settings()
@@ -773,7 +802,7 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
             "signal_reason": status.get("reason", "--"),
             "signal_at": status.get("at"),
             "position": next((item for item in positions if item["symbol"] == symbol), None),
-            **({"candidate_observation": _candidate_observation(state, row, now, settings)}
+            **({"candidate_observation": _candidate_observation(state, row, now, settings, shadow_pool or {})}
                if structure_pool else {}),
         })
     watch_by_symbol = {row["symbol"]: row for row in watchlist}
@@ -866,6 +895,19 @@ class DashboardService:
         self._hotlist_signature: tuple | None = None
         self._hotlist_observed_at: str | None = None
 
+    def _shadow_pool(self, state):
+        if (state.get("execution_mode") != "lead_usdm"
+                or not any(row.get("strategy_tag") == "VSB" for row in state.get("watchlist", []))):
+            return {}
+        try:
+            shadow = json.loads((PROJECT_ROOT / "data" / "vsb_shadow_ledger.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(shadow, dict) or shadow.get("execution_mode") != "vsb_shadow":
+            return {}
+        pool = shadow.get("mr_candidate_pool")
+        return {symbol: row for symbol, row in pool.items() if isinstance(row, dict)} if isinstance(pool, dict) else {}
+
     def _merge_display_mfe(self, state: dict[str, Any], tickers: dict[str, dict]) -> None:
         """Keep dashboard-observed extrema between slower runner ledger updates."""
         exit_states = state.get("exit_management_by_symbol", {})
@@ -913,7 +955,8 @@ class DashboardService:
                 error = self._ticker_error
                 self._merge_display_mfe(state, tickers)
                 self._cached = build_multi_snapshot(state, tickers=tickers, market_error=error,
-                                                    state_updated_at=state_stat.st_mtime, settings=self.settings)
+                                                    state_updated_at=state_stat.st_mtime, settings=self.settings,
+                                                    shadow_pool=self._shadow_pool(state))
                 history_key = self._cached.get("exchange_sync_at") or self._cached.get("state_updated_at")
                 if history_key and history_key != self._last_equity_history_key:
                     self._equity_history.append({"at": history_key, "equity": float(self._cached["equity"])})

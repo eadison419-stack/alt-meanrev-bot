@@ -35,9 +35,9 @@ def structure_pool_state():
                 symbol: {"bar": row["bar"], "status": "evaluated", "reason": "ema9_reclaim_unconfirmed"}}}}
 
 
-def pool_snapshot(state, at="2026-11-14T05:00:30+00:00"):
+def pool_snapshot(state, at="2026-11-14T05:00:30+00:00", **kwargs):
     return build_multi_snapshot(state, tickers={}, settings=load_settings(env_file=None),
-                                now=datetime.fromisoformat(at))
+                                now=datetime.fromisoformat(at), **kwargs)
 
 
 def test_structure_dashboard_preserves_pool_direction_and_shows_recorded_confirmation():
@@ -49,6 +49,8 @@ def test_structure_dashboard_preserves_pool_direction_and_shows_recorded_confirm
     assert row["side"] == "short"  # Generic waiting status has no side.
     assert "hot_score" not in row
     observation = row["candidate_observation"]
+    assert observation["strategy_tag"] == "MR"
+    assert observation["execution_label"] == "实盘候选"
     assert observation["daily_direction"] == "short"
     assert observation["age_hours"] == pytest.approx(1 + 30 / 3600)
     assert observation["signal"]["ema9_confirmed"] is False
@@ -57,6 +59,30 @@ def test_structure_dashboard_preserves_pool_direction_and_shows_recorded_confirm
     assert data["entry_gate_labels"] == ["日内停开锁生效"]
     assert json.dumps(state) == before
     json.dumps(data, allow_nan=False)
+
+
+@pytest.mark.parametrize("shadow_match,live_scan,expected", [
+    (True, False, "影子观察"), (False, True, "实盘扫描"), (False, False, "执行模式待核验"),
+])
+def test_vsb_strategy_mode_uses_matching_ledger_evidence(shadow_match, live_scan, expected):
+    state = structure_pool_state()
+    row = state["watchlist"][0]
+    symbol = row["symbol"]
+    row.update(strategy_tag="VSB", squeeze_on=True, sqz_bars=13)
+    shadow = row.copy()
+    if not shadow_match:
+        # An earlier observation of the same symbol and bar cannot attest the current route.
+        shadow["checked_at"] = "2026-11-14T05:00:00+00:00"
+    if live_scan:
+        state["mr_entry_scan"]["symbols"] = [symbol]
+        state["mr_entry_scan"]["outcomes"][symbol]["reason"] = "vsb_release_unconfirmed"
+    data = pool_snapshot(state, shadow_pool={symbol: shadow})
+    observation = data["watchlist"][0]["candidate_observation"]
+    assert observation["strategy_tag"] == "VSB"
+    assert observation["execution_label"] == expected
+    assert observation["signal"]["ema9_confirmed"] is None
+    assert observation["signal"]["label"] == ("本小时未触发" if live_scan else "挤压中，等待释放")
+    assert data["entry_gate_labels"] == ["日内停开锁生效"]
 
 
 @pytest.mark.parametrize("mismatch", ["scan_bar", "outcome_bar", "outcome_side"])
