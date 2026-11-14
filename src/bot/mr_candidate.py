@@ -96,14 +96,24 @@ def deviation_entry_signal_at_ema(
     if (not math.isfinite(close) or not math.isfinite(open_price)
             or close <= 0 or open_price <= 0):
         return Signal(None, Action.NONE, "invalid_live_price", 0.0)
-    deviation = close / closed_ema - 1.0
+    side = deviation_structure_side(closed_ema, close, settings, deviation_pct=deviation_pct)
     bullish = close > open_price
     bearish = close < open_price
-    if settings.signals.allow_long and deviation <= -deviation_pct and bullish and flags.allow_long_entry:
+    if side is Side.LONG and bullish and flags.allow_long_entry:
         return Signal(Side.LONG, Action.OPEN, "range_deviation_long", 1.0)
-    if settings.signals.allow_short and deviation >= deviation_pct and bearish and flags.allow_short_entry:
+    if side is Side.SHORT and bearish and flags.allow_short_entry:
         return Signal(Side.SHORT, Action.OPEN, "range_deviation_short", 1.0)
     return Signal(None, Action.NONE, "no_range_deviation", 0.0)
+
+
+def deviation_structure_side(closed_ema, current_price, settings, *, deviation_pct):
+    """Share the entry's price reference and inclusive deviation boundaries."""
+    deviation = current_price / closed_ema - 1.0
+    if settings.signals.allow_long and deviation <= -deviation_pct:
+        return Side.LONG
+    if settings.signals.allow_short and deviation >= deviation_pct:
+        return Side.SHORT
+    return None
 
 
 def claim_hourly_entry(attempts: dict[str, str], symbol: str, hour_key: str) -> bool:

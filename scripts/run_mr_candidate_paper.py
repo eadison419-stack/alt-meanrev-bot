@@ -67,6 +67,7 @@ from bot.market_risk import (MarketRiskAssessment, MarketRiskState,
                              fetch_market_risk_status)
 from bot.mr_candidate import (MidExitState, staged_profit_lock_stop,
                               deviation_entry_signal, deviation_entry_signal_at_ema,
+                              deviation_structure_side,
                               mid_band, mid_exit_check, no_progress_update,
                               regime_faded_triggered, structure_invalid_quote_exit,
                               structure_invalid_triggered, structure_reentry_confirmed,
@@ -129,6 +130,9 @@ class ClosedMarketCache:
     four_hour: dict = field(default_factory=dict)
     daily_direction: dict = field(default_factory=dict)
     universe_four_hour: dict = field(default_factory=dict)
+    lead_hourly: dict = field(default_factory=dict)
+    lead_universe: tuple | None = None
+    lead_universe_at: datetime | None = None
 
 
 def _utc_now():
@@ -2705,6 +2709,15 @@ def _daily_direction_gate(exchange, symbol, signal_at, span, *, fail_on_market_e
             "daily_bar_close_time": (frame.index[-1].to_pydatetime()
                                      + timedelta(days=1)).isoformat(),
         }
+        # Evidence used by the Lead structure pool. Existing direction callers
+        # retain their original result; an incomplete pool input stays pending.
+        try:
+            validate_ohlcv(frame)
+            daily_metrics["daily_history_valid"] = bool(
+                (frame[["open", "high", "low", "close"]] > 0).all().all()
+                and (frame.index.to_series().diff().dropna() == timedelta(days=1)).all())
+        except (TypeError, ValueError):
+            daily_metrics["daily_history_valid"] = False
     except (IndexError, KeyError, TypeError, ValueError, OverflowError) as exc:
         return {
             "ready": False, "direction": None, "reason": "daily_data_invalid",
@@ -2739,7 +2752,7 @@ def _cached_daily_direction_gate(exchange, symbol, signal_at, span, cache, **kwa
     if saved is not None and saved[0] == key:
         return {**saved[1], "signal_at": signal_at.isoformat()}
     result = _daily_direction_gate(exchange, symbol, signal_at, span, **kwargs)
-    if result.get("reason") not in {
+    if result.get("daily_history_valid") is not False and result.get("reason") not in {
             "daily_data_unavailable", "daily_data_invalid", "daily_data_stale"}:
         cache.daily_direction[symbol] = (key, result)
     return result
@@ -2757,6 +2770,9 @@ def _cached_four_hour(exchange, symbol, now_ms, cache, *, prefetched=None):
     try:
         frame = ohlcv_frame(rows)
         validate_ohlcv(frame)
+        if ((frame[["open", "high", "low", "close"]] <= 0).any().any()
+                or not (frame.index.to_series().diff().dropna() == timedelta(hours=4)).all()):
+            return None
     except (IndexError, KeyError, TypeError, ValueError, OverflowError):
         return None
     if cache is not None:
@@ -2931,6 +2947,200 @@ def _ticker_observed_at(tickers, symbol):
         return datetime.fromtimestamp(int(timestamp) / 1000, timezone.utc)
     except (TypeError, ValueError, OverflowError, OSError):
         return None
+
+
+def _lead_structure(frame1, frame4, gate, settings, at):
+    """Structure only: no candle colour, EMA9, time filter or account gates."""
+    try:
+        for frame, hours, minimum in ((frame1, 1, 25),
+                                      (frame4, 4, settings.symbol_regime.ema_slow_bars)):
+            validate_ohlcv(frame)
+            boundary = pd.Timestamp(at).floor(f"{hours}h")
+            if (len(frame) < minimum or (frame[["open", "high", "low", "close"]] <= 0).any().any()
+                    or frame.index[-1] + timedelta(hours=hours) != boundary
+                    or not (frame.index.to_series().diff().dropna() == timedelta(hours=hours)).all()):
+                raise ValueError("incomplete closed candles")
+        close = float(frame1["close"].iloc[-1])
+        ema = float(frame4["close"].ewm(span=settings.symbol_regime.ema_slow_bars,
+                    adjust=False, min_periods=settings.symbol_regime.ema_slow_bars).mean().iloc[-1])
+        atr4, atr_pct, threshold = _atr_deviation_threshold(frame4, settings)
+        if threshold is None or not math.isfinite(ema) or ema <= 0:
+            raise ValueError("structure indicators unavailable")
+    except (AttributeError, KeyError, TypeError, ValueError, IndexError, OverflowError):
+        return {"status": "pending", "reason": "structure_data_unavailable"}
+    if gate.get("daily_history_valid") is False:
+        return {"status": "pending", "reason": "daily_history_invalid"}
+    if not gate.get("ready"):
+        reason = gate.get("reason") or "daily_data_unavailable"
+        return {"status": "removed" if reason == "daily_close_equals_ema50" else "pending",
+                "reason": reason}
+    side = deviation_structure_side(ema, close, settings, deviation_pct=threshold)
+    details = {"close": close, "closed_ema50": ema, "deviation_pct": close / ema - 1,
+               "closed_4h_atr": atr4, "closed_4h_atr_pct": atr_pct,
+               "deviation_threshold_pct": threshold, **_daily_gate_status_fields(gate)}
+    if side is None:
+        return {**details, "status": "removed", "reason": "deviation_structure_not_met"}
+    if _daily_direction_rejection_reason(gate, side) is not None:
+        return {**details, "status": "removed", "reason": "daily_structure_direction_changed"}
+    return {**details, "status": "active", "side": side.value, "reason": None}
+
+
+def _update_lead_pool(state, observations, at):
+    """Keep identity/history through read failures, ending only verified structures."""
+    counts = dict(added=0, retained=0, removed=0, pending=0)
+    bar = (at.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)).isoformat()
+    previous = state.mr_candidate_pool
+    pool = {}
+    for symbol in sorted(set(previous) | set(observations)):
+        old = previous.get(symbol)
+        result = observations.get(symbol, {"status": "pending", "reason": "universe_data_missing"})
+        status = result["status"]
+        changed = old and status == "active" and old.get("side") != result.get("side")
+        if old and (status == "removed" or changed):
+            counts["removed"] += 1
+            state.events.append({"event": "mr_candidate_removed", "at": at.isoformat(),
+                                 "symbol": symbol, "side": old.get("side"),
+                                 "first_seen_at": old.get("first_seen_at"),
+                                 "bar": bar, "reason": "direction_changed" if changed else result["reason"]})
+        if status == "removed":
+            continue
+        if status == "pending":
+            counts["pending"] += 1
+            _set_symbol_status(state, symbol, reason=result["reason"], at=at)
+            state.symbol_status[symbol]["candidate_status"] = "pending"
+            # There is no verified candidate identity for a never-seen failed read.
+            if old is None:
+                continue
+        base = {} if changed or old is None else old
+        first = base.get("first_seen_at") or at.isoformat()
+        pool[symbol] = {**base, **result, "symbol": symbol,
+                        "first_seen_at": first, "checked_at": at.isoformat(), "bar": bar,
+                        "pool_age_hours": max(0, (at - datetime.fromisoformat(first)).total_seconds() / 3600)}
+        if status == "active":
+            counts["retained" if base else "added"] += 1
+    state.mr_candidate_pool = pool
+    return counts
+
+
+def _lead_scan_recoveries(scan, symbols):
+    return [symbol for symbol in symbols if symbol not in scan.get("symbols", [])
+            or (scan.get("outcomes", {}).get(symbol, {}).get("status") == "blocked"
+                and scan["outcomes"][symbol].get("reason") == "candidate_structure_unverified")]
+
+
+def _build_lead_universe(exchange, state, settings, now, *, lead_market_ids,
+                         cache, candle_reader=None, on_progress=None):
+    """Scan every eligible Lead contract; the old score never caps coverage."""
+    started = time.monotonic()
+    at = now.replace(minute=0, second=0, microsecond=0)
+    now_ms = int(at.timestamp() * 1000)
+    bar = (at - timedelta(hours=1)).isoformat()
+    # Process-local cache is never trusted across a runner restart.
+    if cache.lead_universe_at is not None and cache.lead_universe_at.replace(
+            minute=0, second=0, microsecond=0) == at:
+        last = cache.lead_universe[-1]
+        if not (last.get("pending", 0) and _utc_now() <= at + timedelta(
+                seconds=settings.execution.confirm_delay_sec_max)
+                and (now - cache.lead_universe_at).total_seconds() >= 5):
+            return cache.lead_universe[:6]
+    # A failed or incomplete global response suspends eligibility; it never
+    # turns absent symbols into a proven structural failure.
+    observations = {}
+    try:
+        markets = exchange.load_markets()
+        tickers = exchange.fetch_tickers()
+    except ccxt.BaseError:
+        _update_lead_pool(state, {}, at)
+        cache.lead_universe_at = None
+        raise
+    candidates = _filter_lead_market_candidates(
+        filter_tradable_crypto_universe(markets, tickers, settings, now=at), markets, lead_market_ids)
+    eligible = {symbol for symbol, _ in candidates}
+    for symbol in state.mr_candidate_pool:
+        if symbol not in eligible:
+            observations[symbol] = {"status": "pending", "reason": "universe_eligibility_unverified"}
+            # Only explicit, complete market+ticker information can confirm
+            # that an existing candidate has lost basic trading eligibility.
+            ticker = tickers.get(symbol) or {}
+            try:
+                volume = float(ticker["quoteVolume"])
+                market = markets.get(symbol) or {}
+                info = market.get("info") or {}
+                verified = (math.isfinite(volume) and volume >= 0
+                            and {"id", "active", "swap", "quote", "settle"}.issubset(market)
+                            and {"contractType", "underlyingType", "underlyingSubType", "onboardDate"}.issubset(info))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                verified = False
+            if verified:
+                observations[symbol] = {"status": "removed", "reason": "trading_eligibility_lost"}
+    span = settings.symbol_regime.ema_slow_bars
+    daily_key = (now_ms // DAY_MS, span, settings.lookback.atr_len, MIN_DAILY_UNIVERSE_BARS)
+    requests, hourly_limits = [], {}
+    for symbol, _ in candidates:
+        saved = cache.lead_hourly.get(symbol)
+        limit = (2 if saved is not None and len(saved) >= 59
+                 and saved.index[-1] == pd.Timestamp(at - timedelta(hours=2)) else 60)
+        hourly_limits[symbol] = limit
+        requests.append((symbol, "1h", limit))
+        if cache.daily_direction.get(symbol, (None,))[0] != daily_key:
+            requests.append((symbol, "1d", max(span + 1, 100)))
+        if cache.four_hour.get(symbol, (None,))[0] != now_ms // FOUR_H_MS:
+            requests.append((symbol, "4h", 100))
+    try:
+        prefetched = candle_reader.read_many(requests, _public_read_deadline(now, settings),
+                                            monitor=on_progress) if candle_reader is not None else {}
+    except ccxt.BaseError:
+        _update_lead_pool(state, {}, now)
+        cache.lead_universe_at = None
+        raise
+    one_hour, current_hour = {}, {}
+    for symbol, volume in candidates:
+        if on_progress is not None:
+            on_progress()
+        try:
+            limit = hourly_limits[symbol]
+            rows = prefetched_read(prefetched, (symbol, "1h", limit),
+                                   lambda: exchange.fetch_ohlcv(symbol, "1h", limit=limit))
+            frame1 = ohlcv_frame(_closed(rows, HOUR_MS, now_ms))
+            if limit == 2:
+                frame1 = pd.concat([cache.lead_hourly[symbol], frame1])
+                closed_count = 59 if any(int(row[0]) >= now_ms for row in rows) else 60
+                frame1 = frame1.loc[~frame1.index.duplicated(keep="last")].sort_index().tail(closed_count)
+            frame4 = _cached_four_hour(exchange, symbol, now_ms, cache, prefetched=prefetched)
+            gate = _cached_daily_direction_gate(exchange, symbol, at, span, cache,
+                                                prefetched=prefetched, atr_period=settings.lookback.atr_len,
+                                                fail_on_market_error=True)
+            result = _lead_structure(frame1, frame4, gate, settings, at)
+            if frame4 is not None and len(frame4) < span:
+                cache.four_hour.pop(symbol, None)
+            if not gate.get("ready"):
+                cache.daily_direction.pop(symbol, None)
+            if result["reason"] != "structure_data_unavailable":
+                cache.lead_hourly[symbol] = frame1
+            one_hour[symbol] = frame1
+            observations[symbol] = {**result, "quote_volume_24h": volume}
+        except ccxt.BaseError as exc:
+            if isinstance(exc, (ccxt.RateLimitExceeded, ccxt.DDoSProtection, ccxt.AuthenticationError)):
+                _update_lead_pool(state, {}, now)
+                cache.lead_universe_at = None
+                raise
+            observations[symbol] = {"status": "pending", "reason": type(exc).__name__}
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+            observations[symbol] = {"status": "pending", "reason": "structure_data_unavailable"}
+    prepared = time.monotonic()
+    counts = _update_lead_pool(state, observations, now)
+    hotlist = [dict(row, rank=index) for index, row in enumerate(
+        sorted(state.mr_candidate_pool.values(), key=lambda row: row["symbol"]), 1)]
+    summary = {"event": "mr_candidate_pool_refreshed", "at": now.isoformat(), "bar": bar,
+               "eligible": len(candidates), "active": sum(row["status"] == "active" for row in hotlist),
+               **counts, "data_prepare_seconds": round(prepared - started, 4),
+               "pool_refresh_seconds": round(time.monotonic() - prepared, 4),
+               "within_entry_deadline": _utc_now() <= at + timedelta(seconds=settings.execution.confirm_delay_sec_max)}
+    state.events.append(summary)
+    logger.info("Lead MR candidate pool {}", json.dumps(summary, ensure_ascii=False))
+    cache.lead_universe = (markets, hotlist, one_hour, current_hour, tickers, [], counts)
+    cache.lead_universe_at = now
+    return cache.lead_universe[:6]
 
 
 def _build_universe(exchange, settings, now, now_ms, *, fail_on_market_error=False,
@@ -3503,6 +3713,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
     leverage = int(settings.sizing.leverage)
     lead_market_ids = (getattr(execution, "lead_market_ids", set())
                        if state.execution_mode == "lead_usdm" else None)
+    if lead_market_ids is not None and closed_market_cache is None:
+        closed_market_cache = ClosedMarketCache()
     if is_demo:
         _reconcile_pending_entries(execution, state, checkpoint)
     resume_symbols = (state.mr_entry_scan.get("symbols", [])
@@ -3589,13 +3801,18 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             exchange, track, settings, now_ms, fail_on_market_error=True,
         )
     else:
-        batch_kwargs = {"candle_reader": candle_reader} if candle_reader is not None else {}
-        markets, hotlist, one_hour, current_hour, tickers, legacy_hotlist = _build_universe(
-            exchange, settings, now, now_ms, fail_on_market_error=intrabar_entries,
-            on_progress=position_monitor, retry_reads=is_demo,
-            closed_market_cache=closed_market_cache, lead_market_ids=lead_market_ids,
-            **batch_kwargs,
-        )
+        if lead_market_ids is not None:
+            markets, hotlist, one_hour, current_hour, tickers, legacy_hotlist = _build_lead_universe(
+                exchange, state, settings, now, lead_market_ids=lead_market_ids,
+                cache=closed_market_cache, candle_reader=candle_reader, on_progress=position_monitor,
+            )
+        else:
+            batch_kwargs = {"candle_reader": candle_reader} if candle_reader is not None else {}
+            markets, hotlist, one_hour, current_hour, tickers, legacy_hotlist = _build_universe(
+                exchange, settings, now, now_ms, fail_on_market_error=intrabar_entries,
+                on_progress=position_monitor, retry_reads=is_demo,
+                closed_market_cache=closed_market_cache, **batch_kwargs,
+            )
         top_symbols = [row["symbol"] for row in hotlist]
         track = sorted(set(top_symbols) | set(state.portfolio.positions)
                        | set(resume_symbols) | set(local_pending_symbols))
@@ -3657,7 +3874,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
     if intrabar_entries and not _hotlist_cache_is_fresh(state, now):
         state.exit_management_by_symbol[HOTLIST_CACHE_KEY] = {"refreshed_at": now.isoformat()}
 
-    top_symbols = [row["symbol"] for row in hotlist]
+    top_symbols = [row["symbol"] for row in hotlist
+                   if lead_market_ids is None or row.get("status") == "active"]
     if candle_reader is not None and is_demo and closed_market_cache is not None:
         span = settings.symbol_regime.ema_slow_bars
         key = (now_ms // DAY_MS, span)
@@ -3709,6 +3927,8 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
         entry_wait_reason = "热度 Top20 候选；日线 EMA50 定方向，4H EMA50 偏离与已收盘 1H 反转确认；止损实时监控"
     else:
         entry_wait_reason = "热度 Top20 候选；开仓还需满足 EMA50 偏离与 1H 均值回归确认"
+    if lead_market_ids is not None:
+        entry_wait_reason = "均值回归结构候选；等待本小时 1H 方向与 EMA9 确认及风控审批"
 
     for row in hotlist:
         symbol = row["symbol"]
@@ -3718,7 +3938,7 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             regime = reg_frame.iloc[-1]["regime"]
             if isinstance(regime, Regime):
                 regime_value = regime.value
-        _set_symbol_status(state, symbol, reason=entry_wait_reason, at=now,
+        _set_symbol_status(state, symbol, reason=(row.get("reason") or entry_wait_reason), at=now,
                            regime=regime_value)
 
     if is_demo:
@@ -3753,13 +3973,18 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
         _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
                         fee_rate, slip_rate, now)
         mr_scan.checkpoint(checkpoint)
+    if lead_market_ids is not None:
+        latest_bar = pd.Timestamp(now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
     scan = state.mr_entry_scan
     entry_due = (latest_bar is not None and
                  ((is_demo and (scan.get("bar") != latest_bar.isoformat()
                                 or scan.get("status") not in {"completed", "expired"}))
                   or (not is_demo and new_exit_bar)))
+    if lead_market_ids is not None and scan.get("bar") == latest_bar.isoformat():
+        entry_due = entry_due or (not mr_scan.expired(scan, _utc_now())
+                                  and bool(_lead_scan_recoveries(scan, top_symbols)))
     if entry_due:
-        if state.execution_mode == "lead_usdm":
+        if state.execution_mode == "lead_usdm" and ranked_hotlist:
             try:
                 _record_lead_whitelist_observation(
                     state, execution, ranked_hotlist, hotlist, markets, latest_bar, now,
@@ -4594,18 +4819,39 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
             daily_direction_gate=daily_direction_gate, position_monitor=position_monitor,
             closed_market_cache=closed_market_cache,
         )
+    evaluation_started = time.monotonic()
+    signal_seconds = execution_seconds = 0.0
+    pending_phase = None
     bars = [frame.index[-1] for frame in one_hour.values() if frame is not None and len(frame)]
-    if not bars:
+    lead = state.execution_mode == "lead_usdm"
+    if not bars and not lead:
         return
-    scan = mr_scan.scan_for(state, max(bars), top_symbols,
+    target_bar = (pd.Timestamp(now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
+                  if lead else max(bars))
+    scan = mr_scan.scan_for(state, target_bar, top_symbols,
                             settings.execution.confirm_delay_sec_max, checkpoint)
+    if lead and not mr_scan.expired(scan, _utc_now()):
+        recovered = _lead_scan_recoveries(scan, top_symbols)
+        if recovered:
+            for symbol in recovered:
+                if symbol not in scan["symbols"]:
+                    scan["symbols"].append(symbol)
+                else:
+                    scan["outcomes"][symbol].update(status="retry")
+                    scan["outcomes"][symbol].pop("reason", None)
+            scan["status"] = "pending"
+            mr_scan.checkpoint(checkpoint)
     if scan["status"] in {"completed", "expired"}:
         return
     _reconcile_structure_invalidation_cooldowns(state)
     reentry = _structure_reentry_states(state.events, scan["symbols"])
 
     def finish(symbol, status, **details):
-        return mr_scan.outcome(state, scan, symbol, status, _utc_now(), checkpoint, **details)
+        # Pure signal discovery is checkpointed as a batch before execution.
+        # Every submission/uncertain result still uses its existing durable gate.
+        save = (None if lead and status in {"evaluating", "candidate", "evaluated", "blocked", "expired"}
+                else checkpoint)
+        return mr_scan.outcome(state, scan, symbol, status, _utc_now(), save, **details)
 
     def failure(symbol, exc):
         row = scan["outcomes"][symbol]
@@ -4636,6 +4882,8 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
             return
         # First attempt every candidate, then retry only unfinished reads once.
         for _ in range(2):
+            signal_started = time.monotonic()
+            pending_phase = "signal"
             candidates = []
             for symbol in scan["symbols"]:
                 row = scan["outcomes"].get(symbol)
@@ -4646,6 +4894,9 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                     continue
                 if mr_scan.expired(scan, _utc_now()):
                     finish(symbol, "expired", reason="original_signal_deadline")
+                    continue
+                if lead and symbol not in top_symbols:
+                    finish(symbol, "blocked", reason="candidate_structure_unverified")
                     continue
                 if len(state.portfolio.positions) >= max_pos:
                     finish(symbol, "blocked", reason="position_limit")
@@ -4660,7 +4911,7 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                         closed_market_cache=closed_market_cache, scan_row=row,
                     )
                     if candidate is None:
-                        finish(symbol, "evaluated", reason="no_eligible_signal")
+                        finish(symbol, "evaluated", reason=row.get("reason") or "no_eligible_signal")
                     else:
                         finish(symbol, "candidate", side=candidate[2].value,
                                candidate_priority=candidate[1])
@@ -4672,6 +4923,11 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                         scan["status"] = "paused"
                         return
             candidates.sort(key=_entry_priority_sort_key)
+            if lead:
+                mr_scan.checkpoint(checkpoint)
+            signal_seconds += time.monotonic() - signal_started
+            execution_started = time.monotonic()
+            pending_phase = "execution"
             for candidate in candidates:
                 symbol = candidate[0]
                 row = scan["outcomes"][symbol]
@@ -4705,12 +4961,25 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                     if not failure(symbol, exc):
                         scan["status"] = "paused"
                         return
+            execution_seconds += time.monotonic() - execution_started
+            pending_phase = None
         scan["status"] = ("expired" if any(row["status"] == "expired"
                                           for row in scan["outcomes"].values()) else "completed")
     finally:
+        if pending_phase == "signal":
+            signal_seconds += time.monotonic() - signal_started
+        elif pending_phase == "execution":
+            execution_seconds += time.monotonic() - execution_started
         state.events.append({"event": "entry_scan_finished", "at": _utc_now().isoformat(),
                              "bar": scan["bar"], "deadline": scan["deadline"],
                              "status": scan["status"], "symbols": len(scan["symbols"]),
+                             "signal_check_seconds": round(signal_seconds, 4),
+                             "execution_prepare_seconds": round(execution_seconds, 4),
+                             "total_seconds": round(time.monotonic() - evaluation_started, 4),
+                             "within_entry_deadline": not mr_scan.expired(scan, _utc_now()),
+                             "valid_signals": sum("candidate_priority" in row for row in scan["outcomes"].values()),
+                             "reasons": {s: r.get("reason") for s, r in scan["outcomes"].items()
+                                         if r.get("reason")},
                              "outcomes": {s: r["status"] for s, r in scan["outcomes"].items()}})
         mr_scan.checkpoint(checkpoint)
 

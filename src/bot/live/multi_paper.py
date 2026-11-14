@@ -54,6 +54,7 @@ class MultiPaperState:
     pending_by_symbol: dict[str, dict[str, Any]] = field(default_factory=dict)
     mr_entry_scan: dict[str, Any] = field(default_factory=dict)
     mr_entry_attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    mr_candidate_pool: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_processed_by_symbol: dict[str, str] = field(default_factory=dict)
     last_observed_by_symbol: dict[str, str] = field(default_factory=dict)
     mark_prices: dict[str, float] = field(default_factory=dict)
@@ -137,6 +138,7 @@ class MultiPaperState:
             "pending_by_symbol": self.pending_by_symbol,
             "mr_entry_scan": self.mr_entry_scan,
             "mr_entry_attempts": self.mr_entry_attempts,
+            "mr_candidate_pool": self.mr_candidate_pool,
             "last_processed_by_symbol": self.last_processed_by_symbol,
             "last_observed_by_symbol": self.last_observed_by_symbol,
             "mark_prices": self.mark_prices,
@@ -191,6 +193,7 @@ class MultiPaperState:
             pending_by_symbol=data.get("pending_by_symbol", {}),
             mr_entry_scan=data.get("mr_entry_scan", {}),
             mr_entry_attempts=data.get("mr_entry_attempts", {}),
+            mr_candidate_pool=data.get("mr_candidate_pool", {}),
             last_processed_by_symbol=data.get("last_processed_by_symbol", {}),
             last_observed_by_symbol=data.get("last_observed_by_symbol", {}),
             mark_prices=data.get("mark_prices", {}), watchlist=data.get("watchlist", []),
