@@ -483,6 +483,80 @@ def _position_management_observation(position: dict[str, Any], watch: dict[str, 
     }
 
 
+def _candidate_time(raw):
+    try:
+        value = datetime.fromisoformat(raw)
+        return value.astimezone(timezone.utc) if value.tzinfo is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _candidate_observation(state, row, now, settings):
+    """Describe recorded evidence only; never fetch candles or infer a signal."""
+    bar = _candidate_time(row.get("bar"))
+    target = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    fresh = bar == target
+    first = _candidate_time(row.get("first_seen_at"))
+    checked = _candidate_time(row.get("checked_at"))
+    scan = state.get("mr_entry_scan", {})
+    outcome = (scan.get("outcomes", {}).get(row["symbol"], {})
+               if fresh and _candidate_time(scan.get("bar")) == bar else {})
+    if ((outcome.get("bar") and _candidate_time(outcome["bar"]) != bar)
+            or (outcome.get("side") and outcome["side"] != row.get("side"))):
+        outcome = {}
+    reason_labels = {
+        "no_eligible_signal": "本小时未形成完整入场信号",
+        "ema9_reclaim_unconfirmed": "EMA9 未发生同方向收复／跌破",
+        "original_signal_deadline": "已超过原 1H 信号有效期",
+        "hourly_bar_stale": "1H 信号已过期",
+        "position_limit": "持仓数量已达上限", "max_positions_reached": "持仓数量已达上限",
+        "market_risk_pause": "BTC 风险暂停新开仓",
+        "account_not_synchronized": "账户尚未同步",
+        "candidate_structure_unverified": "候选结构待核验",
+        "stop_too_wide": "结构止损距离过宽", "stop_too_tight": "结构止损距离过窄",
+        "atr_deviation_not_met": "偏离未达到动态门槛",
+        "entry_deviation_unavailable": "偏离指标不可用",
+        "structure_reentry_confirmation_required": "等待结构重新确认",
+        "time_filter_data_unavailable": "时段过滤数据不完整",
+        "structure_data_unavailable": "结构行情缺失、过期或无效",
+        "daily_history_invalid": "日线历史无效或不连续",
+        "universe_data_missing": "市场列表缺项，保留上次结构",
+        "universe_eligibility_unverified": "交易资格待核验",
+        "RequestTimeout": "行情请求超时", "NetworkError": "行情网络异常",
+    }
+    labels = {"evaluating": "正在核验", "retry": "等待读取重试", "evaluated": "本小时未触发",
+              "candidate": "完整信号已确认", "rejected": "执行未放行", "blocked": "新开仓受限",
+              "pending_limit": "限价单等待成交", "opened": "本小时已开仓",
+              "reconciled": "本小时委托已对账", "expired": "本小时信号已过期",
+              "uncertain": "委托结果待确认", "error": "核验异常"}
+    status = row.get("status") if fresh else "pending"
+    reason = outcome.get("reason")
+    ema9 = (False if reason == "ema9_reclaim_unconfirmed" else
+            True if isinstance(outcome.get("candidate_priority"), dict)
+            and outcome["candidate_priority"] else None)
+    signal_label = labels.get(outcome.get("status"), "本小时尚未评估")
+    if status != "active":
+        signal_label, ema9 = "暂停该币新开仓", None
+        reason = row.get("reason") if fresh else "candidate_structure_unverified"
+    if row["symbol"] in state.get("positions", {}):
+        signal_label = "已有持仓，继续持仓管理"
+    closed_at = bar + timedelta(hours=1) if bar is not None else None
+    deadline = (closed_at + timedelta(seconds=settings.execution.confirm_delay_sec_max)
+                if closed_at is not None else None)
+    return {
+        "side": row.get("side"), "daily_direction": row.get("daily_direction"),
+        "status": status or "pending", "structure_fresh": fresh,
+        "first_seen_at": first.isoformat() if first else None,
+        "checked_at": checked.isoformat() if checked else None,
+        "age_hours": max(0, (now - first).total_seconds() / 3600) if first else None,
+        "signal": {"label": signal_label, "reason": reason,
+                   "detail": reason_labels.get(reason, "其他已记录原因" if reason else ""),
+                   "ema9_confirmed": ema9,
+                   "bar_close_at": closed_at.isoformat() if closed_at else None,
+                   "window_open": bool(fresh and closed_at <= now <= deadline) if deadline else None},
+    }
+
+
 def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], market_error: str | None = None,
                          state_updated_at: float | None = None, settings=None,
                          now: datetime | None = None) -> dict[str, Any]:
@@ -634,6 +708,19 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
     day_start = state.get("day_start_equity")
     drawdown = (float(day_start) - equity) / float(day_start) if day_start and float(day_start) > 0 else None
 
+    structure_pool = (lead_mode and "mr_candidate_pool" in state
+                      and state.get("strategy_variant") == "ema50_daily_gate_closed_h1_mean_reversion")
+    entry_gates = []
+    if structure_pool:
+        if state.get("daily_halted"):
+            entry_gates.append("日内停开锁生效")
+        if state.get("execution_status") != "synchronized":
+            entry_gates.append("账户同步或委托对账未完成")
+        if state.get("market_risk_status", {}).get("state") == "PAUSE_NEW":
+            entry_gates.append("BTC 风险暂停新开仓")
+        if any(row.get("status") in {"submitting", "uncertain", "protected", "limit_pending"}
+               for row in state.get("mr_entry_attempts", {}).values()):
+            entry_gates.append("已有委托待成交或对账")
     watchlist = []
     for row in state.get("watchlist", []):
         symbol = row["symbol"]
@@ -644,9 +731,12 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
             **row, "price": float(price) if price is not None else None,
             "quote_volume_24h": float(ticker.get("quoteVolume") or row.get("quote_volume_24h") or 0),
             "regime": status.get("regime", "--"), "action": status.get("action", "NONE"),
-            "side": status.get("side"), "signal_reason": status.get("reason", "--"),
+            "side": row.get("side") if structure_pool else status.get("side"),
+            "signal_reason": status.get("reason", "--"),
             "signal_at": status.get("at"),
             "position": next((item for item in positions if item["symbol"] == symbol), None),
+            **({"candidate_observation": _candidate_observation(state, row, now, settings)}
+               if structure_pool else {}),
         })
     watch_by_symbol = {row["symbol"]: row for row in watchlist}
     for position in positions:
@@ -702,6 +792,8 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
         "daily_drawdown": drawdown, "daily_halted": bool(state.get("daily_halted", False)),
         "position": positions[0] if len(positions) == 1 else None, "positions": positions,
         "watchlist": watchlist, "pending_entries": pending_entries,
+        "watchlist_model": "structure_pool" if structure_pool else "ranked_hotlist",
+        "entry_gate_labels": entry_gates,
         "market_risk_status": state.get("market_risk_status", {}),
         "strategy_variant": state.get("strategy_variant", "immediate_baseline"),
         "trade_count": len(closes) + len(external_closes),

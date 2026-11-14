@@ -19,6 +19,108 @@ def test_dashboard_frontend_treats_lead_portfolio_as_an_exchange_account():
     assert "x.trailing_started?'2R追踪已启动'" in html
 
 
+def structure_pool_state():
+    symbol = "AAA/USDT:USDT"
+    row = {"symbol": symbol, "rank": 1, "side": "short", "daily_direction": "short",
+           "status": "active", "bar": "2026-11-14T04:00:00+00:00",
+           "first_seen_at": "2026-11-14T04:00:00+00:00", "checked_at": "2026-11-14T05:00:01+00:00",
+           "deviation_pct": .05, "deviation_threshold_pct": .016, "closed_ema50": 100.,
+           "quote_volume_24h": 50_000_000}
+    return {"version": 2, "account_type": "multi_symbol_paper", "execution_mode": "lead_usdm",
+            "execution_status": "synchronized", "strategy_variant": "ema50_daily_gate_closed_h1_mean_reversion",
+            "initial_equity": 1000, "cash": 1000, "positions": {}, "events": [],
+            "daily_halted": True, "mr_candidate_pool": {symbol: row.copy()}, "watchlist": [row],
+            "symbol_status": {symbol: {"side": None, "action": "NONE", "reason": "waiting"}},
+            "mr_entry_scan": {"bar": row["bar"], "status": "completed", "outcomes": {
+                symbol: {"bar": row["bar"], "status": "evaluated", "reason": "ema9_reclaim_unconfirmed"}}}}
+
+
+def pool_snapshot(state, at="2026-11-14T05:00:30+00:00"):
+    return build_multi_snapshot(state, tickers={}, settings=load_settings(env_file=None),
+                                now=datetime.fromisoformat(at))
+
+
+def test_structure_dashboard_preserves_pool_direction_and_shows_recorded_confirmation():
+    state = structure_pool_state()
+    before = json.dumps(state)
+    data = pool_snapshot(state)
+    row = data["watchlist"][0]
+    assert data["watchlist_model"] == "structure_pool"
+    assert row["side"] == "short"  # Generic waiting status has no side.
+    assert "hot_score" not in row
+    observation = row["candidate_observation"]
+    assert observation["daily_direction"] == "short"
+    assert observation["age_hours"] == pytest.approx(1 + 30 / 3600)
+    assert observation["signal"]["ema9_confirmed"] is False
+    assert observation["signal"]["window_open"] is True
+    assert "EMA9" in observation["signal"]["detail"]
+    assert data["entry_gate_labels"] == ["日内停开锁生效"]
+    assert json.dumps(state) == before
+    json.dumps(data, allow_nan=False)
+
+
+@pytest.mark.parametrize("mismatch", ["scan_bar", "outcome_bar", "outcome_side"])
+def test_structure_dashboard_does_not_reuse_confirmation_from_another_signal(mismatch):
+    state = structure_pool_state()
+    outcome = state["mr_entry_scan"]["outcomes"]["AAA/USDT:USDT"]
+    outcome.update(status="candidate", reason=None, candidate_priority={"deviation_zone": 2})
+    if mismatch == "scan_bar":
+        state["mr_entry_scan"]["bar"] = "2026-11-14T03:00:00+00:00"
+    elif mismatch == "outcome_bar":
+        outcome["bar"] = "2026-11-14T03:00:00+00:00"
+    else:
+        outcome["side"] = "long"
+    signal = pool_snapshot(state)["watchlist"][0]["candidate_observation"]["signal"]
+    assert signal["ema9_confirmed"] is None
+    assert signal["label"] == "本小时尚未评估"
+
+
+def test_structure_dashboard_keeps_confirmation_separate_from_expiry_and_account_gates():
+    state = structure_pool_state()
+    state["mr_entry_scan"]["outcomes"]["AAA/USDT:USDT"].update(
+        status="candidate", reason=None, candidate_priority={"deviation_zone": 2})
+    state["market_risk_status"] = {"state": "PAUSE_NEW"}
+    data = pool_snapshot(state, "2026-11-14T05:01:01+00:00")
+    signal = data["watchlist"][0]["candidate_observation"]["signal"]
+    assert signal["ema9_confirmed"] is True
+    assert signal["window_open"] is False
+    assert "日内停开锁生效" in data["entry_gate_labels"]
+    assert "BTC 风险暂停新开仓" in data["entry_gate_labels"]
+
+
+@pytest.mark.parametrize("pending", [True, False])
+def test_structure_dashboard_marks_pending_and_old_structure_without_faking_freshness(pending):
+    state = structure_pool_state()
+    row = state["watchlist"][0]
+    if pending:
+        row.update(status="pending", reason="RequestTimeout")
+    else:
+        row["bar"] = "2026-11-14T03:00:00+00:00"
+    observation = pool_snapshot(state)["watchlist"][0]["candidate_observation"]
+    assert observation["status"] == "pending"
+    assert observation["signal"]["ema9_confirmed"] is None
+    assert observation["signal"]["label"] == "暂停该币新开仓"
+    assert observation["signal"]["detail"]
+
+
+def test_structure_dashboard_does_not_guess_ema9_from_generic_no_signal():
+    state = structure_pool_state()
+    state["mr_entry_scan"]["outcomes"]["AAA/USDT:USDT"]["reason"] = "no_eligible_signal"
+    observation = pool_snapshot(state)["watchlist"][0]["candidate_observation"]
+    assert observation["signal"]["ema9_confirmed"] is None
+    assert observation["signal"]["detail"] == "本小时未形成完整入场信号"
+
+
+def test_legacy_dashboard_keeps_ranking_when_structure_pool_is_not_in_use():
+    state = structure_pool_state()
+    state["execution_mode"] = "demo_usdm"
+    state["watchlist"][0]["hot_score"] = 82.5
+    data = pool_snapshot(state)
+    assert data["watchlist_model"] == "ranked_hotlist"
+    assert data["watchlist"][0]["hot_score"] == 82.5
+    assert "candidate_observation" not in data["watchlist"][0]
+
+
 def sample_state():
     opened = datetime(2026, 9, 29, 1, tzinfo=timezone.utc).isoformat()
     return {
