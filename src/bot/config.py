@@ -460,9 +460,11 @@ class RuntimeSettings(BaseSettings):
     bot_mode: Literal["paper", "live"] = "paper"
     log_level: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     config_path: Path = Path("configs/default.yaml")
+    vsb_execution_mode: Literal["DISABLED", "SHADOW", "LIVE"] | None = None
 
 
 class Settings(Section):
+    vsb_execution_mode: Literal["DISABLED", "SHADOW", "LIVE"] = "SHADOW"
     exchange: Literal["binanceusdm"]
     market_type: Literal["swap"]
     settle: Literal["USDT"]
@@ -519,6 +521,8 @@ def load_settings(config_path: str | Path | None = None, *, env_file: str | Path
         raise ValueError("configuration must be a YAML mapping")
     if "runtime" in payload:
         raise ValueError("runtime settings must come from environment, not YAML")
+    if runtime.vsb_execution_mode is not None:
+        payload["vsb_execution_mode"] = runtime.vsb_execution_mode
     return Settings(**payload, runtime=runtime)
 
 

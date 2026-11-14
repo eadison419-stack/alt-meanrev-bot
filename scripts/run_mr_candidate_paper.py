@@ -63,6 +63,7 @@ from bot.indicators import atr, validate_ohlcv
 from bot.live.multi_paper import MultiPaperState
 from bot.live.paper import effective_max_hold_hours, runner_tail_is_exempt
 from bot.live import mr_scan
+from bot.live.vsb_shadow import VsbShadowLedger
 from bot.market_risk import (MarketRiskAssessment, MarketRiskState,
                              fetch_market_risk_status)
 from bot.mr_candidate import (MidExitState, staged_profit_lock_stop,
@@ -2063,6 +2064,8 @@ def _prepare_lead_manual_position(execution, symbol, exchange_position, at, *,
     entry_price = float(recovered["entry_price"])
     adverse = (ema4 - entry_price) / ema4 if side is Side.LONG else (entry_price - ema4) / ema4
     tag = "MR" if adverse >= threshold else "VSB"
+    if tag == "VSB" and settings.vsb_execution_mode != "LIVE":
+        raise RuntimeError("new manual VSB adoption requires vsb_execution_mode=LIVE")
     frozen_strategy = {"strategy_tag": tag}
     if tag == "VSB":
         # A retracement entry may fill up to three hours after the signal.
@@ -3032,6 +3035,8 @@ def _lead_structure(frame1, frame4, gate, settings, at):
         tag = "MR"
     elif (mr_side is not side and near_ema and squeeze["squeeze_complete"]
           and 6 <= squeeze["sqz_bars"] <= 36):
+        if settings.vsb_execution_mode == "DISABLED":
+            return {**details, "status": "removed", "reason": "vsb_disabled"}
         tag = "VSB"
     else:
         return {**details, "status": "removed", "reason": "deviation_structure_not_met"}
@@ -3769,7 +3774,7 @@ def _reconcile_pending_entries(execution, state, checkpoint):
 def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
            intrabar_entries=False, market_cache: IntrabarMarketCache | None = None,
            position_monitor=None, closed_market_cache: ClosedMarketCache | None = None,
-           checkpoint=None, candle_reader=None):
+           checkpoint=None, candle_reader=None, vsb_shadow=None):
     now_ms = int(now.timestamp() * 1000)
     fee_rate = settings.fees.taker_bps / 10_000
     slip_rate = settings.fees.slippage_bps / 10_000
@@ -4008,6 +4013,9 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
         if not _demo_sync_stopped(execution, state, now):
             logger.error("{} positions do not match the local ledger; entries paused",
                          _execution_label(execution, state))
+            if vsb_shadow is not None:
+                _run_vsb_shadow_cycle(exchange, vsb_shadow, state, one_hour, four_hour, regimes,
+                                      settings, now, market_risk, closed_market_cache)
             return
         if _demo_stop_audit_due(state, now):
             _audit_demo_protective_stops(execution, state, now)
@@ -4093,6 +4101,83 @@ def _cycle(exchange, execution, state, settings, now, is_demo, max_pos,
             state.mark_prices[symbol] = price
         elif frame is not None and len(frame):
             state.mark_prices[symbol] = float(frame["close"].iloc[-1])
+
+    # Virtual discovery and all extra public reads follow the MR submission path.
+    if vsb_shadow is not None:
+        _run_vsb_shadow_cycle(exchange, vsb_shadow, state, one_hour, four_hour, regimes,
+                              settings, now, market_risk, closed_market_cache)
+
+
+def _live_entry_symbols(state, symbols, settings):
+    if settings.vsb_execution_mode == "LIVE":
+        return symbols
+    return [symbol for symbol in symbols
+            if state.mr_candidate_pool.get(symbol, {}).get("strategy_tag", "MR") != "VSB"]
+
+
+def _run_vsb_shadow_cycle(exchange, shadow, live_state, one_hour, four_hour, regimes,
+                          settings, now, market_risk, cache):
+    """No execution service is accepted here. Failures stay in the shadow account."""
+    try:
+        shadow_frames = dict(one_hour)
+        for symbol in shadow.symbols - set(shadow_frames):
+            rows = exchange.fetch_ohlcv(symbol, "1h", limit=60)
+            closed = _closed(rows, HOUR_MS, int(_utc_now().timestamp() * 1000))
+            if closed:
+                shadow_frames[symbol] = ohlcv_frame(closed)
+        shadow.hourly(shadow_frames, now)
+        _monitor_vsb_shadow(exchange, shadow, settings, _utc_now())
+        if settings.vsb_execution_mode != "SHADOW":
+            shadow.tick({}, now, allow_pending=False)
+            return
+        shadow.state.mr_candidate_pool = {
+            s: dict(row) for s, row in live_state.mr_candidate_pool.items()
+            if row.get("strategy_tag") == "VSB" and row.get("status") == "active"}
+        reentry = _structure_reentry_states(shadow.state.events, shadow.state.mr_candidate_pool)
+        candidates = []
+        for symbol in shadow.state.mr_candidate_pool:
+            if shadow.state.last_observed_by_symbol.get(symbol) == now.replace(
+                    minute=0, second=0, microsecond=0).isoformat():
+                continue
+            candidate = _entry_candidate(exchange, shadow.state, True, symbol, one_hour, four_hour,
+                regimes, settings, now, reentry, closed_market_cache=cache)
+            if candidate is None:
+                continue
+            candidates.append(candidate)
+        candidates.sort(key=_entry_priority_sort_key)
+        for candidate in candidates:
+            symbol = candidate[0]
+            funding = _fetch_entry_funding_rate(exchange, symbol)
+            book = exchange.fetch_order_book(symbol, limit=5)
+            at = _utc_now()
+            quote, error = execution_quote(book, candidate[2], at,
+                                           max_age_sec=settings.execution.entry_quote_max_age_sec)
+            if error:
+                shadow.event("shadow_entry_rejected", at, symbol=symbol, reason=error)
+                continue
+            shadow.offer(candidate, quote["price"], at, funding, market_risk.state.value)
+        shadow.save()
+    except Exception as exc:
+        logger.warning("VSB shadow cycle failed: {}", type(exc).__name__)
+
+
+def _monitor_vsb_shadow(exchange, shadow, settings, now):
+    try:
+        quotes = {}
+        for symbol in shadow.symbols:
+            try:
+                row = exchange.fetch_ticker(symbol)
+            except ccxt.BaseError as exc:
+                shadow.event("shadow_quote_unavailable", now, symbol=symbol, error=type(exc).__name__)
+                if _is_rate_limit_error(exc):
+                    break
+                continue
+            price = _ticker_price({symbol: row}, symbol, int(now.timestamp() * 1000), max_age_ms=15000)
+            if price is not None:
+                quotes[symbol] = (price, _ticker_observed_at({symbol: row}, symbol))
+        shadow.tick(quotes, _utc_now(), allow_pending=settings.vsb_execution_mode == "SHADOW")
+    except Exception as exc:
+        logger.warning("VSB shadow monitor failed: {}", type(exc).__name__)
 
 
 def _evaluate_live_stop_exits(state, execution, is_demo, current_prices,
@@ -4516,6 +4601,10 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
     route = state.mr_candidate_pool.get(symbol, {})
     strategy_tag = route.get("strategy_tag", "MR")
     is_vsb = strategy_tag == "VSB"
+    if is_vsb and settings.vsb_execution_mode == "DISABLED":
+        if scan_row is not None:
+            scan_row["reason"] = "vsb_disabled"
+        return None
     if frame1 is not None and not is_vsb:
         frame1 = frame1.tail(frame1.attrs.get("mr_window_bars", len(frame1)))
     if frame1 is None or frame4 is None or len(frame1) < settings.lookback.atr_len + 1 or len(frame4) < span:
@@ -4778,6 +4867,11 @@ def _submit_entry_candidate(exchange, state, execution, is_demo, markets, candid
             candidate = (*candidate[:13], {"order_type": "market"}, candidate[-1])
     (symbol, _strength, side, close, stop, entry_atr, swing_low, swing_high,
      regime_value, reason, daily_gate, context, flags, execution_plan, funding_rate) = candidate
+    is_vsb = (execution_plan.get("strategy_tag") == "VSB"
+              or getattr(context, "strategy_tag", "MR") == "VSB"
+              or state.mr_candidate_pool.get(symbol, {}).get("strategy_tag") == "VSB")
+    if is_vsb and settings.vsb_execution_mode != "LIVE":
+        return None  # Defense in depth: no sizing, approval, credentials or executor.
     max_delay = timedelta(seconds=settings.execution.confirm_delay_sec_max)
     market_risk_state = market_risk.state.value
     def reject(reason, phase, details=None):
@@ -4960,6 +5054,7 @@ def _evaluate_entries(exchange, state, execution, is_demo, markets, top_symbols,
                       regimes, settings, max_pos, fee_rate, slip_rate, now,
                       market_risk, *, daily_direction_gate=False, position_monitor=None,
                       closed_market_cache=None, checkpoint=None):
+    top_symbols = _live_entry_symbols(state, top_symbols, settings)
     if not is_demo:
         return _evaluate_local_entries(
             exchange, state, execution, is_demo, markets, top_symbols, one_hour, four_hour,
@@ -5139,6 +5234,7 @@ def _evaluate_local_entries(exchange, state, execution, is_demo, markets, top_sy
                       regimes, settings, max_pos, fee_rate, slip_rate, now,
                       market_risk: MarketRiskAssessment, *, daily_direction_gate=False,
                       position_monitor=None, closed_market_cache=None):
+    top_symbols = _live_entry_symbols(state, top_symbols, settings)
     structure_reentry_states = {}
     if market_risk.state is MarketRiskState.PAUSE_NEW:
         logger.warning("New entries paused by BTC market risk gate: {}", market_risk.reason)
@@ -5358,11 +5454,18 @@ def main() -> int:
         market_cache = IntrabarMarketCache() if args.intrabar_entries else None
         closed_market_cache = ClosedMarketCache()
         candle_reader = CandleBatchReader(exchange, _utc_now)
+        vsb_shadow = None
+        shadow_path = PROJECT_ROOT / "data" / "vsb_shadow_ledger.json"
+        if mode.name == "lead_usdm" and (settings.vsb_execution_mode == "SHADOW" or shadow_path.exists()):
+            try:
+                vsb_shadow = VsbShadowLedger(shadow_path, settings)
+            except Exception as exc:
+                logger.warning("VSB shadow ledger unavailable: {}", type(exc).__name__)
         retry_after = _persisted_market_retry_after(state) if args.intrabar_entries else None
         market_failure_attempt = 0
         last_position_monitor_at = 0.0
 
-        def monitor_demo_positions(*, force=False):
+        def monitor_live_positions(*, force=False):
             nonlocal last_position_monitor_at
             if (not is_demo or not state.portfolio.positions
                     or rate_limit_cooldown_remaining() > 0):
@@ -5411,6 +5514,20 @@ def main() -> int:
                 checkpoint.try_save()
             return dirty
 
+        shadow_reads_allowed = False
+        last_shadow_monitor_at = 0.0
+
+        def monitor_demo_positions(*, force=False):
+            nonlocal last_shadow_monitor_at
+            dirty = monitor_live_positions(force=force)
+            monotonic_now = time.monotonic()
+            if (vsb_shadow is not None and shadow_reads_allowed and vsb_shadow.symbols
+                    and rate_limit_cooldown_remaining() <= 0
+                    and (force or monotonic_now - last_shadow_monitor_at >= 5)):
+                last_shadow_monitor_at = monotonic_now
+                _monitor_vsb_shadow(exchange, vsb_shadow, settings, _utc_now())
+            return dirty
+
         while True:
             cooldown_remaining = rate_limit_cooldown_remaining() if is_exchange_execution else 0.0
             if cooldown_remaining > 0:
@@ -5439,6 +5556,7 @@ def main() -> int:
                 time.sleep(min(float(args.poll), remaining))
                 continue
             cycle_completed = False
+            shadow_reads_allowed = False
             try:
                 monitor_demo_positions(force=True)
                 if checkpoint.failed:
@@ -5447,7 +5565,8 @@ def main() -> int:
                        intrabar_entries=args.intrabar_entries, market_cache=market_cache,
                        position_monitor=monitor_demo_positions if is_demo else None,
                        closed_market_cache=closed_market_cache, checkpoint=checkpoint,
-                       candle_reader=candle_reader)
+                       candle_reader=candle_reader, vsb_shadow=vsb_shadow)
+                shadow_reads_allowed = True
                 monitor_demo_positions()
                 market_failure_attempt = 0
                 retry_after = None
@@ -5481,6 +5600,7 @@ def main() -> int:
                                    getattr(exc, "mr_endpoint", "unidentified"), type(exc).__name__)
             except mr_scan.ScanCheckpointError:
                 logger.error("MR entry checkpoint failed; entries paused until storage recovers")
+            shadow_reads_allowed = True
             if (is_demo and not checkpoint.failed and rate_limit_cooldown_remaining() <= 0
                     and _background_reads_allowed(_utc_now())):
                 _reconcile_demo_funding(execution, state, _utc_now(),

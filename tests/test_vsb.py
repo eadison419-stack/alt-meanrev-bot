@@ -279,7 +279,7 @@ def test_manual_reconstruction_classifies_without_changing_stop_service(monkeypa
     def protect(position, **kwargs):
         stopped.append(kwargs["strategy_stop"])
         return dict(id="verified", stop_price=kwargs["strategy_stop"], amount=1.)
-    execution = SimpleNamespace(settings=load_settings(env_file=None), exchange=exchange,
+    execution = SimpleNamespace(settings=load_settings(env_file=None).model_copy(update={"vsb_execution_mode": "LIVE"}), exchange=exchange,
         lead_market_ids={"COINUSDT"}, adopt_manual_position_stop=protect)
     recovered = dict(side=side.value, quantity=1., entry_price=entry_price, opened_at=AT, entry_fee=.1)
     prepared = runner._prepare_lead_manual_position(execution, SYMBOL, {}, AT, recovered=recovered)
@@ -362,7 +362,7 @@ def test_manual_vsb_missing_box_blocks_before_installing_any_stop(monkeypatch):
     one, four = frames()
     one.loc[:, ["open", "high", "low", "close"]] = [100., 100.1, 99.9, 100.]
     monkeypatch.setattr(runner, "_adoption_closed_frame", lambda *a: one if a[3] == "1h" else four)
-    execution = SimpleNamespace(settings=load_settings(env_file=None), lead_market_ids={"COINUSDT"},
+    execution = SimpleNamespace(settings=load_settings(env_file=None).model_copy(update={"vsb_execution_mode": "LIVE"}), lead_market_ids={"COINUSDT"},
         exchange=SimpleNamespace(markets={SYMBOL: {}}, market=lambda s: {"id": "COINUSDT"}),
         adopt_manual_position_stop=lambda *a, **kw: pytest.fail("unverified context cannot install a stop"))
     with pytest.raises(RuntimeError, match="VSB squeeze box is unavailable"):

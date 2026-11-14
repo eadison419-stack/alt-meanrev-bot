@@ -2,6 +2,7 @@ exchange: binanceusdm
 market_type: swap
 settle: USDT
 timezone: Asia/Shanghai
+vsb_execution_mode: SHADOW # DISABLED, SHADOW, or LIVE; only VSB new entries.
 
 timeframes:
   regime: 4h
