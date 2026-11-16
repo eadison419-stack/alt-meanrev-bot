@@ -3653,7 +3653,8 @@ def _time_filter_block_reasons(flags, side, bar_close_time, settings):
 
 
 def _record_time_filter_decision(state, symbol, side, frame1, bar_close_time,
-                                 flags, settings, now, *, scan_row=None):
+                                 flags, settings, now, *, scan_row=None,
+                                 strategy_tag="MR"):
     reasons = _time_filter_block_reasons(flags, side, bar_close_time, settings)
     allowed = (flags.data_ready and not flags.flatten_only
                and (flags.allow_long_entry if side is Side.LONG else flags.allow_short_entry))
@@ -3670,7 +3671,7 @@ def _record_time_filter_decision(state, symbol, side, frame1, bar_close_time,
         "event": "entry_time_filter_decision",
         "at": now.isoformat(),
         "symbol": symbol,
-        "source": MEAN_REVERSION,
+        "source": "VSB" if strategy_tag == "VSB" else MEAN_REVERSION,
         "side": side.value,
         "decision": "ALLOW" if allowed else "BLOCK",
         "reason": "time_filter_allowed" if allowed else reasons[0],
@@ -3698,6 +3699,8 @@ def _record_time_filter_decision(state, symbol, side, frame1, bar_close_time,
         "runner_build_id": RUNNER_BUILD_ID,
         "time_filter_build_id": TIME_FILTER_BUILD_ID,
     }
+    if strategy_tag == "VSB":
+        event["strategy_tag"] = "VSB"
     state.events.append(event)
     if not allowed:
         if scan_row is not None:
@@ -4156,6 +4159,21 @@ def _run_vsb_shadow_cycle(exchange, shadow, live_state, one_hour, four_hour, reg
             closed = _closed(rows, HOUR_MS, int(_utc_now().timestamp() * 1000))
             if closed:
                 shadow_frames[symbol] = ohlcv_frame(closed)
+        for symbol in shadow.hourly_observation_symbols - set(shadow_frames) - shadow.symbols:
+            if not shadow.observation_fetch_due(symbol, now):
+                continue
+            shadow.mark_observation_fetch(symbol, now)
+            try:
+                rows = exchange.fetch_ohlcv(symbol, "1h", limit=60)
+            except ccxt.BaseError as exc:
+                if _is_rate_limit_error(exc):
+                    raise
+                shadow.event("vsb_filter_observation_data_unavailable", now,
+                             symbol=symbol, error=type(exc).__name__)
+                continue
+            closed = _closed(rows, HOUR_MS, int(_utc_now().timestamp() * 1000))
+            if closed:
+                shadow_frames[symbol] = ohlcv_frame(closed)
         shadow.hourly(shadow_frames, now)
         _monitor_vsb_shadow(exchange, shadow, settings, _utc_now())
         if settings.vsb_execution_mode != "SHADOW":
@@ -4173,6 +4191,10 @@ def _run_vsb_shadow_cycle(exchange, shadow, live_state, one_hour, four_hour, reg
             candidate = _entry_candidate(exchange, shadow.state, True, symbol, one_hour, four_hour,
                 regimes, settings, now, reentry, closed_market_cache=cache)
             if candidate is None:
+                continue
+            observation = candidate[13].get("vsb_time_filter_observation")
+            if observation is not None:
+                shadow.observe_time_filter_blocked(candidate, observation, _utc_now())
                 continue
             candidates.append(candidate)
         candidates.sort(key=_entry_priority_sort_key)
@@ -4701,10 +4723,28 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
         return None
     if scan_row is not None:
         scan_row["side"] = candidate_signal.side.value
-    if not _record_time_filter_decision(
-            state, symbol, candidate_signal.side, frame1, bar_close_time, flags,
-            settings, evaluated_at, scan_row=scan_row):
-        return None
+    time_filter_allowed = _record_time_filter_decision(
+        state, symbol, candidate_signal.side, frame1, bar_close_time, flags,
+        settings, evaluated_at, scan_row=scan_row, strategy_tag=strategy_tag,
+    )
+    time_filter_observation = None
+    if not time_filter_allowed:
+        filter_reasons = _time_filter_block_reasons(
+            flags, candidate_signal.side, bar_close_time, settings,
+        )
+        if (is_vsb and state.execution_mode == "vsb_shadow" and flags.data_ready
+                and filter_reasons):
+            time_filter_observation = {
+                "reasons": filter_reasons,
+                "recent_move_atr": flags.recent_move_atr,
+                "morning_move": flags.morning_move,
+                "afternoon_dump_today": flags.afternoon_dump_today,
+                "at_upper_extreme": flags.at_upper_extreme,
+                "at_lower_extreme": flags.at_lower_extreme,
+                "flatten_only": flags.flatten_only,
+            }
+        else:
+            return None
     sig = (candidate_signal if is_vsb else deviation_entry_signal(
         frame4["close"], candle, settings, flags, deviation_pct=DEV_PCT))
     if sig.action is not Action.OPEN:
@@ -4842,6 +4882,8 @@ def _entry_candidate(exchange, state, is_demo, symbol, one_hour, four_hour, regi
     execution_plan["candidate_priority"] = priority
     execution_plan.update(ema9_reclaim_side=ema9_side, deviation_threshold_pct=threshold,
                           closed_4h_atr_pct=atr4_pct, **strategy_metadata({"strategy_tag": strategy_tag, **squeeze}))
+    if time_filter_observation is not None:
+        execution_plan["vsb_time_filter_observation"] = time_filter_observation
     return (symbol, priority, sig.side, close, stop, entry_atr,
                        swing_low, swing_high, regime_value, sig.reason, daily_gate,
                        context, flags, execution_plan)

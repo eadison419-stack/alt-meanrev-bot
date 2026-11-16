@@ -18,6 +18,8 @@ from bot.vsb import strategy_metadata
 
 
 class VsbShadowLedger:
+    FILTER_OBSERVATION_HORIZONS = (1, 3, 6, 12, 24)
+
     def __init__(self, path, settings):
         self.path, self.settings = path, settings
         self.state = MultiPaperState.load(path)
@@ -30,6 +32,67 @@ class VsbShadowLedger:
     @property
     def symbols(self):
         return set(self.state.portfolio.positions) | set(self.state.pending_by_symbol)
+
+    @property
+    def hourly_observation_symbols(self):
+        return {event["symbol"] for event in self.state.events
+                if event.get("event") == "vsb_time_filter_observation"
+                and event.get("status") == "tracking" and event.get("symbol")}
+
+    def observation_fetch_due(self, symbol, at):
+        hour_key = at.replace(minute=0, second=0, microsecond=0).isoformat()
+        return any(event.get("event") == "vsb_time_filter_observation"
+                   and event.get("status") == "tracking" and event.get("symbol") == symbol
+                   and event.get("last_fetch_hour") != hour_key
+                   for event in self.state.events)
+
+    def mark_observation_fetch(self, symbol, at):
+        hour_key = at.replace(minute=0, second=0, microsecond=0).isoformat()
+        for event in self.state.events:
+            if (event.get("event") == "vsb_time_filter_observation"
+                    and event.get("status") == "tracking" and event.get("symbol") == symbol):
+                event["last_fetch_hour"] = hour_key
+
+    def observe_time_filter_blocked(self, candidate, filter_observation, at):
+        symbol, _priority, side, close, stop, entry_atr, _low, _high, _regime, _reason, _gate, context, _flags, plan = candidate
+        signal_at = context.bar_close_at
+        signal_key = signal_at.isoformat()
+        if any(event.get("event") == "vsb_time_filter_observation"
+               and event.get("symbol") == symbol and event.get("signal_at") == signal_key
+               for event in self.state.events):
+            return False
+        initial_risk = abs(float(close) - float(stop))
+        if not math.isfinite(initial_risk) or initial_risk <= 0:
+            return False
+        priority = plan.get("candidate_priority") or {}
+        safe_priority = {
+            "tier_bucket": int(priority.get("tier_bucket", 0)),
+            "is_market_order": int(priority.get("is_market_order", 0)),
+            "bar_quality": float(priority.get("bar_quality", 0.0)),
+            "space_r": float(priority.get("space_r", 0.0)),
+        }
+        self.event("vsb_time_filter_observation", at, symbol=symbol, side=side.value,
+            status="tracking", signal_at=signal_key, signal_bar_open_at=(signal_at - timedelta(hours=1)).isoformat(),
+            entry_reference="signal_close", entry_price=float(close), stop_price=float(stop),
+            initial_risk=initial_risk, entry_atr=float(entry_atr), order_type=plan.get("order_type"),
+            limit_price=plan.get("limit_price"), limit_expires_at=plan.get("limit_expires_at"),
+            breakout_level=context.breakout_level, closed_ema=context.closed_ema,
+            deviation_threshold_pct=context.deviation_pct,
+            box_high=plan.get("box_high"), box_low=plan.get("box_low"), box_mid=plan.get("box_mid"),
+            sqz_bars=plan.get("sqz_bars"), candidate_priority=safe_priority,
+            filter_reasons=list(filter_observation["reasons"]),
+            recent_move_atr=filter_observation.get("recent_move_atr"),
+            morning_move=filter_observation.get("morning_move"),
+            afternoon_dump_today=bool(filter_observation.get("afternoon_dump_today")),
+            at_upper_extreme=bool(filter_observation.get("at_upper_extreme")),
+            at_lower_extreme=bool(filter_observation.get("at_lower_extreme")),
+            flatten_only=bool(filter_observation.get("flatten_only")),
+            metric_basis="signal_close_price_only_before_costs",
+            horizon_hours=list(self.FILTER_OBSERVATION_HORIZONS), horizons={},
+            forward_mfe_r=0.0, forward_mae_r=0.0, observation_gaps=0,
+            last_observed_close_at=signal_key, initial_stop_touched=False)
+        self.save()
+        return True
 
     def save(self):
         self.state.save(self.path)
@@ -269,4 +332,88 @@ class VsbShadowLedger:
                 reason = "no_progress"
             if reason:
                 self.close(symbol, close, reason, now)
+        self._update_time_filter_observations(frames, now)
         self.save()
+
+    def _update_time_filter_observations(self, frames, now):
+        cutoff = now.replace(minute=0, second=0, microsecond=0)
+        for observation in self.state.events:
+            if (observation.get("event") != "vsb_time_filter_observation"
+                    or observation.get("status") != "tracking"):
+                continue
+            frame = frames.get(observation.get("symbol"))
+            if frame is None or frame.empty:
+                continue
+            try:
+                validate_ohlcv(frame)
+                signal_at = datetime.fromisoformat(observation["signal_at"])
+                last_close_at = datetime.fromisoformat(observation["last_observed_close_at"])
+                side = observation["side"]
+                direction = 1.0 if side == "long" else -1.0
+                entry = float(observation["entry_price"])
+                stop = float(observation["stop_price"])
+                risk = float(observation["initial_risk"])
+                if risk <= 0 or not math.isfinite(risk):
+                    observation["status"] = "invalid"
+                    continue
+            except (KeyError, TypeError, ValueError, OverflowError):
+                observation["status"] = "invalid"
+                continue
+
+            horizon_results = observation.setdefault("horizons", {})
+            for index, row in frame.iterrows():
+                bar_open = index.to_pydatetime() if hasattr(index, "to_pydatetime") else index
+                if bar_open.tzinfo is None:
+                    bar_open = bar_open.replace(tzinfo=signal_at.tzinfo)
+                bar_close_at = bar_open + timedelta(hours=1)
+                if bar_close_at <= last_close_at or bar_close_at <= signal_at or bar_close_at > cutoff:
+                    continue
+                expected_close = last_close_at + timedelta(hours=1)
+                if bar_close_at > expected_close:
+                    observation["observation_gaps"] += int(
+                        (bar_close_at - expected_close).total_seconds() // 3600)
+                high, low, close = float(row["high"]), float(row["low"]), float(row["close"])
+                favorable_price = high if direction > 0 else low
+                adverse_price = low if direction > 0 else high
+                favorable = max(0.0, direction * (favorable_price - entry) / risk)
+                adverse = max(0.0, -direction * (adverse_price - entry) / risk)
+                observation["forward_mfe_r"] = max(float(observation["forward_mfe_r"]), favorable)
+                observation["forward_mae_r"] = max(float(observation["forward_mae_r"]), adverse)
+                if not observation["initial_stop_touched"]:
+                    touched = low <= stop if direction > 0 else high >= stop
+                    if touched:
+                        observation["initial_stop_touched"] = True
+                        observation["initial_stop_touched_at"] = bar_close_at.isoformat()
+                elapsed_hours = int((bar_close_at - signal_at).total_seconds() // 3600)
+                for horizon in self.FILTER_OBSERVATION_HORIZONS:
+                    key = f"{horizon}h"
+                    target = signal_at + timedelta(hours=horizon)
+                    if key in horizon_results:
+                        continue
+                    if bar_close_at == target:
+                        horizon_results[key] = {
+                            "status": "complete" if observation["observation_gaps"] == 0 else "partial",
+                            "observed_at": bar_close_at.isoformat(),
+                            "forward_close_r": direction * (close - entry) / risk,
+                            "mfe_r": observation["forward_mfe_r"],
+                            "mae_r": observation["forward_mae_r"],
+                            "initial_stop_touched": observation["initial_stop_touched"],
+                            "observation_gaps": observation["observation_gaps"],
+                        }
+                    elif bar_close_at > target:
+                        horizon_results[key] = {"status": "missing_hourly_bar"}
+                observation["last_observed_close_at"] = bar_close_at.isoformat()
+                observation["last_forward_close_r"] = direction * (close - entry) / risk
+                last_close_at = bar_close_at
+                if elapsed_hours >= max(self.FILTER_OBSERVATION_HORIZONS):
+                    break
+
+            if cutoff >= signal_at + timedelta(hours=max(self.FILTER_OBSERVATION_HORIZONS)):
+                for horizon in self.FILTER_OBSERVATION_HORIZONS:
+                    key = f"{horizon}h"
+                    if key not in horizon_results:
+                        horizon_results[key] = {"status": "missing_hourly_bar"}
+                observation["status"] = (
+                    "complete" if horizon_results.get("24h", {}).get("status") == "complete"
+                    else "incomplete")
+                observation["completed_at"] = cutoff.isoformat()
