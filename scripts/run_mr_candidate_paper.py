@@ -3082,6 +3082,33 @@ def _update_lead_pool(state, observations, at):
     return counts
 
 
+_LEAD_CANDIDATE_HISTORY_FIELDS = (
+    "bar", "signal_at", "first_seen_at", "checked_at", "pool_age_hours",
+    "side", "close", "daily_direction", "closed_ema50", "deviation_pct",
+    "adverse_dev", "deviation_threshold_pct", "closed_4h_atr", "closed_4h_atr_pct",
+    "daily_close", "daily_ema50", "daily_atr", "daily_ema_distance_atr",
+    "daily_quote_volume_7d_avg", "quote_volume_24h", "squeeze_on",
+    "squeeze_complete", "squeeze_released", "sqz_bars", "box_high", "box_low",
+    "box_mid", "squeeze_volume_mean",
+)
+
+
+def _lead_candidate_history_by_strategy(candidate_pool):
+    grouped = {"MR": [], "VSB": []}
+    for symbol, row in sorted(candidate_pool.items()):
+        if row.get("status") != "active":
+            continue
+        strategy_tag = row.get("strategy_tag", "MR")
+        if strategy_tag not in grouped:
+            strategy_tag = "OTHER"
+            grouped.setdefault(strategy_tag, [])
+        member = {"symbol": symbol, "strategy_tag": strategy_tag, "status": "active"}
+        member.update({field: row[field] for field in _LEAD_CANDIDATE_HISTORY_FIELDS
+                       if field in row})
+        grouped[strategy_tag].append(member)
+    return grouped
+
+
 def _lead_scan_recoveries(scan, symbols):
     return [symbol for symbol in symbols if symbol not in scan.get("symbols", [])
             or (scan.get("outcomes", {}).get(symbol, {}).get("status") == "blocked"
@@ -3196,8 +3223,12 @@ def _build_lead_universe(exchange, state, settings, now, *, lead_market_ids,
     counts = _update_lead_pool(state, observations, now)
     hotlist = [dict(row, rank=index) for index, row in enumerate(
         sorted(state.mr_candidate_pool.values(), key=lambda row: row["symbol"]), 1)]
+    candidate_members = _lead_candidate_history_by_strategy(state.mr_candidate_pool)
     summary = {"event": "mr_candidate_pool_refreshed", "at": now.isoformat(), "bar": bar,
                "eligible": len(candidates), "active": sum(row["status"] == "active" for row in hotlist),
+               "candidate_counts_by_strategy": {tag: len(rows)
+                                                for tag, rows in candidate_members.items()},
+               "candidate_members_by_strategy": candidate_members,
                **counts, "data_prepare_seconds": round(prepared - started, 4),
                "pool_refresh_seconds": round(time.monotonic() - prepared, 4),
                "within_entry_deadline": _utc_now() <= at + timedelta(seconds=settings.execution.confirm_delay_sec_max)}
