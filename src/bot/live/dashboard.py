@@ -36,6 +36,29 @@ def _display_close_reason(reason: str | None) -> str | None:
     }.get(reason, reason)
 
 
+def _aware_event_time(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+
+
+def _latest_lead_statistics_period_start(events: list[dict[str, Any]]) -> datetime | None:
+    starts = [_aware_event_time(event.get("at")) for event in events
+              if event.get("event") == "lead_statistics_period_started"]
+    valid = [value for value in starts if value is not None]
+    return max(valid) if valid else None
+
+
+def _event_is_in_statistics_period(event: dict[str, Any], start: datetime | None) -> bool:
+    if start is None:
+        return True
+    opened_at = event.get("opened_at") or event.get("at")
+    event_at = _aware_event_time(opened_at)
+    return event_at is not None and event_at >= start
+
+
 def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None,
                          end_date: str | None = None,
                          current_positions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -48,6 +71,7 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
     upper = datetime.combine(end, datetime_time.max, SHANGHAI) if end else None
     fills = []
     source_events = state.get("events", [])
+    statistics_period_start = _latest_lead_statistics_period_start(source_events)
     exchange_source = _exchange_execution_source(state.get("execution_mode", ""))
     exchange_mode = exchange_source is not None
     if exchange_mode:
@@ -217,6 +241,8 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
         local_at = trade_date(trade)
         if local_at is None or (lower and local_at < lower) or (upper and local_at > upper):
             continue
+        if statistics_period_start and local_at.astimezone(timezone.utc) < statistics_period_start:
+            continue
         filtered.append(trade)
     filtered.sort(key=lambda row: row.get("opened_at") or row.get("closed_at") or "", reverse=True)
     sample_trades = [row for row in filtered if row.get("strategy_sample_eligible", True)]
@@ -273,7 +299,11 @@ def build_snapshot(state: dict[str, Any], *, price: float | None, market_error: 
     equity = cash + unrealized + float((state.get("isolated_margin") or {}).get("initial_margin", 0.0))
 
     events = state.get("events", [])
-    closes = [event for event in events if event.get("event") == "paper_fill" and event.get("action") == "CLOSE"]
+    statistics_period_start = _latest_lead_statistics_period_start(events)
+    statistics_events = [event for event in events
+                         if _event_is_in_statistics_period(event, statistics_period_start)]
+    closes = [event for event in statistics_events
+              if event.get("event") == "paper_fill" and event.get("action") == "CLOSE"]
     realized = sum(float(event.get("net_pnl", 0.0)) for event in closes)
     wins = sum(float(event.get("net_pnl", 0.0)) > 0 for event in closes)
     losses = sum(float(event.get("net_pnl", 0.0)) < 0 for event in closes)
@@ -633,6 +663,7 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     initial, cash = float(state["initial_equity"]), float(state["cash"])
     events = state.get("events", [])
+    statistics_period_start = _latest_lead_statistics_period_start(events)
     mark_prices = state.get("mark_prices", {})
     exit_states = state.get("exit_management_by_symbol", {})
     margin_states = state.get("isolated_margin_by_symbol", {})
@@ -642,6 +673,8 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
     if exchange_mode:
         events = [event for event in events if event.get("execution_source") == exchange_source
                   or event.get("event") == "external_position_reconciled_flat"]
+    statistics_events = [event for event in events
+                         if _event_is_in_statistics_period(event, statistics_period_start)]
     exchange_snapshot = state.get("exchange_snapshot", {}) if exchange_mode else {}
     exchange_positions = exchange_snapshot.get("positions", {})
     if exchange_mode:
@@ -753,10 +786,11 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
             position["stop_net_if_closed"] = None
     equity = (float(exchange_snapshot.get("equity")) if exchange_mode and exchange_snapshot.get("equity") is not None
               else cash + unrealized + sum(float(item.get("initial_margin", 0.0)) for item in margin_states.values()))
-    closes = [event for event in events if event.get("event") == "paper_fill" and event.get("action") == "CLOSE"
+    closes = [event for event in statistics_events
+              if event.get("event") == "paper_fill" and event.get("action") == "CLOSE"
               and event.get("strategy_sample_eligible", True)
               and event.get("net_pnl") is not None]
-    external_closes = [event for event in events if exchange_mode
+    external_closes = [event for event in statistics_events if exchange_mode
                        and event.get("event") == "external_position_reconciled_flat"
                        and event.get("strategy_sample_eligible", True)]
     recorded_external_closes = [event for event in external_closes
@@ -892,6 +926,7 @@ class DashboardService:
         self._display_mfe_prices: dict[str, tuple[str, str, float]] = {}
         self._equity_history: list[dict[str, Any]] = []
         self._last_equity_history_key: str | None = None
+        self._statistics_period_start: datetime | None = None
         self._hotlist_signature: tuple | None = None
         self._hotlist_observed_at: str | None = None
 
@@ -941,6 +976,11 @@ class DashboardService:
             state_stat = self.state_path.stat()
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
             if state.get("version") == 2:
+                statistics_period_start = _latest_lead_statistics_period_start(state.get("events", []))
+                if statistics_period_start != self._statistics_period_start:
+                    self._equity_history = []
+                    self._last_equity_history_key = None
+                    self._statistics_period_start = statistics_period_start
                 if (not self._tickers_cached_at
                         or time.monotonic() - self._tickers_cached_at
                         >= MULTI_DASHBOARD_TICKER_CACHE_SECONDS):

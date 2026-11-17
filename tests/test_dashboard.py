@@ -399,6 +399,90 @@ def test_verified_bot_stop_reconciliation_is_included_in_demo_trade_statistics()
     assert snapshot["realized_pnl"] == -10.4
 
 
+def test_lead_statistics_period_hides_old_trades_without_removing_archived_events():
+    symbol = "ADA/USDT:USDT"
+    marker = "2026-11-18T01:00:00+00:00"
+    state = {
+        "version": 2, "account_type": "multi_symbol_paper", "execution_mode": "lead_usdm",
+        "execution_status": "synchronized", "initial_equity": 500.0, "cash": 500.0,
+        "positions": {}, "watchlist": [], "inconsistencies": [], "foreign_order_ids": [],
+        "exchange_snapshot": {"positions": {}, "equity": 495.0,
+                              "at": "2026-11-18T01:04:00+00:00",
+                              "host": "https://fapi.binance.com"},
+        "events": [
+            {"event": "paper_fill", "execution_source": "binance_usdm_lead", "action": "OPEN",
+             "at": "2026-11-18T00:00:00+00:00", "symbol": symbol, "side": "long",
+             "quantity": 1.0, "price": 100.0},
+            {"event": "paper_fill", "execution_source": "binance_usdm_lead", "action": "CLOSE",
+             "at": "2026-11-18T00:30:00+00:00", "opened_at": "2026-11-18T00:00:00+00:00",
+             "symbol": symbol, "side": "long", "quantity": 1.0, "price": 110.0,
+             "net_pnl": 10.0},
+            {"event": "lead_statistics_period_started", "at": marker, "initial_equity": 500.0},
+            {"event": "paper_fill", "execution_source": "binance_usdm_lead", "action": "OPEN",
+             "at": "2026-11-18T01:01:00+00:00", "symbol": symbol, "side": "long",
+             "quantity": 1.0, "price": 100.0},
+            {"event": "paper_fill", "execution_source": "binance_usdm_lead", "action": "CLOSE",
+             "at": "2026-11-18T01:03:00+00:00", "opened_at": "2026-11-18T01:01:00+00:00",
+             "symbol": symbol, "side": "long", "quantity": 1.0, "price": 95.0,
+             "net_pnl": -5.0},
+        ],
+    }
+    before = json.dumps(state["events"])
+
+    orders = build_order_snapshot(state)
+    snapshot = build_multi_snapshot(
+        state, tickers={}, settings=load_settings(env_file=None),
+        now=datetime(2026, 11, 18, 1, 5, tzinfo=timezone.utc),
+    )
+
+    assert orders["trade_count"] == 1
+    assert orders["wins"] == 0
+    assert orders["losses"] == 1
+    assert orders["realized_pnl"] == -5.0
+    assert orders["trades"][0]["symbol"] == symbol
+    assert snapshot["trade_count"] == 1
+    assert snapshot["realized_pnl"] == -5.0
+    assert snapshot["total_pnl"] == -5.0
+    assert snapshot["win_rate"] == 0.0
+    assert json.dumps(state["events"]) == before
+
+
+def test_dashboard_equity_history_restarts_at_new_lead_statistics_period(tmp_path):
+    state_path = tmp_path / "portfolio.json"
+    state = {
+        "version": 2, "account_type": "multi_symbol_paper", "execution_mode": "lead_usdm",
+        "execution_status": "synchronized", "initial_equity": 500.0, "cash": 500.0,
+        "positions": {}, "watchlist": [], "events": [],
+        "exchange_snapshot": {"at": "2026-11-18T01:00:00+00:00", "equity": 500.0,
+                              "positions": {}, "host": "https://fapi.binance.com"},
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    class FakeExchange:
+        def fetch_tickers(self):
+            return {}
+
+    service = DashboardService(state_path, None, FakeExchange(), load_settings(env_file=None))
+    first = service.snapshot()
+    state["exchange_snapshot"].update(at="2026-11-18T01:00:30+00:00", equity=501.0)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    service._cached_at = 0
+    second = service.snapshot()
+    assert len(second["equity_history"]) == 2
+
+    state["events"].append({"event": "lead_statistics_period_started",
+                            "at": "2026-11-18T01:01:00+00:00", "initial_equity": 500.0})
+    state["exchange_snapshot"].update(at="2026-11-18T01:01:00+00:00", equity=500.0)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    service._cached_at = 0
+    third = service.snapshot()
+
+    assert len(first["equity_history"]) == 1
+    assert len(second["equity_history"]) == 2
+    assert len(third["equity_history"]) == 1
+    assert third["equity_history"][0]["equity"] == 500.0
+
+
 def test_multi_dashboard_snapshot_shows_ranked_signals_and_shared_equity():
     state = {
         "version": 2, "account_type": "multi_symbol_paper", "initial_equity": 1_000.0, "cash": 999.0,
