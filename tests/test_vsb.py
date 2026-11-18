@@ -262,10 +262,17 @@ def test_uncertain_or_limit_fill_recovers_frozen_strategy_after_restart(monkeypa
 
 
 @pytest.mark.parametrize("side", list(Side))
-@pytest.mark.parametrize("tag", ["MR", "VSB"])
-def test_manual_reconstruction_classifies_without_changing_stop_service(monkeypatch, side, tag):
+@pytest.mark.parametrize("mode,meets_mr_deviation,tag", [
+    ("LIVE", True, "MR"),
+    ("LIVE", False, "VSB"),
+    ("SHADOW", False, "MR"),
+    ("DISABLED", False, "MR"),
+])
+def test_manual_reconstruction_classifies_without_changing_stop_service(
+        monkeypatch, side, mode, meets_mr_deviation, tag):
     one, four = frames(side)
-    entry_price = (95. if side is Side.LONG else 105.) if tag == "MR" else float(one["close"].iloc[-1])
+    entry_price = ((95. if side is Side.LONG else 105.) if meets_mr_deviation
+                   else float(one["close"].iloc[-1]))
     monkeypatch.setattr(runner, "_utc_now", lambda: AT)
     monkeypatch.setattr(runner, "_adoption_closed_frame", lambda *a: one if a[3] == "1h" else four)
     monkeypatch.setattr(runner, "classify_regimes", lambda *a: pd.DataFrame({"regime": [Regime.MID]}))
@@ -279,7 +286,7 @@ def test_manual_reconstruction_classifies_without_changing_stop_service(monkeypa
     def protect(position, **kwargs):
         stopped.append(kwargs["strategy_stop"])
         return dict(id="verified", stop_price=kwargs["strategy_stop"], amount=1.)
-    execution = SimpleNamespace(settings=load_settings(env_file=None).model_copy(update={"vsb_execution_mode": "LIVE"}), exchange=exchange,
+    execution = SimpleNamespace(settings=load_settings(env_file=None).model_copy(update={"vsb_execution_mode": mode}), exchange=exchange,
         lead_market_ids={"COINUSDT"}, adopt_manual_position_stop=protect)
     recovered = dict(side=side.value, quantity=1., entry_price=entry_price, opened_at=AT, entry_fee=.1)
     prepared = runner._prepare_lead_manual_position(execution, SYMBOL, {}, AT, recovered=recovered)
@@ -291,6 +298,9 @@ def test_manual_reconstruction_classifies_without_changing_stop_service(monkeypa
                                   else float(atr(one.tail(60), 14).iloc[-1]))
     if tag == "VSB":
         assert meta["box_mid"] == 100.
+    else:
+        assert "box_mid" not in meta
+    assert state.exchange_orders_by_symbol[SYMBOL]["stop"]["id"] == "verified"
     assert len(stopped) == 1
 
 

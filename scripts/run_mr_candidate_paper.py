@@ -2056,16 +2056,18 @@ def _prepare_lead_manual_position(execution, symbol, exchange_position, at, *,
         execution.exchange, symbol, opened_at, "4h", FOUR_H_MS, regime_required,
         max(regime_required, 100),
     )
-    ema4 = float(frame4["close"].ewm(span=settings.symbol_regime.ema_slow_bars,
-                 adjust=False, min_periods=settings.symbol_regime.ema_slow_bars).mean().iloc[-1])
-    _, _, threshold = _atr_deviation_threshold(frame4, settings)
-    if threshold is None or not math.isfinite(ema4) or ema4 <= 0:
-        raise RuntimeError("entry-time deviation context is unavailable")
-    entry_price = float(recovered["entry_price"])
-    adverse = (ema4 - entry_price) / ema4 if side is Side.LONG else (entry_price - ema4) / ema4
-    tag = "MR" if adverse >= threshold else "VSB"
-    if tag == "VSB" and settings.vsb_execution_mode != "LIVE":
-        raise RuntimeError("new manual VSB adoption requires vsb_execution_mode=LIVE")
+    # With VSB out of live execution, manage manual fills under the original MR policy.
+    tag = "MR"
+    if settings.vsb_execution_mode == "LIVE":
+        ema4 = float(frame4["close"].ewm(span=settings.symbol_regime.ema_slow_bars,
+                     adjust=False, min_periods=settings.symbol_regime.ema_slow_bars).mean().iloc[-1])
+        _, _, threshold = _atr_deviation_threshold(frame4, settings)
+        if threshold is None or not math.isfinite(ema4) or ema4 <= 0:
+            raise RuntimeError("entry-time deviation context is unavailable")
+        entry_price = float(recovered["entry_price"])
+        adverse = (ema4 - entry_price) / ema4 if side is Side.LONG else (entry_price - ema4) / ema4
+        if adverse < threshold:
+            tag = "VSB"
     frozen_strategy = {"strategy_tag": tag}
     if tag == "VSB":
         # A retracement entry may fill up to three hours after the signal.
