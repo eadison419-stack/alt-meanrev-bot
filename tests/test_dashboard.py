@@ -287,11 +287,23 @@ def test_demo_external_flat_is_closed_without_fabricating_pnl():
     assert snapshot["realized_pnl"] == 0
 
 
-def test_manual_position_adoption_is_visible_but_excluded_from_strategy_samples():
+def test_manual_position_adoption_counts_in_account_stats_but_not_strategy_samples():
     symbol = "KOMA/USDT:USDT"
     opened = "2026-11-08T02:00:00+00:00"
+    active_symbol = "MMT/USDT:USDT"
     state = {
-        "execution_mode": "lead_usdm",
+        "version": 2, "account_type": "multi_symbol_paper", "execution_mode": "lead_usdm",
+        "execution_status": "synchronized", "initial_equity": 500.0, "cash": 490.0,
+        "positions": {}, "watchlist": [], "inconsistencies": [], "foreign_order_ids": [],
+        "exchange_snapshot": {
+            "positions": {active_symbol: {
+                "side": "short", "quantity": 2_000.0, "entry_price": 0.243475,
+                "unrealized_pnl": 2.76, "margin_mode": "isolated", "leverage": 10,
+                "initial_margin": 48.695,
+            }},
+            "equity": 502.76, "at": "2026-11-08T05:00:00+00:00",
+            "host": "https://fapi.binance.com",
+        },
         "events": [
             {"event": "manual_position_adopted", "execution_source": "binance_usdm_lead",
              "at": "2026-11-08T03:00:00+00:00", "opened_at": opened,
@@ -300,23 +312,57 @@ def test_manual_position_adoption_is_visible_but_excluded_from_strategy_samples(
              "reason": "manual_position_adopted", "regime": "MID",
              "strategy_sample_eligible": False,
              "sample_exclusion_reason": "manual_position_adopted"},
+            {"event": "manual_position_adopted", "execution_source": "binance_usdm_lead",
+             "at": "2026-11-08T05:00:00+00:00", "opened_at": "2026-11-08T04:50:00+00:00",
+             "symbol": active_symbol, "side": "short", "quantity": 1_000.0,
+             "price": 0.2413, "entry_price": 0.2413, "fee": 0.1,
+             "strategy_sample_eligible": False,
+             "sample_exclusion_reason": "manual_position_adopted"},
+            {"event": "manual_position_changed", "execution_source": "binance_usdm_lead",
+             "at": "2026-11-08T05:01:00+00:00", "symbol": active_symbol,
+             "action": "add", "quantity": 500.0, "price": 0.2438,
+             "strategy_sample_eligible": False},
             {"event": "paper_fill", "execution_source": "binance_usdm_lead",
              "action": "CLOSE", "at": "2026-11-08T04:00:00+00:00",
              "symbol": symbol, "side": "short", "quantity": 10_000.0,
-             "price": 0.019, "net_pnl": 9.8, "fees": 0.3, "reason": "no_progress"},
+             "price": 0.019, "net_pnl": 9.8, "fees": 0.3, "reason": "no_progress",
+             "strategy_sample_eligible": False,
+             "sample_exclusion_reason": "manual_position_adopted"},
         ],
     }
 
-    snapshot = build_order_snapshot(state, start_date="2026-11-08", end_date="2026-11-08")
-    assert snapshot["trade_count"] == 0
-    assert len(snapshot["trades"]) == 1
-    trade = snapshot["trades"][0]
+    current_positions = [{
+        "symbol": active_symbol, "side": "short", "quantity": 2_000.0,
+        "entry_price": 0.243475, "opened_at": "2026-11-08T04:50:00+00:00",
+        "price": 0.242095, "unrealized_pnl": 2.76,
+    }]
+    orders = build_order_snapshot(state, start_date="2026-11-08", end_date="2026-11-08",
+                                  current_positions=current_positions)
+    assert (orders["trade_count"], orders["open_trade_count"], orders["closed_trade_count"]) == (2, 1, 1)
+    assert orders["realized_pnl"] == 9.8
+    assert orders["unrealized_pnl"] == 2.76
+    assert orders["win_rate"] == 1.0
+    assert orders["strategy_trade_count"] == 0
+    assert orders["strategy_realized_pnl"] == 0
+    assert len(orders["trades"]) == 2
+    trade = next(row for row in orders["trades"] if row["symbol"] == symbol)
     assert trade["entry_price"] == 0.02003
     assert trade["entry_reason"] == "manual_position_adopted"
     assert trade["entry_regime"] == "MID"
     assert trade["strategy_sample_eligible"] is False
     assert trade["sample_exclusion_reason"] == "manual_position_adopted"
-    assert snapshot["exit_reason_stats"] == []
+    assert orders["exit_reason_stats"] == []
+
+    snapshot = build_multi_snapshot(
+        state, tickers={}, settings=load_settings(env_file=None),
+        now=datetime(2026, 11, 8, 5, 2, tzinfo=timezone.utc),
+    )
+    assert snapshot["trade_count"] == snapshot["closed_trade_count"] == 1
+    assert snapshot["open_trade_count"] == 1
+    assert snapshot["realized_pnl"] == 9.8
+    assert snapshot["win_rate"] == 1.0
+    assert snapshot["strategy_trade_count"] == 0
+    assert snapshot["strategy_realized_pnl"] == 0
 
 
 def test_demo_paper_fill_with_missing_costs_keeps_fees_unknown():

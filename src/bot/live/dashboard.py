@@ -245,14 +245,20 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
             continue
         filtered.append(trade)
     filtered.sort(key=lambda row: row.get("opened_at") or row.get("closed_at") or "", reverse=True)
-    sample_trades = [row for row in filtered if row.get("strategy_sample_eligible", True)]
-    closed = [row for row in sample_trades if row["status"] == "closed"]
-    opened = [row for row in sample_trades if row["status"] == "open"]
+    # Account summaries include every reconstructed account trade. Strategy
+    # sample eligibility is a separate research filter, not a visibility filter.
+    closed = [row for row in filtered if row["status"] == "closed"]
+    opened = [row for row in filtered if row["status"] == "open"]
     recorded_closed = [row for row in closed if row.get("realized_pnl") is not None]
+    sample_trades = [row for row in filtered if row.get("strategy_sample_eligible", True)]
+    sample_closed = [row for row in sample_trades if row["status"] == "closed"]
+    sample_recorded_closed = [row for row in sample_closed if row.get("realized_pnl") is not None]
     wins = sum(float(row["realized_pnl"]) > 0 for row in recorded_closed)
     losses = sum(float(row["realized_pnl"]) < 0 for row in recorded_closed)
+    strategy_wins = sum(float(row["realized_pnl"]) > 0 for row in sample_recorded_closed)
+    strategy_losses = sum(float(row["realized_pnl"]) < 0 for row in sample_recorded_closed)
     exits_by_reason: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for trade in recorded_closed:
+    for trade in sample_recorded_closed:
         exits_by_reason[str(trade.get("exit_reason") or "unknown")].append(trade)
     exit_reason_stats = []
     for reason, reason_trades in exits_by_reason.items():
@@ -273,7 +279,14 @@ def build_order_snapshot(state: dict[str, Any], *, start_date: str | None = None
     exit_reason_stats.sort(key=lambda row: (-row["trade_count"], row["reason"]))
     return {
         "start_date": start_date, "end_date": end_date, "timezone": "Asia/Shanghai",
-        "trade_count": len(sample_trades), "open_trade_count": len(opened), "closed_trade_count": len(closed),
+        "trade_count": len(filtered), "open_trade_count": len(opened), "closed_trade_count": len(closed),
+        "strategy_trade_count": len(sample_trades),
+        "strategy_open_trade_count": sum(row["status"] == "open" for row in sample_trades),
+        "strategy_closed_trade_count": len(sample_closed),
+        "strategy_realized_pnl": sum(float(row["realized_pnl"]) for row in sample_recorded_closed),
+        "strategy_wins": strategy_wins, "strategy_losses": strategy_losses,
+        "strategy_win_rate": (strategy_wins / len(sample_recorded_closed)
+                               if sample_recorded_closed else None),
         "realized_pnl": sum(float(row["realized_pnl"]) for row in recorded_closed),
         "unrecorded_close_count": len(closed) - len(recorded_closed),
         "unrealized_pnl": sum(float(row.get("unrealized_pnl") or 0.0) for row in opened),
@@ -786,24 +799,34 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
             position["stop_net_if_closed"] = None
     equity = (float(exchange_snapshot.get("equity")) if exchange_mode and exchange_snapshot.get("equity") is not None
               else cash + unrealized + sum(float(item.get("initial_margin", 0.0)) for item in margin_states.values()))
-    closes = [event for event in statistics_events
-              if event.get("event") == "paper_fill" and event.get("action") == "CLOSE"
-              and event.get("strategy_sample_eligible", True)
-              and event.get("net_pnl") is not None]
+    all_closes = [event for event in statistics_events
+                  if event.get("event") == "paper_fill" and event.get("action") == "CLOSE"]
+    strategy_closes = [event for event in all_closes if event.get("strategy_sample_eligible", True)]
+    recorded_closes = [event for event in all_closes if event.get("net_pnl") is not None]
     external_closes = [event for event in statistics_events if exchange_mode
-                       and event.get("event") == "external_position_reconciled_flat"
-                       and event.get("strategy_sample_eligible", True)]
+                       and event.get("event") == "external_position_reconciled_flat"]
+    strategy_external_closes = [event for event in external_closes
+                                if event.get("strategy_sample_eligible", True)]
     recorded_external_closes = [event for event in external_closes
                                 if event.get("pnl_recorded") and event.get("net_pnl") is not None]
-    recorded_closes = closes + recorded_external_closes
-    realized = sum(float(event["net_pnl"]) for event in recorded_closes)
-    wins = sum(float(event["net_pnl"]) > 0 for event in recorded_closes)
-    losses = sum(float(event["net_pnl"]) < 0 for event in recorded_closes)
-    positive = sum(max(0.0, float(event["net_pnl"])) for event in recorded_closes)
-    negative = -sum(min(0.0, float(event["net_pnl"])) for event in recorded_closes)
+    strategy_recorded_closes = [event for event in strategy_closes if event.get("net_pnl") is not None]
+    strategy_recorded_external_closes = [event for event in strategy_external_closes
+                                         if event.get("pnl_recorded") and event.get("net_pnl") is not None]
+    account_recorded_closes = recorded_closes + recorded_external_closes
+    strategy_recorded_closes = strategy_recorded_closes + strategy_recorded_external_closes
+    wins = sum(float(event["net_pnl"]) > 0 for event in account_recorded_closes)
+    losses = sum(float(event["net_pnl"]) < 0 for event in account_recorded_closes)
+    positive = sum(max(0.0, float(event["net_pnl"])) for event in account_recorded_closes)
+    negative = -sum(min(0.0, float(event["net_pnl"])) for event in account_recorded_closes)
+    strategy_wins = sum(float(event["net_pnl"]) > 0 for event in strategy_recorded_closes)
+    strategy_losses = sum(float(event["net_pnl"]) < 0 for event in strategy_recorded_closes)
+    strategy_positive = sum(max(0.0, float(event["net_pnl"])) for event in strategy_recorded_closes)
+    strategy_negative = -sum(min(0.0, float(event["net_pnl"])) for event in strategy_recorded_closes)
+    realized = sum(float(event["net_pnl"]) for event in account_recorded_closes)
+    strategy_realized = sum(float(event["net_pnl"]) for event in strategy_recorded_closes)
     curve = [{"at": None, "equity": initial}]
     curve_value = initial
-    for event in sorted(recorded_closes, key=lambda item: item.get("closed_at") or item.get("at") or ""):
+    for event in sorted(account_recorded_closes, key=lambda item: item.get("closed_at") or item.get("at") or ""):
         curve_value += float(event.get("net_pnl", 0.0))
         curve.append({"at": event.get("closed_at") or event.get("at"), "equity": round(curve_value, 8)})
     day_start = state.get("day_start_equity")
@@ -897,10 +920,20 @@ def build_multi_snapshot(state: dict[str, Any], *, tickers: dict[str, dict], mar
         "entry_gate_labels": entry_gates,
         "market_risk_status": state.get("market_risk_status", {}),
         "strategy_variant": state.get("strategy_variant", "immediate_baseline"),
-        "trade_count": len(closes) + len(external_closes),
-        "unrecorded_close_count": len(external_closes) - len(recorded_external_closes),
-        "win_rate": wins / len(recorded_closes) if recorded_closes else None,
+        "trade_count": len(all_closes) + len(external_closes),
+        "closed_trade_count": len(all_closes) + len(external_closes),
+        "open_trade_count": len(positions),
+        "unrecorded_close_count": (len(all_closes) - len(recorded_closes)
+                                   + len(external_closes) - len(recorded_external_closes)),
+        "win_rate": wins / len(account_recorded_closes) if account_recorded_closes else None,
         "profit_factor": positive / negative if negative else (None if not positive else "∞"),
+        "strategy_trade_count": len(strategy_closes) + len(strategy_external_closes),
+        "strategy_wins": strategy_wins, "strategy_losses": strategy_losses,
+        "strategy_realized_pnl": strategy_realized,
+        "strategy_win_rate": (strategy_wins / len(strategy_recorded_closes)
+                              if strategy_recorded_closes else None),
+        "strategy_profit_factor": (strategy_positive / strategy_negative if strategy_negative
+                                   else (None if not strategy_positive else "∞")),
         "wins": wins, "losses": losses, "equity_curve": curve, "events": visible_events,
         "last_processed_close": max(state.get("last_processed_by_symbol", {}).values(), default=None),
         "last_observed_open": max(state.get("last_observed_by_symbol", {}).values(), default=None),
