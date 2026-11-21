@@ -155,9 +155,11 @@ def _refresh_exchange_clock(clock, exchange, state):
     try:
         status = clock.synchronize(exchange)
     except Exception as exc:
+        reason = str(exc) if isinstance(exc, ExchangeClockError) else type(exc).__name__
         state.events.append({"event": "exchange_clock_sync_failed", "at": _utc_now().isoformat(),
-                             "error": type(exc).__name__, "new_entries_paused": clock.age() > clock.MAX_AGE_SECONDS})
-        logger.warning("Exchange clock refresh failed: {}", type(exc).__name__)
+                             "error": type(exc).__name__, "reason": reason,
+                             "new_entries_paused": clock.age() > clock.MAX_AGE_SECONDS})
+        logger.warning("Exchange clock refresh failed: {} ({})", type(exc).__name__, reason)
     else:
         state.events.append({"event": "exchange_clock_calibrated", "at": _utc_now().isoformat(), **status})
 

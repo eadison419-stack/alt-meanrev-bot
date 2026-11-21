@@ -85,6 +85,55 @@ def test_high_latency_calibration_fails_closed():
         _clock(delays=(1.1, 1.2, 1.3))
 
 
+@pytest.mark.parametrize("change", [-3.0, 3.0])
+def test_stale_clock_recovers_signatures_without_extending_entry_deadlines(change):
+    clock, client, mono, wall = _clock(offset=0)
+    mono[0] += 301
+    before = clock.now()
+
+    def server(_):
+        mono[0] += .08
+        return {"serverTime": int((wall[0] + mono[0] + change - .04) * 1000)}
+
+    client.fapiPublicGetTime = server
+    clock.synchronize(client)
+    clock.require_fresh()
+    assert client.nonce() / 1000 == pytest.approx(wall[0] + mono[0] + change, abs=.05, rel=0)
+    assert clock.now() >= before + timedelta(seconds=.24)
+    assert clock.now() >= clock.lower_now()
+    mono[0] += 61
+    clock.synchronize(client)
+    assert client.nonce() / 1000 == pytest.approx(wall[0] + mono[0] + change, abs=.05, rel=0)
+
+
+def test_fresh_clock_still_rejects_abrupt_changes():
+    clock, client, mono, wall = _clock(offset=0)
+    prior_nonce = client.nonce()
+    client.fapiPublicGetTime = lambda _: {"serverTime": int((wall[0] + mono[0] + 3) * 1000)}
+    with pytest.raises(ExchangeClockError, match="changed_abruptly"):
+        clock.synchronize(client)
+    assert client.nonce() == prior_nonce
+
+
+@pytest.mark.parametrize("offsets", [(3.0, None, None), (3.0, 6.0, 9.0)])
+def test_stale_clock_rejects_uncorroborated_or_conflicting_samples(offsets):
+    clock, client, mono, wall = _clock(offset=0)
+    mono[0] += 301
+    prior_nonce = client.nonce()
+    offsets = iter(offsets)
+
+    def server(_):
+        offset = next(offsets)
+        return {} if offset is None else {"serverTime": int((wall[0] + mono[0] + offset) * 1000)}
+
+    client.fapiPublicGetTime = server
+    with pytest.raises(ExchangeClockError, match="changed_abruptly"):
+        clock.synchronize(client)
+    assert client.nonce() == prior_nonce
+    with pytest.raises(ExchangeClockError, match="stale"):
+        clock.require_fresh()
+
+
 def test_stale_clock_blocks_open_but_keeps_management_time(monkeypatch):
     clock, _, mono, _ = _clock()
     monkeypatch.setattr(clock_module, "_active_clock", clock)

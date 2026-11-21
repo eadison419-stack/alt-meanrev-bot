@@ -63,11 +63,19 @@ class ExchangeClock:
             raise ExchangeClockError("exchange_clock_no_bounded_sample")
         rtt, server, at = min(samples)
         upper = server + rtt
-        # Reject an implausible server jump while retaining the last good sample
-        # for position management. New entries still expire at MAX_AGE_SECONDS.
-        if self._anchor is not None and abs(upper - (self._anchor + at - self._at)) > 1:
-            raise ExchangeClockError("exchange_clock_changed_abruptly")
+        # Fresh clocks reject sudden changes. Once stale, require corroborating
+        # bounded samples before replacing the signing clock after a long outage.
         if self._anchor is not None:
+            expected = self._signature_anchor + at - self._at
+            if abs(server + rtt / 2 - expected) > 1:
+                projected = [value + delay / 2 + at - sampled_at
+                             for delay, value, sampled_at in samples]
+                if (self.age() <= self.MAX_AGE_SECONDS or len(samples) < 2
+                        or max(projected) - min(projected) > self.MAX_RTT_SECONDS):
+                    raise ExchangeClockError("exchange_clock_changed_abruptly")
+        if self._anchor is not None:
+            # Keep the entry deadline clock conservative and nondecreasing even
+            # when a recovered signing clock needs to move backwards.
             upper = max(upper, self._anchor + at - self._at)
         self._anchor, self._at, self._rtt = upper, at, rtt
         self._signature_anchor = server + rtt / 2
