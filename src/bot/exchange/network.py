@@ -22,6 +22,24 @@ _BAN_UNTIL = re.compile(r"banned\s+until\s+(\d{13})", re.IGNORECASE)
 _REQUEST_LOCK = threading.Lock()
 
 
+class BinanceRequestPacer:
+    """Coordinate CCXT request weights across clients in the same process."""
+
+    def __init__(self, *, monotonic=time.monotonic, sleep=time.sleep):
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._next_at = 0.0
+
+    def wait(self, cost: float, rate_limit_ms: float) -> None:
+        delay = max(0.0, self._next_at - self._monotonic())
+        if delay:
+            self._sleep(delay)
+        self._next_at = self._monotonic() + cost * rate_limit_ms / 1000
+
+
+_REQUEST_PACER = BinanceRequestPacer()
+
+
 class BinanceRateLimitCooldown(ccxt.RateLimitExceeded):
     """Raised locally while Binance's IP-based rate-limit cooldown is active."""
 
@@ -95,7 +113,7 @@ class BinanceRateLimitGate:
             except (TypeError, ValueError, OverflowError):
                 return None
 
-    def trip(self, error: Exception, *, response_headers=None) -> int:
+    def trip(self, error: Exception, *, response_headers=None, endpoint=None) -> int:
         """Persist a conservative cooldown; return its absolute Unix timestamp in ms."""
         now_ms = int(self.wall_time() * 1000)
         with self._lock:
@@ -113,13 +131,14 @@ class BinanceRateLimitGate:
                 persisted_until = 0
             previous_until = max(self._blocked_until_ms, persisted_until)
             error_type = type(error).__name__
+            retry_after = self._retry_after_seconds(response_headers)
             if isinstance(error, ccxt.DDoSProtection):
                 match = _BAN_UNTIL.search(str(error))
                 until_ms = int(match.group(1)) if match else now_ms + 300_000
             else:
-                retry_after = self._retry_after_seconds(response_headers)
                 fallback = min(1800, 60 * (2 ** min(retry_count - 1, 5)))
                 until_ms = now_ms + int(max(fallback, retry_after or 0.0) * 1000)
+            until_ms = max(until_ms, now_ms + int((retry_after or 0.0) * 1000))
             until_ms = max(previous_until, until_ms, now_ms + 1_000)
             self._blocked_until_ms = until_ms
             state = {
@@ -129,6 +148,16 @@ class BinanceRateLimitGate:
                 "error_type": error_type,
                 "updated_at_ms": now_ms,
             }
+            if endpoint:
+                state["endpoint"] = str(endpoint).split("?", 1)[0][:128]
+            status = re.search(r"\b(403|418|429)\b", str(error))
+            if status:
+                state["http_status"] = int(status.group(1))
+            if hasattr(response_headers, "items"):
+                weight = next((value for key, value in response_headers.items()
+                               if str(key).lower() == "x-mbx-used-weight-1m"), None)
+                if str(weight).isdigit():
+                    state["used_weight_1m"] = int(weight)
             try:
                 self.state_path.parent.mkdir(parents=True, exist_ok=True)
                 temporary_path = self.state_path.with_name(
@@ -161,17 +190,29 @@ def configure_system_proxy(exchange) -> None:
         return
     exchange.enableLastResponseHeaders = True
 
-    def guarded_request(*args, **kwargs):
+    def guarded_request(path, api="public", method="GET", params=None,
+                        headers=None, body=None, config=None):
         # Serialize this process's independently rate-limited CCXT clients and
         # re-read the shared marker so Dashboard and Runner processes coordinate.
         with _REQUEST_LOCK:
             _RATE_LIMIT_GATE.ensure_allowed()
+            cost_function = getattr(exchange, "calculate_rate_limiter_cost", None)
+            if method == "GET" and str(api).startswith("fapi") and callable(cost_function):
+                cost = float(cost_function(api, method, path, params or {}, config or {}))
+                rate_limit_ms = float(exchange.rateLimit)
+                if not math.isfinite(cost) or cost < 0 or not math.isfinite(rate_limit_ms) or rate_limit_ms < 0:
+                    raise RuntimeError("binance_request_weight_invalid")
+                _REQUEST_PACER.wait(cost, rate_limit_ms)
+                _RATE_LIMIT_GATE.ensure_allowed()
             try:
-                return original_request(*args, **kwargs)
+                return original_request(path, api, method, params or {}, headers, body, config or {})
             except BinanceRateLimitCooldown:
                 raise
             except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as exc:
-                _RATE_LIMIT_GATE.trip(exc, response_headers=getattr(exchange, "last_response_headers", None))
+                _RATE_LIMIT_GATE.trip(
+                    exc, response_headers=getattr(exchange, "last_response_headers", None),
+                    endpoint=f"{api}:{method}:{path}",
+                )
                 raise
 
     exchange.request = guarded_request

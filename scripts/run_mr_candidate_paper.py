@@ -1755,6 +1755,10 @@ def _demo_sync_stopped(execution, state, at):
                                            _aware_datetime(snapshot.get("at")) or at):
             return False
     live = set(snapshot["positions"])
+    adoption_retries = getattr(execution, "_manual_adoption_retries", {})
+    for symbol in list(adoption_retries):
+        if symbol not in live:
+            adoption_retries.pop(symbol)
     for symbol in list(state.portfolio.positions):
         if symbol not in live:
             position = state.portfolio.positions[symbol]
@@ -2170,10 +2174,25 @@ def _adopt_lead_manual_position(execution, state, symbol, exchange_position, at)
         raise RuntimeError("manual adoption is disabled")
     if state.execution_mode != "lead_usdm" or symbol in state.portfolio.positions:
         raise RuntimeError("manual adoption is restricted to untracked Lead positions")
-    _install_lead_manual_position(
-        execution, state, symbol, at,
-        _prepare_lead_manual_position(execution, symbol, exchange_position, at),
-    )
+    retries = getattr(execution, "_manual_adoption_retries", None)
+    if retries is None:
+        retries = execution._manual_adoption_retries = {}
+    identity = tuple(exchange_position.get(key) for key in ("side", "quantity", "entry_price"))
+    previous = retries.get(symbol)
+    if previous and previous["identity"] == identity and time.monotonic() < previous["retry_at"]:
+        raise ValueError(previous["reason"])
+    try:
+        prepared = _prepare_lead_manual_position(execution, symbol, exchange_position, at)
+    except (ValueError, RuntimeError) as exc:
+        if (all(value is not None for value in identity)
+                and str(exc) in {"stop_too_wide", "stop_too_tight", "structure level is on the wrong side of entry"}):
+            # The original entry bars and position identity determine these
+            # failures. Keep the account isolated while avoiding repeated history reads.
+            retries[symbol] = {"identity": identity, "reason": str(exc),
+                               "retry_at": time.monotonic() + 300}
+        raise
+    _install_lead_manual_position(execution, state, symbol, at, prepared)
+    retries.pop(symbol, None)
 
 
 def _manual_sync_error(exc):

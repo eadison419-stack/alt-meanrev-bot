@@ -7,6 +7,7 @@ import ccxt
 import pytest
 
 from bot.config import load_settings
+from bot.exchange import network
 from bot.live import mr_scan
 from bot.live.multi_paper import MultiPaperState
 from bot.portfolio import Position
@@ -102,6 +103,8 @@ def test_public_read_retry_respects_deadline_and_records_endpoint(monkeypatch, e
 
 def _mock_main(monkeypatch, tmp_path, state):
     settings = load_settings(env_file=None)
+    monkeypatch.setattr(network, "_RATE_LIMIT_GATE",
+                        network.BinanceRateLimitGate(tmp_path / "cooldown.json"))
     monkeypatch.setattr(sys, "argv", ["runner", "--demo", "--once", "--state",
                                       str(tmp_path / "state.json")])
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
@@ -122,6 +125,18 @@ def _mock_main(monkeypatch, tmp_path, state):
     monkeypatch.setattr(runner, "logger", SimpleNamespace(**{
         name: lambda *a, **kw: None for name in ("remove", "add", "info", "warning", "error", "exception")
     }))
+
+
+def test_mocked_main_isolates_its_cooldown_from_an_active_live_marker(monkeypatch, tmp_path):
+    live_path = tmp_path / "live-cooldown.json"
+    live_gate = network.BinanceRateLimitGate(live_path, wall_time=lambda: 1000.0)
+    live_gate.trip(ccxt.DDoSProtection("418"))
+    before = live_path.read_bytes()
+    monkeypatch.setattr(network, "_RATE_LIMIT_GATE", live_gate)
+    assert runner.rate_limit_cooldown_remaining() == 300.0
+    _mock_main(monkeypatch, tmp_path, MultiPaperState())
+    assert runner.rate_limit_cooldown_remaining() == 0.0
+    assert live_path.read_bytes() == before
 
 
 def test_runner_keeps_managing_known_positions_but_never_scans_with_failed_storage(monkeypatch, tmp_path):

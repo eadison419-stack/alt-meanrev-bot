@@ -1630,6 +1630,83 @@ def test_blocked_manual_adoption_does_not_skip_other_symbols(monkeypatch):
     assert state.inconsistencies == [f"manual position adoption blocked for {blocked_symbol}: stop_too_wide"]
 
 
+def test_blocked_adoption_reduces_history_reads_but_keeps_fresh_account_checks(monkeypatch):
+    tick = [0.0]
+    monkeypatch.setattr(runner.time, "monotonic", lambda: tick[0])
+    now = datetime(2026, 11, 23, 15, tzinfo=timezone.utc)
+    symbol = "NAORIS/USDT:USDT"
+    observed = {symbol: {"side": "short", "quantity": 20_000, "entry_price": .0347}}
+    snapshots, preparations = [], []
+
+    def snapshot():
+        snapshots.append(tick[0])
+        return {"at": now.isoformat(), "positions": dict(observed)}
+
+    def prepare(*args):
+        preparations.append(tick[0])
+        raise ValueError("stop_too_wide")
+
+    execution = SimpleNamespace(adopt_manual_positions=True, sync_snapshot=snapshot)
+    state = MultiPaperState()
+    state.execution_mode = "lead_usdm"
+    monkeypatch.setattr(runner, "_prepare_lead_manual_position", prepare)
+    for tick[0] in (0.0, 30.0, 60.0, 299.0):
+        assert not runner._demo_sync_stopped(execution, state, now)
+        assert state.execution_status == "inconsistent"
+        assert state.protective_stop_audit["blocked_symbols"] == [symbol]
+    assert len(snapshots) == 4 and preparations == [0.0]
+    tick[0] = 300.0
+    assert not runner._demo_sync_stopped(execution, state, now)
+    assert preparations == [0.0, 300.0]
+    observed[symbol]["quantity"] = 10_000
+    assert not runner._demo_sync_stopped(execution, state, now)
+    assert len(preparations) == 3
+    observed.clear()
+    assert runner._demo_sync_stopped(execution, state, now)
+    assert execution._manual_adoption_retries == {}
+
+
+@pytest.mark.parametrize("reason", ["stop_too_wide", "stop_too_tight",
+                                    "structure level is on the wrong side of entry"])
+def test_deterministic_adoption_failures_retry_immediately_when_position_changes(monkeypatch, reason):
+    monkeypatch.setattr(runner.time, "monotonic", lambda: 0.0)
+    state = MultiPaperState()
+    state.execution_mode = "lead_usdm"
+    execution = SimpleNamespace(adopt_manual_positions=True)
+    observed = {"side": "short", "quantity": 10, "entry_price": 100}
+    attempts = []
+
+    def prepare(*args):
+        attempts.append(1)
+        raise ValueError(reason)
+
+    monkeypatch.setattr(runner, "_prepare_lead_manual_position", prepare)
+    for price in (100, 100, 101):
+        observed["entry_price"] = price
+        with pytest.raises(ValueError, match=reason):
+            runner._adopt_lead_manual_position(execution, state, "TEST", observed, datetime.now(timezone.utc))
+    assert len(attempts) == 2
+
+
+def test_transient_adoption_failure_remains_retryable_without_a_history_cooldown(monkeypatch):
+    state = MultiPaperState()
+    state.execution_mode = "lead_usdm"
+    execution = SimpleNamespace(adopt_manual_positions=True)
+    observed = {"side": "long", "quantity": 1, "entry_price": 100}
+    attempts = []
+
+    def prepare(*args):
+        attempts.append(1)
+        raise RuntimeError("manual position trade history is incomplete")
+
+    monkeypatch.setattr(runner, "_prepare_lead_manual_position", prepare)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="incomplete"):
+            runner._adopt_lead_manual_position(execution, state, "TEST", observed, datetime.now(timezone.utc))
+    assert len(attempts) == 2
+    assert not execution._manual_adoption_retries
+
+
 def test_startup_allows_only_isolated_lead_manual_position_errors():
     state = MultiPaperState()
     state.execution_mode = "lead_usdm"
