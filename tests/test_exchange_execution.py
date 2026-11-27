@@ -798,6 +798,62 @@ def test_manual_position_reconstruction_replays_adds_and_partial_closes():
     assert result["opened_at"] == opened
 
 
+@pytest.mark.parametrize("old_side,new_side", [
+    ("BUY", "BUY"), ("SELL", "SELL"), ("BUY", "SELL"), ("SELL", "BUY"),
+])
+def test_manual_reconstruction_resets_cycle_after_many_fractional_close_fills(old_side, new_side):
+    from datetime import datetime, timedelta, timezone
+
+    opened = datetime(2026, 11, 26, 15, tzinfo=timezone.utc)
+    closed = opened + timedelta(hours=20)
+    reopened = closed + timedelta(hours=2)
+    close_side = "SELL" if old_side == "BUY" else "BUY"
+    rows = [(int(opened.timestamp() * 1000), 1, old_side, 1000.0, 100.0, 1.0)]
+    rows.extend((int(closed.timestamp() * 1000), i + 2, close_side, .03, 90.0, .003)
+                for i in range(100))
+    rows.append((int(closed.timestamp() * 1000), 102, close_side, 997.0, 90.0, .997))
+    rows.extend([
+        (int(reopened.timestamp() * 1000), 103, new_side, .79, 110.0, .079),
+        (int(reopened.timestamp() * 1000), 104, new_side, 1.21, 110.0, .121),
+    ])
+    service = DemoExecutionService(OrderSpy(), SimpleNamespace())
+    service._manual_position_trades = lambda *args, **kwargs: rows
+    service._market_rules = lambda _: (.01, .01, 0)
+    result = service.reconstruct_open_position(
+        "ADA/USDT:USDT", {"side": "long" if new_side == "BUY" else "short",
+                          "quantity": 2.0, "entry_price": 110.0}, at=reopened)
+    assert result["opened_at"] == reopened
+    assert result["entry_price"] == 110.0
+    assert result["entry_fee"] == pytest.approx(.2, abs=1e-15)
+    assert result["cursor"] == {"time": int(reopened.timestamp() * 1000), "id": 104}
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+@pytest.mark.parametrize("remaining", ["0.00000001", "0.000000000001"])
+def test_manual_reconstruction_preserves_a_real_tiny_remaining_quantity(side, remaining):
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal
+
+    opened = datetime(2026, 11, 26, 15, tzinfo=timezone.utc)
+    closed = opened + timedelta(hours=20)
+    close_side = "SELL" if side == "BUY" else "BUY"
+    rows = [(int(opened.timestamp() * 1000), 1, side, 1000.0, 100.0, 1.0)]
+    rows.extend((int(closed.timestamp() * 1000), i + 2, close_side, .03, 90.0, .003)
+                for i in range(100))
+    final_close = float(Decimal(997) - Decimal(remaining))
+    rows.append((int(closed.timestamp() * 1000), 102, close_side, final_close, 90.0, .997))
+    service = DemoExecutionService(OrderSpy(), SimpleNamespace())
+    service._manual_position_trades = lambda *args, **kwargs: rows
+    remaining = float(remaining)
+    service._market_rules = lambda _: (remaining, remaining, 0)
+    result = service.reconstruct_open_position(
+        "ADA/USDT:USDT", {"side": "long" if side == "BUY" else "short",
+                          "quantity": remaining, "entry_price": 100.0}, at=closed)
+    assert result["opened_at"] == opened
+    assert result["quantity"] == remaining
+    assert result["entry_price"] == 100.0
+
+
 def test_manual_position_reconstruction_rejects_unsupported_commission_currency():
     from datetime import datetime, timezone
 

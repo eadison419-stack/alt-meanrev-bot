@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
+from decimal import Decimal
 import math
 import time
 from types import SimpleNamespace
@@ -509,38 +510,41 @@ class DemoExecutionService:
         """Rebuild the current one-way position from bounded, verified USD-M fills."""
         trades = self._manual_position_trades(symbol, at=at or _utc_now())
 
-        signed_quantity = 0.0
+        # Exact decimal quantities keep a fully closed cycle separate from its next entry.
+        signed_quantity = Decimal(0)
         average_entry = 0.0
         entry_fee = 0.0
         opened_at = None
         for timestamp, _trade_id, side, quantity, price, commission in trades:
-            fill_signed = quantity if side == "BUY" else -quantity
+            fill_quantity = Decimal(str(quantity))
+            fill_signed = fill_quantity if side == "BUY" else -fill_quantity
             if signed_quantity == 0 or signed_quantity * fill_signed > 0:
-                old_quantity = abs(signed_quantity)
+                old_quantity = float(abs(signed_quantity))
                 signed_quantity += fill_signed
                 average_entry = ((average_entry * old_quantity + price * quantity)
-                                 / abs(signed_quantity))
+                                 / float(abs(signed_quantity)))
                 entry_fee += commission
                 if opened_at is None:
                     opened_at = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
                 continue
 
             old_quantity = abs(signed_quantity)
-            closed_quantity = min(old_quantity, quantity)
+            closed_quantity = min(old_quantity, fill_quantity)
             remaining_old = old_quantity - closed_quantity
-            entry_fee *= remaining_old / old_quantity
+            entry_fee *= float(remaining_old / old_quantity)
             signed_quantity += fill_signed
-            if remaining_old <= 1e-12:
+            if remaining_old == 0:
                 average_entry = 0.0
                 entry_fee = 0.0
                 opened_at = None
-            if quantity > old_quantity:
-                opened_quantity = quantity - old_quantity
-                signed_quantity = math.copysign(opened_quantity, fill_signed)
+            if fill_quantity > old_quantity:
+                opened_quantity = fill_quantity - old_quantity
+                signed_quantity = opened_quantity if fill_signed > 0 else -opened_quantity
                 average_entry = price
-                entry_fee = commission * opened_quantity / quantity
+                entry_fee = commission * float(opened_quantity / fill_quantity)
                 opened_at = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
 
+        signed_quantity = float(signed_quantity)
         try:
             expected_side = str(expected["side"]).lower()
             expected_quantity = float(expected["quantity"])
