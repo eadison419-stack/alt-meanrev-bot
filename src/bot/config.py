@@ -224,6 +224,7 @@ class Risk(Section):
 class LeadRisk(Section):
     min_leverage: Annotated[int, Field(ge=3, le=10)]
     max_leverage: Annotated[int, Field(ge=3, le=10)]
+    min_isolated_margin_pct: Annotated[float, Field(ge=0.10, le=1, allow_inf_nan=False)] = 0.10
     max_symbol_notional_pct: Fraction
     max_portfolio_stop_risk_pct: Fraction
     giveback_risk_weight: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]

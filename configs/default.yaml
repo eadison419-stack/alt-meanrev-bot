@@ -150,6 +150,7 @@ risk:
 lead_risk:
   min_leverage: 3
   max_leverage: 10
+  min_isolated_margin_pct: 0.10
   max_symbol_notional_pct: 0.60
   max_portfolio_stop_risk_pct: 0.04
   giveback_risk_weight: 0.15

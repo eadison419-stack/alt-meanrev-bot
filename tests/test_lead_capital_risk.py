@@ -213,7 +213,7 @@ def test_unreliable_live_risk_inputs_fail_closed(settings, fault):
         lead_entry_exposure(state, settings, NOW)
 
 
-@pytest.mark.parametrize("side,stop,leverage", [(Side.LONG, 98, 10), (Side.SHORT, 102, 10),
+@pytest.mark.parametrize("side,stop,leverage", [(Side.LONG, 98, 9), (Side.SHORT, 102, 9),
                                                (Side.LONG, 90, 4), (Side.SHORT, 110, 4)])
 def test_dynamic_leverage_uses_real_tier_and_preserves_stop(settings, side, stop, leverage):
     brackets = parse_brackets(_brackets(), "TESTUSDT")
@@ -296,14 +296,15 @@ class LeadClient:
             self.stop = {"algoId": "stop", "clientAlgoId": params["clientOrderId"],
                 "symbol": "TESTUSDT", "orderType": "STOP_MARKET", "side": side.upper(),
                 "algoStatus": "NEW", "reduceOnly": True, "quantity": quantity,
-                "triggerPrice": params["stopPrice"], "workingType": "CONTRACT_PRICE", "positionSide": "BOTH"}
+                "triggerPrice": params["stopPrice"], "workingType": params["workingType"], "positionSide": "BOTH"}
             return {"id": "stop"}
         if params.get("reduceOnly"):
             self.live = None
         else:
             self.live = {"symbol": symbol, "side": "long", "contracts": quantity,
                 "entryPrice": 100, "unrealizedPnl": 0, "marginMode": "isolated",
-                "liquidationPrice": self.liquidation}
+                "markPrice": 100, "liquidationPrice": self.liquidation,
+                "info": {"isolatedWallet": quantity * 100 / self.leverage - quantity * 100 * .0005}}
         return {"id": "fill", "filled": quantity, "average": 100, "status": "closed"}
 
     def fapiPrivateGetOpenAlgoOrders(self, params):
@@ -314,14 +315,15 @@ class LeadClient:
         self.stop = None
 
 
-def test_live_open_chooses_ten_and_verifies_actual_liquidation_and_stop(settings):
+def test_live_open_reserves_costs_above_ten_percent_margin_and_verifies_mark_stop(settings):
     client = LeadClient()
     service = LeadPortfolioExecutionService(client, settings)
     plans, submissions = [], []
     result = service.open(_intent(), stop_price=98, on_safety_plan=plans.append,
         client_order_id="mrb_test", on_submit=lambda *args: submissions.append(args))
-    assert client.leverage_calls == [10]
-    assert plans[0]["leverage"] == 10 and submissions[0][1] == 98
+    assert client.leverage_calls == [9]
+    assert plans[0]["leverage"] == 9 and submissions[0][1] == 98
+    assert client.orders[1][-1]["workingType"] == "MARK_PRICE"
     assert result["capital_safety"]["verified"] is True
     assert result["capital_safety"]["actual_liquidation_price"] == 90.6
     assert [row[0] for row in client.orders] == ["market", "STOP_MARKET"]
@@ -401,7 +403,174 @@ def test_leverage_preparation_does_not_bypass_quote_expiry_checkpoint(settings, 
     assert result is None and client.orders == []
     attempt = next(iter(state.mr_entry_attempts.values()))
     assert attempt["status"] == "not_submitted"
-    assert attempt["audit"]["capital_safety"]["leverage"] == 10
+    assert attempt["audit"]["capital_safety"]["leverage"] == 9
+
+
+class ProtectionClient(LeadClient):
+    def __init__(self, side=Side.LONG, *, entry=100, stop=95, liquidation=80, wallet=30):
+        super().__init__()
+        self.live = {"symbol": SYMBOL, "side": side.value, "contracts": 2,
+                     "entryPrice": entry, "markPrice": entry, "marginMode": "isolated",
+                     "liquidationPrice": liquidation, "info": {"isolatedWallet": wallet}}
+        self.active = [{"algoId": "old", "clientAlgoId": "mrb_s_old", "symbol": "TESTUSDT",
+                        "orderType": "STOP_MARKET", "algoStatus": "NEW", "side": "SELL",
+                        "reduceOnly": True, "quantity": 2, "triggerPrice": stop,
+                        "workingType": "CONTRACT_PRICE"}]
+        self.calls = []
+        self.fail_cancel = False
+        self.return_wrong_trigger = False
+
+    def create_order(self, symbol, kind, side, quantity, price, params):
+        assert kind == "STOP_MARKET"
+        self.calls.append(("place", quantity, params["stopPrice"], params["workingType"]))
+        order_id = f"new-{len(self.calls)}"
+        row = {**self.active[0], "algoId": order_id, "clientAlgoId": params["clientOrderId"],
+               "side": side.upper(), "quantity": quantity, "triggerPrice": params["stopPrice"],
+               "workingType": "CONTRACT_PRICE" if self.return_wrong_trigger else params["workingType"]}
+        self.active.append(row)
+        return {"id": order_id, "info": row}
+
+    def fapiPrivateGetOpenAlgoOrders(self, params):
+        return [dict(row) for row in self.active]
+
+    def fapiPrivateGetAlgoOrder(self, params):
+        return next(dict(row) for row in self.active if row["algoId"] == params["algoId"])
+
+    def fapiPrivateDeleteAlgoOrder(self, params):
+        self.calls.append(("cancel", params["algoId"]))
+        if self.fail_cancel:
+            raise RuntimeError("cancellation unavailable")
+        self.active = [row for row in self.active if row["algoId"] != params["algoId"]]
+
+
+def _protection_service(settings, client):
+    service = LeadPortfolioExecutionService(client, settings)
+    service._market_rules = lambda symbol: (.01, .01, 0)
+    pos = Position(SYMBOL, Side(client.live["side"]), float(client.live["contracts"]),
+                   client.live["entryPrice"], float(client.active[0]["triggerPrice"]),
+                   NOW, "manual_position_adopted", "MID")
+    stop = {"id": "old", "clientOrderId": "mrb_s_old", "amount": 2,
+            "stop_price": pos.stop_price}
+    return service, pos, stop
+
+
+@pytest.mark.parametrize("side,entry,stop,liquidation,wallet,reason", [
+    (Side.LONG, 37.21, 34.95, 35.70656566, 7.442, "liquidation_buffer"),
+    (Side.SHORT, 100, 105, 103, 20, "liquidation_buffer"),
+    (Side.LONG, 100, 95, 92, 20, "liquidation_buffer"),
+    (Side.LONG, 100, 99.9, 99.5, 20, "liquidation_buffer"),
+    (Side.LONG, 100, 95, 80, 10, "margin_below"),
+    (Side.LONG, 100, 95, 80, None, "margin_below"),
+    (Side.LONG, 100, 95, 80, float("nan"), "margin_below"),
+    (Side.LONG, 100, 95, None, 20, "liquidation_buffer"),
+])
+def test_manual_lead_adoption_rejects_unsafe_margin_or_liquidation_without_orders(
+        settings, side, entry, stop, liquidation, wallet, reason):
+    client = ProtectionClient(side, entry=entry, stop=stop, liquidation=liquidation, wallet=wallet)
+    client.active = []
+    service = LeadPortfolioExecutionService(client, settings)
+    service._market_rules = lambda symbol: (.01, .01, 0)
+    pos = Position(SYMBOL, side, 2, entry, stop, NOW, "manual_position_adopted", "MID")
+    with pytest.raises(RuntimeError, match=reason):
+        service.adopt_manual_position_stop(pos, strategy_stop=stop, market_price=entry)
+    assert client.calls == []
+
+
+def test_adoption_migrates_tighter_legacy_stop_without_widening(settings):
+    client = ProtectionClient(stop=96)
+    service, pos, stop = _protection_service(settings, client)
+    saved = service.adopt_manual_position_stop(pos, strategy_stop=95, market_price=100)
+    assert saved["stop_price"] == 96
+    assert client.calls == [("place", 2, 96, "MARK_PRICE"), ("cancel", "old")]
+    assert len(client.active) == 1
+    assert service.audit_active_protective_stops({SYMBOL: pos}, {SYMBOL: {"stop": saved}}) == []
+
+
+@pytest.mark.parametrize("mode,reason", [
+    ("legacy", "trigger_must_be_mark"), ("unsafe_liquidation", "liquidation_buffer"),
+    ("low_wallet", "margin_below"), ("missing_mark", "mark_price"),
+])
+def test_continuous_audit_flags_trigger_margin_and_liquidation_after_adoption(settings, mode, reason):
+    client = ProtectionClient()
+    if mode != "legacy":
+        client.active[0]["workingType"] = "MARK_PRICE"
+    if mode == "unsafe_liquidation":
+        client.live["liquidationPrice"] = 97
+    if mode == "low_wallet":
+        client.live["info"]["isolatedWallet"] = 10
+    if mode == "missing_mark":
+        client.live["markPrice"] = None
+    service, pos, stop = _protection_service(settings, client)
+    mismatches = service.audit_active_protective_stops({SYMBOL: pos}, {SYMBOL: {"stop": stop}})
+    assert len(mismatches) == 1 and reason in mismatches[0]
+    assert client.calls == []
+
+
+def test_manual_add_with_insufficient_wallet_preserves_original_stop(settings):
+    client = ProtectionClient(wallet=20)
+    service, original, stop = _protection_service(settings, client)
+    client.live["contracts"] = 3
+    with pytest.raises(RuntimeError, match="margin_below"):
+        service.reconcile_manual_position_stop(replace(original, quantity=3), original, stop,
+                                               stop_price=95, market_price=100)
+    assert client.calls == [] and client.active[0]["algoId"] == "old"
+
+
+def test_manual_resize_migrates_stop_and_retry_reuses_verified_replacement(settings):
+    client = ProtectionClient(wallet=40)
+    service, original, stop = _protection_service(settings, client)
+    client.live["contracts"] = 3
+    client.fail_cancel = True
+    updated = replace(original, quantity=3)
+    with pytest.raises(RuntimeError, match="cancellation unavailable"):
+        service.reconcile_manual_position_stop(updated, original, stop, stop_price=95, market_price=100)
+    assert len(client.active) == 2
+    client.fail_cancel = False
+    saved = service.reconcile_manual_position_stop(updated, original, stop, stop_price=95, market_price=100)
+    assert len([c for c in client.calls if c[0] == "place"]) == 1
+    assert len(client.active) == 1 and client.active[0]["algoId"] == saved["id"]
+
+
+def test_same_price_stop_replacement_migrates_trigger_and_preserves_new_stop_on_cancel_failure(settings):
+    client = ProtectionClient()
+    service, pos, stop = _protection_service(settings, client)
+    client.fail_cancel = True
+    with pytest.raises(RuntimeError, match="cancellation unavailable"):
+        service.replace_stop(pos, stop=stop, stop_price=95)
+    assert client.calls == [("place", 2, 95, "MARK_PRICE"), ("cancel", "old")]
+    assert len(client.active) == 2 and client.active[-1]["workingType"] == "MARK_PRICE"
+
+
+def test_wrong_trigger_readback_never_cancels_old_stop(settings):
+    client = ProtectionClient()
+    client.return_wrong_trigger = True
+    service, pos, stop = _protection_service(settings, client)
+    with pytest.raises(RuntimeError, match="could not be verified"):
+        service.replace_stop(pos, stop=stop, stop_price=96)
+    assert client.active[0]["algoId"] == "old" and len(client.active) == 1
+
+
+@pytest.mark.parametrize("side,stop,mark,liquidation", [
+    (Side.LONG, 105, 110, 80), (Side.SHORT, 95, 90, 120),
+])
+def test_profit_lock_and_existing_cross_position_pass_safety_check(settings, side, stop, mark, liquidation):
+    client = ProtectionClient(side, stop=95 if side is Side.LONG else 105, liquidation=liquidation)
+    client.live.update(markPrice=mark, marginMode="cross", info={})
+    service, pos, _ = _protection_service(settings, client)
+    service._verify_stop_safety(pos, service._position(SYMBOL), stop)
+
+
+def test_higher_margin_floor_selects_lower_leverage_and_config_cannot_weaken_ten_percent(settings):
+    from pydantic import ValidationError
+
+    policy = settings.lead_risk.model_copy(update={"min_isolated_margin_pct": .20})
+    changed = settings.model_copy(update={"lead_risk": policy})
+    plan = select_leverage(Side.LONG, 100, 6, 98, parse_brackets(_brackets(), "TESTUSDT"), changed, 1000)
+    assert plan["leverage"] == 4
+    data = settings.lead_risk.model_dump()
+    data["min_isolated_margin_pct"] = .05
+    with pytest.raises(ValidationError):
+        type(settings.lead_risk).model_validate(data)
 
 
 @pytest.mark.parametrize("safe", [True, False])
@@ -439,7 +608,7 @@ def test_invalid_venue_tiers_do_not_receive_a_fallback(field, value):
 
 
 @pytest.mark.parametrize("confirmation", [None, {"leverage": 10, "maxNotionalValue": "NaN"},
-    {"leverage": 10.5, "maxNotionalValue": "10000"}, {"leverage": 9, "maxNotionalValue": "10000"},
+    {"leverage": 10.5, "maxNotionalValue": "10000"}, {"leverage": 10, "maxNotionalValue": "10000"},
     {"leverage": 10, "maxNotionalValue": "500"}])
 def test_unconfirmed_venue_leverage_or_notional_limit_prevents_submission(settings, confirmation):
     client = LeadClient()

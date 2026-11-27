@@ -133,9 +133,10 @@ def liquidation_is_safe(side, entry, stop, liquidation, policy):
     except (TypeError, ValueError, OverflowError):
         return False
     direction = 1 if Side(side) is Side.LONG else -1
-    stop_distance = direction * (entry - stop)
+    # A tightened stop may already lock in profit. Its remaining principal risk is zero.
+    stop_distance = max(0.0, direction * (entry - stop))
     liquidation_distance = direction * (entry - liquidation)
-    return (stop_distance > 0
+    return (liquidation_distance > 0
             and direction * (stop - liquidation) > 0
             and liquidation_distance >= policy.liquidation_stop_distance_multiple * stop_distance
             and abs(stop - liquidation) / liquidation >= policy.min_stop_liquidation_gap_pct)
@@ -156,7 +157,7 @@ def select_leverage(side, entry, quantity, stop, brackets, settings, available):
         if available < margin + 2 * notional * costs:
             continue
         wallet = margin - notional * costs
-        if wallet <= 0:
+        if wallet < notional * policy.min_isolated_margin_pct:
             continue
         try:
             liquidation = liquidation_price(side, entry, quantity, wallet, brackets)
