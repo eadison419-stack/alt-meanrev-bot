@@ -2201,7 +2201,10 @@ def _manual_sync_error(exc):
     message = str(exc)
     safe = ("manual_sync_", "manual position trade history", "stop_too_",
             "strategy stop is invalid", "structure level is on the wrong side",
-            "insufficient completed", "entry-time ")
+            "insufficient completed", "entry-time ",
+            "lead_position_margin_mode_unverified", "lead_position_changed_during_stop_safety_check",
+            "lead_mark_price_unverified_or_stop_crossed", "lead_isolated_margin_below_notional_floor",
+            "lead_position_liquidation_buffer_insufficient_or_unverified")
     return message if message.startswith(safe) else type(exc).__name__
 
 

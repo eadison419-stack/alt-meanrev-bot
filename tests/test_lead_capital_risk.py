@@ -573,6 +573,16 @@ def test_higher_margin_floor_selects_lower_leverage_and_config_cannot_weaken_ten
         type(settings.lead_risk).model_validate(data)
 
 
+@pytest.mark.parametrize("reason", [
+    "lead_position_margin_mode_unverified", "lead_position_changed_during_stop_safety_check",
+    "lead_mark_price_unverified_or_stop_crossed", "lead_isolated_margin_below_notional_floor",
+    "lead_position_liquidation_buffer_insufficient_or_unverified",
+])
+def test_manual_adoption_preserves_safe_liquidation_failure_reason(reason):
+    assert runner._manual_sync_error(RuntimeError(reason)) == reason
+    assert runner._manual_sync_error(RuntimeError("untrusted exchange response")) == "RuntimeError"
+
+
 @pytest.mark.parametrize("safe", [True, False])
 def test_restart_recovery_rechecks_actual_liquidation_without_resending(settings, safe):
     client = LeadClient()
