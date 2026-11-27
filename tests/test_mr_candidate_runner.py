@@ -81,6 +81,17 @@ def test_hourly_management_does_not_import_pre_fill_extreme():
                                                + timedelta(seconds=5))
     runner._evaluate_exits(state, None, True, {symbol: frame}, {}, settings, 0, 0, now)
     assert state.exit_management_by_symbol[symbol]["best_price"] == 100
+
+
+@pytest.mark.parametrize("bar_offset,expected_best", [(-1, 100), (0, 100), (1, 97)])
+def test_hourly_management_extremes_start_with_a_full_post_add_bar(bar_offset, expected_best):
+    settings, state, symbol, frame, _ = _short_exit_fixture(is_demo=True)
+    basis_at = frame.index[-1].to_pydatetime() + timedelta(minutes=30)
+    state.exit_management_by_symbol[symbol]["profit_basis_at"] = basis_at.isoformat()
+    frame.index = frame.index + timedelta(hours=bar_offset)
+    now = frame.index[-1].to_pydatetime() + timedelta(hours=1)
+    runner._evaluate_exits(state, None, True, {symbol: frame}, {}, settings, 0, 0, now)
+    assert state.exit_management_by_symbol[symbol]["best_price"] == expected_best
     assert state.exit_management_by_symbol[symbol]["worst_price"] == 101
 
 
@@ -161,6 +172,20 @@ def test_position_monitor_ignores_fresh_quote_older_than_fill(monkeypatch):
     public = SimpleNamespace(markets={symbol: {}}, fetch_ticker=lambda _:
         {"last": 80, "timestamp": int((now - timedelta(seconds=1)).timestamp() * 1000)})
     execution = SimpleNamespace()
+    runner._manage_demo_positions(public, execution, state, settings, now, 0, 0)
+    assert state.exit_management_by_symbol[symbol]["best_price"] == 100
+    assert state.exchange_orders_by_symbol[symbol]["stop"]["stop_price"] == 102
+
+
+def test_position_monitor_ignores_fresh_quote_older_than_the_new_average_basis(monkeypatch):
+    settings, state, symbol, _, now = _short_exit_fixture(is_demo=True)
+    monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    state.exit_management_by_symbol[symbol]["profit_basis_at"] = now.isoformat()
+    state.exchange_snapshot = {"at": now.isoformat()}
+    public = SimpleNamespace(markets={symbol: {}}, fetch_ticker=lambda _:
+        {"last": 80, "timestamp": int((now - timedelta(seconds=1)).timestamp() * 1000)})
+    execution = SimpleNamespace(exchange=SimpleNamespace(price_to_precision=lambda _, value: str(value)),
+                                replace_stop=lambda *args, **kwargs: pytest.fail("pre-add quotes must not move stops"))
     runner._manage_demo_positions(public, execution, state, settings, now, 0, 0)
     assert state.exit_management_by_symbol[symbol]["best_price"] == 100
     assert state.exchange_orders_by_symbol[symbol]["stop"]["stop_price"] == 102

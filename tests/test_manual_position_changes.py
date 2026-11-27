@@ -271,22 +271,25 @@ def test_manual_changes_cannot_loosen_or_cross_the_stop(price, reason):
     assert service.exchange.calls == []
 
 
-def managed_state(monkeypatch, rows, observed):
+def managed_state(monkeypatch, rows, observed, *, original=None, quote=120, entry_atr=2):
     now = OPENED + timedelta(minutes=5)
     monkeypatch.setattr(runner, "_utc_now", lambda: now)
+    original = original or position()
     state = MultiPaperState(initial_equity=1000, cash=1000)
     state.execution_mode = "lead_usdm"
-    state.portfolio.positions[SYMBOL] = position()
-    state.exchange_orders_by_symbol[SYMBOL] = {"stop": {"id": "old", "amount": 2, "stop_price": 95}}
-    state.entry_costs[SYMBOL] = {"entry_fee": .2}
-    runner._initialize_entry_metadata(state, SYMBOL, position(), True, 100, 95, 2, 90, 110)
+    state.portfolio.positions[SYMBOL] = original
+    state.exchange_orders_by_symbol[SYMBOL] = {
+        "stop": {"id": "old", "amount": original.quantity, "stop_price": original.stop_price}}
+    state.entry_costs[SYMBOL] = {"entry_fee": original.quantity * original.entry_price * .001}
+    runner._initialize_entry_metadata(state, SYMBOL, original, True, original.entry_price,
+                                     original.stop_price, entry_atr, 90, 110)
     state.exit_management_by_symbol[SYMBOL].update(no_progress_count=3, trailing_started=True, mid_fired=True)
 
     class Execution:
         adopt_manual_positions = True
         fail_protection = False
         protection_calls = 0
-        exchange = SimpleNamespace(fetch_ticker=lambda symbol: {"last": 120, "timestamp": int(now.timestamp() * 1000)})
+        exchange = SimpleNamespace(fetch_ticker=lambda symbol: {"last": quote, "timestamp": int(now.timestamp() * 1000)})
 
         def sync_snapshot(self):
             return {"at": now.isoformat(), "positions": {SYMBOL: observed} if observed else {}}
@@ -336,11 +339,194 @@ def test_failed_protection_keeps_ledger_and_cursor_then_retries(monkeypatch):
     assert not runner._demo_sync_stopped(service, state, now)
     assert state.portfolio.positions[SYMBOL].quantity == 2
     assert "manual_sync" not in state.exit_management_by_symbol[SYMBOL]
+    assert "profit_basis_at" not in state.exit_management_by_symbol[SYMBOL]
+    assert state.exit_management_by_symbol[SYMBOL]["initial_risk"] == 5
+    assert not any(e.get("event") == "manual_position_basis_updated" for e in state.events)
     assert state.execution_status == "inconsistent"
     service.fail_protection = False
     assert runner._demo_sync_stopped(service, state, now)
     assert state.portfolio.positions[SYMBOL].quantity == 3
+    assert state.exit_management_by_symbol[SYMBOL]["initial_risk"] == pytest.approx(25 / 3)
     assert state.execution_status == "synchronized"
+
+
+@pytest.mark.parametrize("side,order,stop,add_price,next_price", [
+    (Side.LONG, "BUY", 95, 110, 120), (Side.SHORT, "SELL", 105, 90, 80),
+])
+def test_add_rebases_r_from_final_average_and_fixed_stop_across_restart(
+        monkeypatch, tmp_path, side, order, stop, add_price, next_price):
+    average = (200 + add_price) / 3
+    rows = [trade(1, order, 2, 100), trade(2, order, 1, add_price)]
+    observed = expected(side.value, 3, average)
+    state, service, now = managed_state(monkeypatch, rows, observed,
+                                        original=position(side, stop=stop), quote=average)
+    meta = state.exit_management_by_symbol[SYMBOL]
+    meta["best_price"] = 150 if side is Side.LONG else 50
+    assert runner._demo_sync_stopped(service, state, now)
+    assert state.portfolio.positions[SYMBOL].entry_price == pytest.approx(average)
+    assert state.portfolio.positions[SYMBOL].stop_price == stop
+    assert meta["risk_reference_stop"] == stop
+    assert meta["initial_risk"] == pytest.approx(25 / 3)
+    assert meta["best_price"] == pytest.approx(average)
+    assert meta["profit_basis_at"] == (OPENED + timedelta(minutes=1)).isoformat()
+    assert meta["entry_atr"] == 2
+    assert (meta["no_progress_count"], meta["trailing_started"], meta["mid_fired"]) == (3, True, True)
+    path = tmp_path / "state.json"
+    state.save(path)
+    state = MultiPaperState.load(path)
+    event_count = len(state.events)
+    assert runner._demo_sync_stopped(service, state, now)
+    assert len(state.events) == event_count
+    # A second add after reload must use the same absolute stop reference.
+    rows.append(trade(3, order, 1, next_price))
+    observed.update(quantity=4, entry_price=(200 + add_price + next_price) / 4)
+    assert runner._demo_sync_stopped(service, state, now)
+    meta = state.exit_management_by_symbol[SYMBOL]
+    assert meta["initial_risk"] == 12.5
+    assert meta["risk_reference_stop"] == stop
+    assert state.portfolio.positions[SYMBOL].stop_price == stop
+    events = [e for e in state.events if e.get("event") == "manual_position_basis_updated"]
+    assert len(events) == 2
+    assert events[-1]["entry_price"] == observed["entry_price"]
+    assert events[-1]["initial_risk"] == 12.5
+    # A later pure reduction preserves the new basis and risk distance.
+    rows.append(trade(4, "SELL" if order == "BUY" else "BUY", 1, 100))
+    observed["quantity"] = 3
+    assert runner._demo_sync_stopped(service, state, now)
+    assert meta["initial_risk"] == 12.5
+    assert meta["profit_basis_at"] == (OPENED + timedelta(minutes=2)).isoformat()
+    assert len([e for e in state.events if e.get("event") == "manual_position_basis_updated"]) == 2
+
+
+def monitor_after_add(service, state, now, quote, *, fee_rate=0, slip_rate=0):
+    service.exchange.markets = {SYMBOL: {}}
+    service.exchange.fetch_ticker = lambda _: {"last": quote, "timestamp": int(now.timestamp() * 1000)}
+    service.exchange.price_to_precision = lambda _, value: str(value)
+    state.protective_stop_audit = {"at": now.isoformat(), "status": "verified", "position_count": 1,
+                                    "mismatch_count": 0, "mismatches": []}
+    settings = load_settings(env_file=None)
+    runner._manage_demo_positions(service.exchange, service, state, settings, now, fee_rate, slip_rate)
+
+
+@pytest.mark.parametrize("side,order,stop,add_price,sign", [
+    (Side.LONG, "BUY", 95, 110, 1), (Side.SHORT, "SELL", 105, 90, -1),
+])
+def test_first_atr_lock_after_add_uses_final_average_and_rebased_r(
+        monkeypatch, side, order, stop, add_price, sign):
+    average = (200 + add_price) / 3
+    rows = [trade(1, order, 2, 100), trade(2, order, 1, add_price)]
+    state, service, now = managed_state(monkeypatch, rows, expected(side.value, 3, average),
+                                        original=position(side, stop=stop), quote=average)
+    assert runner._demo_sync_stopped(service, state, now)
+    replacements = []
+
+    def replace_stop(updated, *, stop, stop_price):
+        replacements.append(stop_price)
+        return {"id": "locked", "amount": updated.quantity, "stop_price": stop_price}
+
+    service.replace_stop = replace_stop
+    monitor_after_add(service, state, now, average + sign * 1.99)
+    assert replacements == []  # The post-add position has not reached 1 ATR.
+    monitor_after_add(service, state, now, average + sign * 2.01)
+    assert replacements == pytest.approx([105 if side is Side.LONG else 95])
+    event = next(e for e in state.events if e.get("event") == "protective_stop_updated")
+    assert event["entry_price"] == pytest.approx(average)
+    assert event["initial_risk"] == pytest.approx(25 / 3)
+    assert event["progress_atr"] == pytest.approx(1.005)
+    assert event["progress_r"] < 1.5
+
+
+def test_ssv_additions_rebase_the_one_atr_trigger_and_point_two_r_lock(monkeypatch):
+    rows = [trade(1, "SELL", 500, 2.741), trade(2, "SELL", 500, 2.816),
+            trade(3, "SELL", 500, 2.875)]
+    state, service, now = managed_state(monkeypatch, rows, expected("short", 1500, 2.8106666666666666),
+                                        original=position(Side.SHORT, 500, 2.741, 3),
+                                        quote=2.81, entry_atr=.13553226891164555)
+    assert runner._demo_sync_stopped(service, state, now)
+    meta = state.exit_management_by_symbol[SYMBOL]
+    assert meta["initial_risk"] == pytest.approx(.18933333333333335)
+    replacements = []
+
+    def replace_stop(updated, *, stop, stop_price):
+        replacements.append(stop_price)
+        return {"id": "locked", "amount": updated.quantity, "stop_price": stop_price}
+
+    service.replace_stop = replace_stop
+    monitor_after_add(service, state, now, 2.676, fee_rate=.0005, slip_rate=.0003)
+    assert not replacements
+    monitor_after_add(service, state, now, 2.674, fee_rate=.0005, slip_rate=.0003)
+    assert len(replacements) == 1
+    assert round(replacements[0], 3) == 2.769
+    event = next(e for e in state.events if e.get("event") == "protective_stop_updated")
+    assert event["progress_atr"] >= 1
+    assert event["progress_r"] < 1.5
+
+
+def test_reduce_and_add_with_unchanged_quantity_and_average_still_rebases_progress(monkeypatch):
+    rows = [trade(1, "BUY", 2, 100), trade(2, "SELL", 1, 110), trade(3, "BUY", 1, 100)]
+    state, service, now = managed_state(monkeypatch, rows, expected(), quote=100)
+    meta = state.exit_management_by_symbol[SYMBOL]
+    meta["best_price"] = 150
+    assert runner._demo_sync_stopped(service, state, now)
+    assert meta["profit_basis_at"] == (OPENED + timedelta(minutes=2)).isoformat()
+    assert meta["initial_risk"] == 5 and meta["best_price"] == 100
+    assert runner._demo_sync_stopped(service, state, now)
+    assert len([e for e in state.events if e.get("event") == "manual_position_basis_updated"]) == 1
+
+
+@pytest.mark.parametrize("side,order,initial_stop,active_stop,add_price,quote", [
+    (Side.LONG, "BUY", 95, 106, 110, 107), (Side.SHORT, "SELL", 105, 94, 90, 93),
+])
+def test_add_rebases_r_without_loosening_an_already_profitable_stop(
+        monkeypatch, side, order, initial_stop, active_stop, add_price, quote):
+    rows = [trade(1, order, 2, 100), trade(2, order, 1, add_price)]
+    state, service, now = managed_state(monkeypatch, rows, expected(side.value, 3, (200 + add_price) / 3),
+                                        original=position(side, stop=initial_stop), quote=quote)
+    state.exchange_orders_by_symbol[SYMBOL]["stop"]["stop_price"] = active_stop
+    state.exit_management_by_symbol[SYMBOL]["protective_stop"] = active_stop
+    assert runner._demo_sync_stopped(service, state, now)
+    meta = state.exit_management_by_symbol[SYMBOL]
+    assert meta["initial_risk"] == pytest.approx(25 / 3)
+    assert meta["protective_stop"] == active_stop
+    assert state.exchange_orders_by_symbol[SYMBOL]["stop"]["amount"] == 3
+    service.replace_stop = lambda *args, **kwargs: pytest.fail("a rebased lock must not loosen protection")
+    monitor_after_add(service, state, now, quote)
+    assert meta["protective_stop"] == active_stop
+
+
+def test_add_recovers_fixed_reference_from_a_legacy_shifted_position(monkeypatch):
+    average = 310 / 3
+    rows = [trade(1, "BUY", 3, average), trade(2, "BUY", 1, 120)]
+    state, service, now = managed_state(monkeypatch, rows, expected(quantity=4, price=107.5),
+                                        original=position(quantity=3, price=average, stop=average - 5))
+    meta = state.exit_management_by_symbol[SYMBOL]
+    meta.pop("risk_reference_stop", None)
+    meta.update(initial_risk=5, telemetry_initial_stop_price=95)
+    assert runner._demo_sync_stopped(service, state, now)
+    assert state.portfolio.positions[SYMBOL].stop_price == 95
+    assert meta["initial_risk"] == 12.5
+
+
+def test_add_rejects_a_fresh_quote_from_before_the_last_added_fill(monkeypatch):
+    rows = [trade(1, "BUY", 2, 100), trade(6, "BUY", 1, 110)]
+    state, service, now = managed_state(monkeypatch, rows, expected(quantity=3, price=310 / 3))
+    service.exchange.fetch_ticker = lambda _: {"last": 120, "timestamp": int((now - timedelta(seconds=1)).timestamp() * 1000)}
+    assert not runner._demo_sync_stopped(service, state, now)
+    assert service.protection_calls == 0
+    assert state.portfolio.positions[SYMBOL].quantity == 2
+    meta = state.exit_management_by_symbol[SYMBOL]
+    assert "profit_basis_at" not in meta and "manual_sync" not in meta
+    assert state.events[-1]["reason"] == "manual_sync_fresh_price_unavailable"
+
+
+def test_zero_risk_after_add_is_isolated_without_committing_a_new_basis(monkeypatch):
+    rows = [trade(1, "BUY", 2, 100), trade(2, "BUY", 2, 90)]
+    state, service, now = managed_state(monkeypatch, rows, expected(quantity=4, price=95))
+    assert not runner._demo_sync_stopped(service, state, now)
+    assert service.protection_calls == 0
+    assert state.portfolio.positions[SYMBOL].quantity == 2
+    assert state.execution_status == "inconsistent"
+    assert state.events[-1]["reason"] == "manual_sync_average_entry_risk_invalid"
 
 
 def test_position_state_and_cursor_survive_serialization_without_duplicate_pnl(monkeypatch):

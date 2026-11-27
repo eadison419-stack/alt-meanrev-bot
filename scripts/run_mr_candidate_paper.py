@@ -1323,15 +1323,17 @@ def _demo_trade_observations(state, position, *, closed_at, reconciled_at=None):
     return observations
 
 
-def _position_sample_is_eligible(position, observed_at):
+def _position_sample_is_eligible(position, observed_at, *, since=None):
     opened_at = _aware_datetime(position.opened_at)
     sampled_at = _aware_datetime(observed_at)
-    return opened_at is not None and sampled_at is not None and sampled_at >= opened_at
+    basis_at = _aware_datetime(since) if since is not None else opened_at
+    return (opened_at is not None and sampled_at is not None and basis_at is not None
+            and sampled_at >= max(opened_at, basis_at))
 
 
-def _position_bar_is_eligible(position, frame, as_of):
+def _position_bar_is_eligible(position, frame, as_of, *, since=None):
     bar_open = _aware_datetime(frame.index[-1].to_pydatetime())
-    return (bar_open is not None and _position_sample_is_eligible(position, bar_open)
+    return (bar_open is not None and _position_sample_is_eligible(position, bar_open, since=since)
             and bar_open + timedelta(hours=1) <= as_of)
 
 
@@ -2221,6 +2223,7 @@ def _sync_lead_position_changes(execution, state, snapshot, at):
                 entry_fee=(state.entry_costs.get(symbol) or {}).get("entry_fee"),
             )
             prepared = None
+            basis_updates = {}
             remaining = plan["remaining"]
             if plan["changes"]:
                 stage = "protection"
@@ -2245,10 +2248,22 @@ def _sync_lead_position_changes(execution, state, snapshot, at):
                     recorded_price = float(meta.get("protective_stop", tracked_price))
                     current_stop = (max(tracked_price, recorded_price) if position.side is Side.LONG
                                     else min(tracked_price, recorded_price))
-                    # Position.stop_price is an initial risk reference; the active
-                    # trailing stop may already be on the profitable side of cost.
-                    risk = float(meta.get("initial_risk") or abs(position.entry_price - position.stop_price))
-                    reference = remaining["entry_price"] + (risk if position.side is Side.SHORT else -risk)
+                    # Rebase R against a fixed initial stop, never the trailed stop
+                    # or a synthetic stop shifted to preserve the first fill's R.
+                    reference = position.stop_price
+                    additions = [change for change in plan["changes"] if change["action"] == "add"]
+                    if additions:
+                        reference = float(meta.get("risk_reference_stop",
+                                          meta.get("telemetry_initial_stop_price", position.stop_price)))
+                        risk = abs(remaining["entry_price"] - reference)
+                        if not math.isfinite(reference) or reference <= 0 or not math.isfinite(risk) or risk <= 0:
+                            raise RuntimeError("manual_sync_average_entry_risk_invalid")
+                        basis_at = _aware_datetime(additions[-1]["at"])
+                        if basis_at is None or not _position_sample_is_eligible(
+                                position, _ticker_observed_at({symbol: ticker}, symbol), since=basis_at):
+                            raise RuntimeError("manual_sync_fresh_price_unavailable")
+                        basis_updates = {"risk_reference_stop": reference, "initial_risk": risk,
+                                         "profit_basis_at": basis_at.isoformat()}
                     updated = replace(position, quantity=remaining["quantity"],
                                       entry_price=remaining["entry_price"], stop_price=reference)
                     saved_stop = execution.reconcile_manual_position_stop(
@@ -2312,6 +2327,14 @@ def _sync_lead_position_changes(execution, state, snapshot, at):
                 state.portfolio.positions[symbol] = updated
                 state.exchange_orders_by_symbol[symbol] = {"stop": saved_stop}
                 state.entry_costs[symbol] = {"entry_fee": remaining["entry_fee"]}
+                if basis_updates:
+                    state.events.append({
+                        "event": "manual_position_basis_updated", "at": at.isoformat(), "symbol": symbol,
+                        "previous_entry_price": position.entry_price, "entry_price": updated.entry_price,
+                        "previous_initial_risk": meta.get("initial_risk"), **basis_updates,
+                        "execution_source": _execution_source(state),
+                    })
+                    meta.update(basis_updates)
                 meta.update(protective_stop=float(saved_stop["stop_price"]),
                             best_price=max(updated.entry_price, price) if updated.side is Side.LONG else min(updated.entry_price, price),
                             worst_price=min(updated.entry_price, price) if updated.side is Side.LONG else max(updated.entry_price, price),
@@ -2534,7 +2557,8 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
                                _execution_label(execution, state), symbol, quote_status)
             dirty = True
         dirty = True  # Persist each valid excursion sample and the latest freshness result.
-        if price is None or not _position_sample_is_eligible(position, observed_at):
+        if price is None or not _position_sample_is_eligible(
+                position, observed_at, since=meta.get("profit_basis_at")):
             state.exit_management_by_symbol[symbol] = meta
             if _apply_max_hold_exit(True, execution, state, symbol, position, None,
                                     checked_at, settings, fee_rate, slip_rate):
@@ -2688,6 +2712,9 @@ def _manage_demo_positions(exchange, execution, state, settings, now, fee_rate, 
             "previous_stop": tracked_stop, "stop_price": actual_stop,
             "requested_stop": proposed_stop, "previous_algo_id": tracked_order.get("id"),
             "algoId": updated.get("id"), "reason": stop_reason,
+            "entry_price": entry, "entry_atr": entry_atr, "initial_risk": initial_risk,
+            "best_price": best_price, "progress_atr": favorable / entry_atr, "progress_r": progress_r,
+            "profit_basis_at": meta.get("profit_basis_at"),
             "execution_source": _execution_source(state),
         })
         logger.info("{} protective stop updated for {}: {} -> {} algoId={}",
@@ -4460,7 +4487,7 @@ def _evaluate_exits(state, execution, is_demo, one_hour, regimes, settings,
         # 2. update best/worst
         best_price = float(meta.get("best_price", entry))
         worst_price = float(meta.get("worst_price", entry))
-        if _position_bar_is_eligible(position, frame, now):
+        if _position_bar_is_eligible(position, frame, now, since=meta.get("profit_basis_at")):
             best_price = max(best_price, current_high) if side is Side.LONG else min(best_price, current_low)
             worst_price = min(worst_price, current_low) if side is Side.LONG else max(worst_price, current_high)
         meta["best_price"] = best_price
@@ -4927,6 +4954,7 @@ def _initialize_entry_metadata(state, symbol, opened, is_demo, close, stop,
         "protective_stop": float(opened.stop_price),
         "structure_low": swing_low,
         "structure_high": swing_high,
+        "risk_reference_stop": float(opened.stop_price),
         "initial_risk": initial_risk,
         "trailing_started": False,
         "best_price": (opened.entry_price if is_demo and observed_price is None
